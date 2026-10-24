@@ -1,0 +1,12 @@
+# Dark Portal's technical profile: the facts about this repository that the
+# programme's tooling asks for (programme/scripts/board/profile.py). What the
+# programme's processes need to know about the application is its programme
+# profile, 3.2.6 in the programme repository; this file says how to reach it.
+# Grows with the code: versions, what ships and the hooks arrive with #7 and #11.
+
+# The application's folder in the programme repository's `applications/`.
+application = "dark-portal"
+
+[environments.production]
+# Private: reached through SSH to its host, so no fixed URL.
+env = ["PROD_URL"]
