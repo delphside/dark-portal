@@ -1,0 +1,47 @@
+# Rust builds
+/target
+**/target
+**/*.rs.bk
+
+# Collected and derived data never goes in the repository: it is large, it is
+# the host's, and a public repository must not carry it. Snapshots, Parquet
+# files and DuckDB databases live outside the working tree; these catch a
+# local copy made by mistake.
+/data/
+*.parquet
+*.duckdb
+*.duckdb.wal
+snapshots/
+
+# Python and notebooks (the analysis client)
+__pycache__/
+.venv/
+.ipynb_checkpoints/
+__marimo__/
+
+# Secrets: the Blizzard client id and secret live on the host only
+.env
+.env.*
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Claude Code: local state is ignored, the versioned parts are let back in.
+# `.claude/*` rather than `.claude/`, so that a path inside can be re-included.
+.claude/*
+!.claude/skills/
+!.claude/agents/
+!.claude/settings.json
+
+# CI checks the programme repository's live copy out here; PROGRAMME_DIR points at it.
+/.programme-live/
