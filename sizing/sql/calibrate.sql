@@ -18,7 +18,7 @@ CREATE TABLE pairs AS
            lag(n) OVER w AS prev_n, lag(items) OVER w AS prev_items, lag(n_long) OVER w AS prev_long,
            maxid - lag(maxid) OVER w AS id_span
     FROM s WINDOW w AS (ORDER BY snapshot_ts))
-  WHERE epoch(hour_ts - prev_ts) BETWEEN 1800 AND 5400;
+  WHERE epoch(hour_ts - prev_ts) BETWEEN 2700 AND 4500;
 -- validate.sql compares against the same pairs.
 COPY (SELECT hour_ts FROM pairs) TO '@SEED@/pairs.csv' (HEADER);
 CREATE TABLE e AS
@@ -54,6 +54,7 @@ CREATE TABLE per AS
   FROM pairs JOIN e USING (hour_ts)
   GROUP BY pairs.hour_ts;
 COPY (
+  WITH base AS (
   SELECT avg(sold / prev_n) AS front_rate,
          -- Only a listing with two hours or more left counts as cancelled, so
          -- the rate is over those; the generator cancels only those too.
@@ -69,5 +70,13 @@ COPY (
          avg((sold + cancelled + expired) / prev_n) AS real_gone_rate,
          avg(posted / prev_n) AS real_posted_rate,
          count(*) AS pairs
-  FROM per
+  FROM per)
+  -- The split of 24- and 48-hour postings is not visible (both show
+  -- VERY_LONG), so it is solved for the measured expiry rate: a posting of d
+  -- hours survives to expire with chance about (1 - h)^d, h being the hourly
+  -- rate of sales and cancellations.
+  SELECT *, least(greatest(
+           (p12 * pow(1 - h, 12) + (1 - p12) * pow(1 - h, 24) - real_expired_rate / real_posted_rate)
+           / (pow(1 - h, 24) - pow(1 - h, 48)), 0), 1 - p12) AS p48
+  FROM (SELECT *, front_rate + cancel_rate AS h FROM base)
 ) TO '@SEED@/params.csv' (HEADER);

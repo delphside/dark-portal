@@ -23,7 +23,7 @@ token=$(printf 'user = "%s:%s"\n' "$id" "$secret" |
   curl -fsS --max-time 60 -K - -d grant_type=client_credentials https://oauth.battle.net/token |
   sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p' || true)
 unset secret
-[ ${#token} -gt 20 ] || { echo 'no token: check the client in blizzard.env' >&2; exit 1; }
+[ ${#token} -gt 20 ] || { echo 'no token: check the client in blizzard.env' | tee -a "$LOG" >&2; exit 1; }
 
 # A snapshot is kept only when its last-modified time is newer than the last
 # one kept, so a restart, or a stale copy from Blizzard's cache, adds nothing.

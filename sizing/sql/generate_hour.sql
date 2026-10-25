@@ -66,7 +66,7 @@ INSERT INTO nxt
          (CASE WHEN price >= 10000 AND u(r, @H@, 11) < (SELECT round_share FROM p)
                THEN round(price / 100) * 100 ELSE price END)::BIGINT AS unit_price,
          @H@ + CASE WHEN u(r, @H@, 8) < (SELECT p12 FROM p) THEN 12
-                    WHEN u(r, @H@, 8) < (SELECT p12 + (1 - p12) / 2 FROM p) THEN 24
+                    WHEN u(r, @H@, 8) < (SELECT 1 - p48 FROM p) THEN 24
                     ELSE 48 END AS expires_h
   FROM priced;
 

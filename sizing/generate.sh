@@ -14,10 +14,10 @@ fi
 for w in $(seq 1 "$WEEKS"); do
   [ -f "$(state "$w")" ] && continue
   # Room for the rest of bronze, all of silver (about a fifth of bronze) and
-  # 10 GB to spill, judged from week 1 once it exists.
+  # 5 GB to spill, judged from week 1 once it exists.
   if [ -d "$DATA/bronze/$(week_dir 1)" ] && [ "$w" -gt 1 ]; then
-    wk1=$(du -sBG "$DATA/bronze/$(week_dir 1)" | cut -f1 | tr -dc 0-9)
-    need_free $(((wk1 * (WEEKS - w + 1) * 10 + wk1 * WEEKS * 2) / 10 + 10)) "the rest of the year"
+    wk1=$(du -sb "$DATA/bronze/$(week_dir 1)" | cut -f1)
+    need_free $(((wk1 * (WEEKS - w + 1) + wk1 * WEEKS / 5) / 1073741824 + 6)) "the rest of the year"
   else
     need_free 3 "week $w"
   fi
