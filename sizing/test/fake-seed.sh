@@ -7,9 +7,10 @@
 mkdir -p "$DATA/seed/raw" "$DATA/seed/real"
 {
   echo "CREATE MACRO u(a, b, c) AS (hash(a, b, c) % 1000003) / 1000003.0;"
-  # About 296,000 listings over 5,000 items, a few items holding most of them.
+  # About 296,000 listings over 5,500 items, a few items holding most of them
+  # and 500 rare ones holding one each.
   echo "CREATE TABLE t AS
-    WITH items AS (SELECT range::INTEGER AS item, ceil(4000 / pow(range, 0.6))::INTEGER AS n FROM range(1, 5001))
+    WITH items AS (SELECT range::INTEGER AS item, CASE WHEN range > 5000 THEN 1 ELSE ceil(4000 / pow(range, 0.6)) END::INTEGER AS n FROM range(1, 5501))
     SELECT (row_number() OVER (ORDER BY u(item, g, 0)) * 3 + 2000000000)::BIGINT AS id, item,
            (1 + floor(u(item, g, 1) * 200))::INTEGER AS quantity,
            (100 * item + floor(u(item, g, 2) * 20 * item))::BIGINT AS unit_price,

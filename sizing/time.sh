@@ -22,6 +22,7 @@ RETRY_FAILED=${RETRY_FAILED:-0}
 # The spill folder is on the same disk as the data; a run that needs more
 # than this fails, and its log says so.
 SPILL_MAX_GB=${SPILL_MAX_GB:-$(($(df -BG --output=avail "$DATA" | tail -1 | tr -dc 0-9) - 2))}
+[ "$SPILL_MAX_GB" -ge 1 ] || { echo "under 3 GB free: no room to spill" >&2; exit 1; }
 CSV=$DATA/results/timings.csv
 SPILL=$DATA/tmp/spill
 OUT=$DATA/tmp/out.parquet
@@ -74,7 +75,7 @@ for c in "${cases[@]}"; do
         else
           grep -q "^$c,$m,$t,$r," "$CSV" && continue
         fi
-        log=$DATA/results/logs/$c-$m-$t-$r.log
+        log=$DATA/results/logs/$c-$m-$t-$r-$(date -u +%Y%m%dT%H%M%S).log
         rm -rf "$SPILL" "$OUT" && mkdir -p "$SPILL"
         drop_cache
         bytes=''
@@ -90,7 +91,8 @@ for c in "${cases[@]}"; do
         fi
         # Sample the spill folder while the run lasts, keeping the largest size.
         echo 0 >"$DATA/tmp/spill.max"
-        ( max=0; while :; do s=$(du -sb "$SPILL" 2>/dev/null | cut -f1); [ "${s:-0}" -gt "$max" ] && max=$s && echo "$max" >"$DATA/tmp/spill.max"; sleep 0.5; done ) &
+        # Files vanish mid-scan while DuckDB spills, so du may fail: keep going.
+        ( set +e; max=0; while :; do s=$(du -sb "$SPILL" 2>/dev/null | cut -f1); [ "${s:-0}" -gt "$max" ] && max=$s && echo "$max" >"$DATA/tmp/spill.max"; sleep 0.5; done ) &
         sampler=$!
         set +e
         /usr/bin/time -f '%e,%U,%S,%M' -o "$DATA/tmp/time.out" timeout "$TIMEOUT" "${cmd[@]}" >"$log" 2>&1
@@ -98,9 +100,13 @@ for c in "${cases[@]}"; do
         set -e
         kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null || true
         spill=$(cat "$DATA/tmp/spill.max"); spill=${spill:-0}
-        error=''
-        [ "$status" = 0 ] || error=$(grep -m1 -iE 'error|killed' "$log" | tr -d ',"' | cut -c1-120)
-        [ "$status" = 124 ] && error="timed out after $TIMEOUT s"
+        case $status in
+          0) error='' ;;
+          124) error="timed out after $TIMEOUT s" ;;
+          137) error='killed by signal 9, probably the kernel out of memory' ;;
+          *) error=$(grep -m1 -iE 'error|killed' "$log" | tr -d ',"' | cut -c1-120 || true)
+             error=${error:-"exit $status, no error line in the log"} ;;
+        esac
         echo "$c,$m,$t,$r,$(tail -1 "$DATA/tmp/time.out"),$spill,$bytes,$status,$(date -u +%FT%TZ),$error" | tee -a "$CSV"
       done
     done

@@ -5,6 +5,7 @@
 # step resumes where it stopped, so it can simply be run again.
 . "$(dirname "$0")/lib.sh"
 
+rm -f "$DATA/results/report.md"
 "$HERE/generate.sh"
 "$HERE/silver.sh"
 "$HERE/validate.sh" >/dev/null

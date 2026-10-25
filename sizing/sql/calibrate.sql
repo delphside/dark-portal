@@ -1,5 +1,6 @@
 -- The generator's inputs, measured from the real snapshots and their events.
 -- Placeholder: @SEED@ the seed folder. Writes, in it:
+--   pairs.csv      the snapshots whose pair with the one before is used
 --   params.csv     the rates, from pairs of snapshots about an hour apart
 --   pool.parquet   the last real snapshot's (item, quantity) pairs, from which
 --                  new postings are drawn, with each item's lowest price
@@ -17,6 +18,8 @@ CREATE TABLE pairs AS
            maxid - lag(maxid) OVER w AS id_span
     FROM s WINDOW w AS (ORDER BY snapshot_ts))
   WHERE epoch(hour_ts - prev_ts) BETWEEN 1800 AND 5400;
+-- validate.sql compares against the same pairs.
+COPY (SELECT hour_ts FROM pairs) TO '@SEED@/pairs.csv' (HEADER);
 CREATE TABLE e AS
   SELECT e.* FROM read_parquet('@SEED@/events/*.parquet') e SEMI JOIN pairs USING (hour_ts);
 

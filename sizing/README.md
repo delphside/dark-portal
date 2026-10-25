@@ -108,7 +108,9 @@ The last real snapshot is the starting state. Each hour:
    measured share on average, and sometimes the next one is part-bought.
 2. Listings past their expiry hour go. Others behind the front are cancelled
    at the measured rate.
-3. New postings bring the count back to the real count, give or take 5% over
+3. An item left with no listings gets one back, at its seed price, as a
+   real market keeps its rarer items listed.
+4. New postings bring the count back to the real count, give or take 5% over
    the day. Each draws an item and quantity from the last real snapshot, so
    both keep the real spread all year. Its price is the item's lowest price
    in that snapshot times a ratio drawn from the real postings, each measured
