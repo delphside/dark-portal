@@ -18,7 +18,7 @@ find "$DATA/bronze" "$DATA/silver" -name '*.parquet' -printf '%p,%s\n' >"$DATA/t
   echo
   echo '## Generator parameters'
   echo
-  duck -c "FROM read_csv('$DATA/seed/params.csv')" -markdown
+  duck -markdown -c "FROM read_csv('$DATA/seed/params.csv')"
   echo
   echo '## Validation'
   echo
