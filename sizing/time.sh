@@ -1,7 +1,9 @@
 #!/bin/bash
 # Times each case at each memory limit and thread count, cold, $REPEATS times,
-# appending to results/timings.csv. A run already recorded is skipped, so it
-# can be stopped and restarted. Usage: time.sh [CASE...]; with none, every case.
+# appending to results/timings.csv, with each run's output in results/logs/. A
+# run already recorded is skipped, failed or not, so it can be stopped and
+# restarted; RETRY_FAILED=1 runs the failed ones again. Usage: time.sh
+# [CASE...]; with none, every case.
 #
 # Cases: read (cold read of one bronze week, for the disk's throughput),
 # collect (one real snapshot to bronze), compare (one hourly comparison), and
@@ -16,6 +18,10 @@ THREADS=${THREADS:-1 2}
 REPEATS=${REPEATS:-3}
 COLD=${COLD:-1}
 TIMEOUT=${TIMEOUT:-7200}
+RETRY_FAILED=${RETRY_FAILED:-0}
+# The spill folder is on the same disk as the data; a run that needs more
+# than this fails, and its log says so.
+SPILL_MAX_GB=${SPILL_MAX_GB:-$(($(df -BG --output=avail "$DATA" | tail -1 | tr -dc 0-9) - 2))}
 CSV=$DATA/results/timings.csv
 SPILL=$DATA/tmp/spill
 OUT=$DATA/tmp/out.parquet
@@ -42,9 +48,15 @@ case_sql() {
   esac
 }
 
-drop_cache() { [ "$COLD" = 1 ] && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null || true; }
+drop_cache() {
+  [ "$COLD" = 1 ] || return 0
+  sync
+  echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null ||
+    { echo 'cannot drop the page cache, so the timings would not be cold: run as a sudo user, or COLD=0' >&2; exit 1; }
+}
 
-[ -f "$CSV" ] || echo 'case,memory_gb,threads,repeat,wall_s,user_s,sys_s,max_rss_kb,spill_max_bytes,read_bytes,exit,at' >"$CSV"
+[ -f "$CSV" ] || echo 'case,memory_gb,threads,repeat,wall_s,user_s,sys_s,max_rss_kb,spill_max_bytes,read_bytes,exit,at,error' >"$CSV"
+mkdir -p "$DATA/results/logs"
 cases=("$@")
 [ ${#cases[@]} -gt 0 ] || mapfile -t cases < <(all_cases | tr ' ' '\n')
 
@@ -57,7 +69,12 @@ for c in "${cases[@]}"; do
   for m in $mems; do
     for t in $threads; do
       for r in $(seq 1 "$REPEATS"); do
-        grep -q "^$c,$m,$t,$r,.*,0,[^,]*$" "$CSV" && continue
+        if [ "$RETRY_FAILED" = 1 ]; then
+          grep -q "^$c,$m,$t,$r,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,0," "$CSV" && continue
+        else
+          grep -q "^$c,$m,$t,$r," "$CSV" && continue
+        fi
+        log=$DATA/results/logs/$c-$m-$t-$r.log
         rm -rf "$SPILL" "$OUT" && mkdir -p "$SPILL"
         drop_cache
         bytes=''
@@ -67,20 +84,24 @@ for c in "${cases[@]}"; do
           drop_cache
           cmd=(sh -c 'cat "$@" >/dev/null' sh "${files[@]}")
         else
-          { echo "SET memory_limit = '${m}GB'; SET threads = $t; SET temp_directory = '$SPILL';"
+          { echo "SET memory_limit = '${m}GB'; SET threads = $t; SET temp_directory = '$SPILL'; SET max_temp_directory_size = '${SPILL_MAX_GB}GB';"
             case_sql "$c"; } >"$DATA/tmp/case.sql"
           cmd=("$DUCKDB" -no-agent -batch -init /dev/null -f "$DATA/tmp/case.sql")
         fi
         # Sample the spill folder while the run lasts, keeping the largest size.
+        echo 0 >"$DATA/tmp/spill.max"
         ( max=0; while :; do s=$(du -sb "$SPILL" 2>/dev/null | cut -f1); [ "${s:-0}" -gt "$max" ] && max=$s && echo "$max" >"$DATA/tmp/spill.max"; sleep 0.5; done ) &
         sampler=$!
-        echo 0 >"$DATA/tmp/spill.max"
         set +e
-        /usr/bin/time -f '%e,%U,%S,%M' -o "$DATA/tmp/time.out" timeout "$TIMEOUT" "${cmd[@]}" >"$DATA/tmp/case.log" 2>&1
+        /usr/bin/time -f '%e,%U,%S,%M' -o "$DATA/tmp/time.out" timeout "$TIMEOUT" "${cmd[@]}" >"$log" 2>&1
         status=$?
         set -e
         kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null || true
-        echo "$c,$m,$t,$r,$(tail -1 "$DATA/tmp/time.out"),$(cat "$DATA/tmp/spill.max"),$bytes,$status,$(date -u +%FT%TZ)" | tee -a "$CSV"
+        spill=$(cat "$DATA/tmp/spill.max"); spill=${spill:-0}
+        error=''
+        [ "$status" = 0 ] || error=$(grep -m1 -iE 'error|killed' "$log" | tr -d ',"' | cut -c1-120)
+        [ "$status" = 124 ] && error="timed out after $TIMEOUT s"
+        echo "$c,$m,$t,$r,$(tail -1 "$DATA/tmp/time.out"),$spill,$bytes,$status,$(date -u +%FT%TZ),$error" | tee -a "$CSV"
       done
     done
   done

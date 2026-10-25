@@ -6,6 +6,7 @@
 for w in $(seq 1 "$WEEKS"); do
   dir=$DATA/silver/$(week_dir "$w")
   [ -f "$dir/.done" ] && continue
+  need_free 2 "silver week $w"
   mkdir -p "$dir"
   start=$(date +%s)
   for h in $(seq $(((w - 1) * 168)) $((w * 168 - 1))); do

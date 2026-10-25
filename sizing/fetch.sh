@@ -12,9 +12,11 @@ RAW=$DATA/seed/raw
 LOG=$RAW/fetch.log
 
 # The secret goes to curl on its standard input, never on a command line.
-creds=$(sudo -u dp-e5 cat "$ENV_FILE")
-id=$(sed -n 's/^BLIZZARD_CLIENT_ID=//p' <<<"$creds")
-secret=$(sed -n 's/^BLIZZARD_CLIENT_SECRET=//p' <<<"$creds")
+# Tolerates `export`, quotes and CRLF line endings in the file.
+creds=$(sudo -u dp-e5 cat "$ENV_FILE" | tr -d '\r' | sed 's/^export //')
+value() { sed -n "s/^$1=//p" <<<"$creds" | sed 's/^["'"'"']//; s/["'"'"']$//'; }
+id=$(value BLIZZARD_CLIENT_ID)
+secret=$(value BLIZZARD_CLIENT_SECRET)
 unset creds
 token=$(printf 'user = "%s:%s"\n' "$id" "$secret" |
   curl -fsS -K - -d grant_type=client_credentials https://oauth.battle.net/token |
@@ -22,20 +24,26 @@ token=$(printf 'user = "%s:%s"\n' "$id" "$secret" |
 unset secret
 [ ${#token} -gt 20 ] || { echo 'no token: check the client in blizzard.env' >&2; exit 1; }
 
-last='' n=$(ls "$RAW"/c*.json 2>/dev/null | wc -l)
+# A snapshot is kept only when its last-modified time is newer than the last
+# one kept, so a restart, or a stale copy from Blizzard's cache, adds nothing.
+n=$(ls "$RAW"/c*.json 2>/dev/null | wc -l)
+last=0
+[ "$n" -gt 0 ] && last=$(date -u -d "$(cat "$RAW/c$n.ts") UTC" +%s)
 for _ in $(seq 1 $((N * 8))); do
   [ "$n" -ge "$N" ] && break
+  rm -f "$RAW/h.txt" "$RAW/tmp.json"
   printf 'header = "Authorization: Bearer %s"\n' "$token" |
-    curl -sS --compressed -K - -D "$RAW/h.txt" -o "$RAW/tmp.json" "$URL" || true
-  code=$(head -1 "$RAW/h.txt" | cut -d' ' -f2)
-  lm=$(grep -i '^last-modified' "$RAW/h.txt" | cut -d' ' -f2- | tr -d '\r')
-  echo "$(date -u +%FT%TZ) status=$code size=$(stat -c %s "$RAW/tmp.json") lm=$lm" >>"$LOG"
-  if [ "$code" = 200 ] && [ -n "$lm" ] && [ "$lm" != "$last" ]; then
+    curl -sS --compressed -K - -D "$RAW/h.txt" -o "$RAW/tmp.json" "$URL" && rc=0 || rc=$?
+  code=$(head -1 "$RAW/h.txt" 2>/dev/null | cut -d' ' -f2 || true)
+  lm=$(grep -i '^last-modified' "$RAW/h.txt" 2>/dev/null | cut -d' ' -f2- | tr -d '\r' || true)
+  t=$( [ -n "$lm" ] && date -u -d "$lm" +%s || echo 0)
+  echo "$(date -u +%FT%TZ) curl=$rc status=$code size=$(stat -c %s "$RAW/tmp.json" 2>/dev/null || echo 0) lm=$lm" >>"$LOG"
+  if [ "$rc" = 0 ] && [ "$code" = 200 ] && [ "$t" -gt "$last" ]; then
     n=$((n + 1))
     mv "$RAW/tmp.json" "$RAW/c$n.json"
-    date -u -d "$lm" '+%F %T' >"$RAW/c$n.ts"
+    date -u -d "@$t" '+%F %T' >"$RAW/c$n.ts"
     echo "saved c$n.json" >>"$LOG"
-    last=$lm
+    last=$t
   fi
   [ "$n" -ge "$N" ] || sleep 600
 done
@@ -46,4 +54,5 @@ for json in "$RAW"/c*.json; do
   c=$(basename "$json" .json)
   render "$HERE/sql/collect.sql" JSON="$json" TS="$(cat "$RAW/$c.ts")" OUT="$DATA/seed/real/$c.parquet" MAXOBJ="$MAXOBJ" | duck
 done
+[ "$n" -ge "$N" ] || echo "only $n of $N snapshots: see $LOG" | tee -a "$LOG"
 echo "done: $(ls "$DATA"/seed/real/*.parquet | wc -l) snapshots" | tee -a "$LOG"

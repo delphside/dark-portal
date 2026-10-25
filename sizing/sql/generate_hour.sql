@@ -1,6 +1,7 @@
 -- One synthetic hour: table cur (the last hour) to the next snapshot, which
 -- becomes cur. Placeholders: @H@ the hour index, @TS@ its time, @OUT@ the
--- bronze file. Expects macro u, table p (params.csv) and table cur.
+-- bronze file. Expects macro u, tables p (params.csv), pool, ratios and cur,
+-- and variables pool_size and ratio_count.
 SET VARIABLE maxid = (SELECT max(id) FROM cur);
 
 -- Each item's queue, price ascending and newest first, as compare.sql reads it.
@@ -30,31 +31,32 @@ CREATE OR REPLACE TEMP TABLE nxt AS
     AND NOT (q.pos > k.k + 1 AND u(q.id, @H@, 5) < (SELECT cancel_rate FROM p));
 
 -- New postings bring the count back to a target that swings 5% over the day.
--- Each copies an existing listing's item and quantity. The measured share
--- undercut the item's lowest price; the rest take the copied listing's price
--- within price_spread, so the spread of prices holds over the year. The
--- measured share of prices of a gold or more are whole silver. Ids rise at
--- the measured step.
+-- Each draws an (item, quantity) pair from the seed snapshot, so items and
+-- quantities keep the seed's spread all year, and a price ratio from the real
+-- postings, applied to the item's lowest price in the seed. Applied to the
+-- lowest price now instead, the ratios compound and prices climb week on week.
+-- The measured share of prices of a gold or more are whole silver. Ids rise
+-- at the measured step.
 SET VARIABLE posts = (
   SELECT greatest(0, round((SELECT seed_rows FROM p)
            * (1 + 0.05 * sin(2 * pi() * (@H@ % 24) / 24) + 0.02 * (u(@H@, 0, 9) - 0.5))
          - (SELECT count(*) FROM nxt)))::BIGINT);
 INSERT INTO nxt
-  WITH mp AS (SELECT item, min(unit_price) AS minp FROM cur GROUP BY item),
+  WITH draws AS (
+    SELECT range AS r,
+           (1 + floor(u(range, @H@, 7) * getvariable('pool_size')))::BIGINT AS pool_rn,
+           (1 + floor(u(range, @H@, 6) * getvariable('ratio_count')))::BIGINT AS ratio_rn
+    FROM range(1, getvariable('posts') + 1)),
   t AS (
-    SELECT id AS tid, item, quantity, unit_price, row_number() OVER (ORDER BY u(id, @H@, 7)) AS r
-    FROM cur QUALIFY r <= getvariable('posts')),
-  priced AS (
-    SELECT t.*, greatest(1, round(CASE
-             WHEN u(tid, @H@, 6) < (SELECT undercut_share FROM p) THEN mp.minp * (1 - 0.02 * u(tid, @H@, 10))
-             ELSE t.unit_price * (1 + (SELECT price_spread FROM p) * (u(tid, @H@, 10) - 0.5)) END)) AS price
-    FROM t JOIN mp USING (item))
+    SELECT draws.r, pool.item, pool.quantity, pool.seed_minp, ratios.ratio
+    FROM draws JOIN pool ON pool.rn = draws.pool_rn JOIN ratios ON ratios.rn = draws.ratio_rn),
+  priced AS (SELECT t.*, greatest(1, round(t.seed_minp * t.ratio)) AS price FROM t)
   SELECT getvariable('maxid') + ceil(r * (SELECT id_step FROM p))::BIGINT AS id,
          item, quantity,
-         (CASE WHEN price >= 10000 AND u(tid, @H@, 11) < (SELECT round_share FROM p)
+         (CASE WHEN price >= 10000 AND u(r, @H@, 11) < (SELECT round_share FROM p)
                THEN round(price / 100) * 100 ELSE price END)::BIGINT AS unit_price,
-         @H@ + CASE WHEN u(tid, @H@, 8) < (SELECT p12 FROM p) THEN 12
-                    WHEN u(tid, @H@, 8) < (SELECT p12 + (1 - p12) / 2 FROM p) THEN 24
+         @H@ + CASE WHEN u(r, @H@, 8) < (SELECT p12 FROM p) THEN 12
+                    WHEN u(r, @H@, 8) < (SELECT p12 + (1 - p12) / 2 FROM p) THEN 24
                     ELSE 48 END AS expires_h
   FROM priced;
 
