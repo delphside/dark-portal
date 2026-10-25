@@ -1,0 +1,88 @@
+#!/bin/bash
+# Times each case at each memory limit and thread count, cold, $REPEATS times,
+# appending to results/timings.csv. A run already recorded is skipped, so it
+# can be stopped and restarted. Usage: time.sh [CASE...]; with none, every case.
+#
+# Cases: read (cold read of one bronze week, for the disk's throughput),
+# collect (one real snapshot to bronze), compare (one hourly comparison), and
+# price, volume and lifetime over the last 4, 26 and 52 weeks.
+. "$(dirname "$0")/lib.sh"
+
+MEMS=${MEMS:-4 8 12}
+# The hourly steps are small, so they are timed lower down to find the least
+# each needs: its memory_limit is set from that (#12, R3).
+SMALL_MEMS=${SMALL_MEMS:-1 2 4}
+THREADS=${THREADS:-1 2}
+REPEATS=${REPEATS:-3}
+COLD=${COLD:-1}
+TIMEOUT=${TIMEOUT:-7200}
+CSV=$DATA/results/timings.csv
+SPILL=$DATA/tmp/spill
+OUT=$DATA/tmp/out.parquet
+
+all_cases() {
+  echo read collect compare
+  for q in price volume lifetime; do
+    for span in 4 26 52; do [ "$span" -le "$WEEKS" ] && echo "$q-$span"; done
+  done
+}
+
+case_sql() {
+  local c=$1 last
+  case $c in
+    collect)
+      render "$HERE/sql/collect.sql" JSON="$DATA/seed/raw/c1.json" TS="$(cat "$DATA/seed/raw/c1.ts")" OUT="$OUT" MAXOBJ="$MAXOBJ" ;;
+    compare)
+      last=$((WEEKS * 168 - 1))
+      render "$HERE/sql/compare.sql" \
+        PREV="$DATA/bronze/$(week_dir "$WEEKS")/h$(printf %04d $((last - 1))).parquet" \
+        CUR="$DATA/bronze/$(week_dir "$WEEKS")/h$(printf %04d "$last").parquet" OUT="$OUT" ;;
+    *-*)
+      render "$HERE/sql/q_${c%-*}.sql" DATA="$DATA" FROM=$((WEEKS - ${c#*-} + 1)) OUT="$OUT" ;;
+  esac
+}
+
+drop_cache() { [ "$COLD" = 1 ] && sync && echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null || true; }
+
+[ -f "$CSV" ] || echo 'case,memory_gb,threads,repeat,wall_s,user_s,sys_s,max_rss_kb,spill_max_bytes,read_bytes,exit,at' >"$CSV"
+cases=("$@")
+[ ${#cases[@]} -gt 0 ] || mapfile -t cases < <(all_cases | tr ' ' '\n')
+
+for c in "${cases[@]}"; do
+  case $c in
+    read) mems=0 threads=1 ;;
+    collect | compare) mems=$SMALL_MEMS threads=$THREADS ;;
+    *) mems=$MEMS threads=$THREADS ;;
+  esac
+  for m in $mems; do
+    for t in $threads; do
+      for r in $(seq 1 "$REPEATS"); do
+        grep -q "^$c,$m,$t,$r,.*,0,[^,]*$" "$CSV" && continue
+        rm -rf "$SPILL" "$OUT" && mkdir -p "$SPILL"
+        drop_cache
+        bytes=''
+        if [ "$c" = read ]; then
+          files=("$DATA/bronze/$(week_dir 1)"/*.parquet)
+          bytes=$(cat "${files[@]}" | wc -c)
+          drop_cache
+          cmd=(sh -c 'cat "$@" >/dev/null' sh "${files[@]}")
+        else
+          { echo "SET memory_limit = '${m}GB'; SET threads = $t; SET temp_directory = '$SPILL';"
+            case_sql "$c"; } >"$DATA/tmp/case.sql"
+          cmd=("$DUCKDB" -no-agent -batch -init /dev/null -f "$DATA/tmp/case.sql")
+        fi
+        # Sample the spill folder while the run lasts, keeping the largest size.
+        ( max=0; while :; do s=$(du -sb "$SPILL" 2>/dev/null | cut -f1); [ "${s:-0}" -gt "$max" ] && max=$s && echo "$max" >"$DATA/tmp/spill.max"; sleep 0.5; done ) &
+        sampler=$!
+        echo 0 >"$DATA/tmp/spill.max"
+        set +e
+        /usr/bin/time -f '%e,%U,%S,%M' -o "$DATA/tmp/time.out" timeout "$TIMEOUT" "${cmd[@]}" >"$DATA/tmp/case.log" 2>&1
+        status=$?
+        set -e
+        kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null || true
+        echo "$c,$m,$t,$r,$(tail -1 "$DATA/tmp/time.out"),$(cat "$DATA/tmp/spill.max"),$bytes,$status,$(date -u +%FT%TZ)" | tee -a "$CSV"
+      done
+    done
+  done
+done
+rm -rf "$SPILL" "$OUT"
