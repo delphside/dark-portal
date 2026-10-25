@@ -3,7 +3,8 @@
 --
 -- Each item's queue is price ascending, newest (highest id) first. A listing
 -- gone from in front of the first intact one was bought; one gone from behind
--- it was not, so it expired if its time was SHORT and was cancelled otherwise.
+-- it was not, so it expired if its time left was SHORT or MEDIUM (under two
+-- hours, so it could have run out within the hour) and was cancelled otherwise.
 -- A quantity drop is a partial buy. A new id is a posting.
 COPY (
   WITH a AS (
@@ -23,7 +24,7 @@ COPY (
            CASE WHEN f.fate = 'part' THEN f.quantity - f.q2 ELSE f.quantity END AS units,
            CASE WHEN f.fate = 'part' THEN 'sold_part'
                 WHEN f.pos < coalesce(fi.first_intact, 2147483647) THEN 'sold'
-                WHEN f.time_left = 'SHORT' THEN 'expired'
+                WHEN f.time_left IN ('SHORT', 'MEDIUM') THEN 'expired'
                 ELSE 'cancelled' END AS event
     FROM f LEFT JOIN fi USING (item)
     WHERE f.fate <> 'intact'

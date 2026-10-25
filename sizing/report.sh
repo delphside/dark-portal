@@ -16,6 +16,12 @@ find "$DATA/bronze" "$DATA/silver" -name '*.parquet' -printf '%p,%s\n' >"$DATA/t
   df -h "$DATA" | sed -n 1,2p
   echo '```'
   echo
+  echo '## Timing settings, per run of time.sh'
+  echo
+  echo '```text'
+  cat "$DATA/results/settings.txt" 2>/dev/null || echo 'none: time.sh has not run'
+  echo '```'
+  echo
   echo '## Generator parameters'
   echo
   echo "Collection accepts responses up to $MAXOBJ bytes, which sets its memory."

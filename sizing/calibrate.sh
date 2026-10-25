@@ -6,7 +6,7 @@
 . "$(dirname "$0")/lib.sh"
 
 rm -rf "$DATA"/bronze/* "$DATA"/silver/* "$DATA"/tmp/state-*.parquet \
-  "$DATA"/results/timings.csv "$DATA"/results/logs "$DATA"/results/validation.md "$DATA"/results/report.md
+  "$DATA"/results/timings.csv "$DATA"/results/logs "$DATA"/results/validation.md "$DATA"/results/report.md "$DATA"/results/settings.txt
 
 mapfile -t real < <(ls "$DATA"/seed/real/*.parquet | sort -V)
 [ ${#real[@]} -ge 2 ] || { echo 'need at least two real snapshots: run fetch.sh' >&2; exit 1; }

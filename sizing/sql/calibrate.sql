@@ -7,14 +7,15 @@
 --   ratios.parquet each real posting's price over its item's lowest price an
 --                  hour before, from which new postings are priced
 CREATE TABLE s AS
-  SELECT snapshot_ts, count(*) AS n, count(DISTINCT item) AS items, max(id) AS maxid
+  SELECT snapshot_ts, count(*) AS n, count(DISTINCT item) AS items, max(id) AS maxid,
+         count(*) FILTER (WHERE time_left IN ('LONG', 'VERY_LONG')) AS n_long
   FROM read_parquet('@SEED@/real/*.parquet') GROUP BY 1;
 -- Consecutive pairs; a pair further apart than about an hour (Blizzard skipped
 -- or delayed a refresh) would read as one hour's churn, so it is left out.
 CREATE TABLE pairs AS
   SELECT * FROM (
     SELECT snapshot_ts AS hour_ts, lag(snapshot_ts) OVER w AS prev_ts,
-           lag(n) OVER w AS prev_n, lag(items) OVER w AS prev_items,
+           lag(n) OVER w AS prev_n, lag(items) OVER w AS prev_items, lag(n_long) OVER w AS prev_long,
            maxid - lag(maxid) OVER w AS id_span
     FROM s WINDOW w AS (ORDER BY snapshot_ts))
   WHERE epoch(hour_ts - prev_ts) BETWEEN 1800 AND 5400;
@@ -41,6 +42,7 @@ COPY (
 
 CREATE TABLE per AS
   SELECT pairs.hour_ts, any_value(prev_n) AS prev_n, any_value(prev_items) AS prev_items,
+         any_value(prev_long) AS prev_long,
          any_value(id_span) AS id_span,
          count(*) FILTER (WHERE event = 'sold') AS sold,
          count(*) FILTER (WHERE event = 'sold_part') AS part,
@@ -53,7 +55,9 @@ CREATE TABLE per AS
   GROUP BY pairs.hour_ts;
 COPY (
   SELECT avg(sold / prev_n) AS front_rate,
-         avg(cancelled / prev_n) AS cancel_rate,
+         -- Only a listing with two hours or more left counts as cancelled, so
+         -- the rate is over those; the generator cancels only those too.
+         avg(cancelled / prev_long) AS cancel_rate,
          avg(part / prev_items) AS partial_rate,
          sum(posted_long) / sum(posted) AS p12,
          sum(id_span) / sum(posted) AS id_step,
