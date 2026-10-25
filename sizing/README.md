@@ -28,10 +28,10 @@ flowchart TB
 | --- | --- | --- |
 | `setup.sh` | installs DuckDB 2.0.0 and GNU `time`, makes the folders | a minute |
 | `fetch.sh` | fetches real commodity snapshots with the non-production Blizzard client until it has four, and loads each with the collection step | about 4 hours, unattended |
-| `calibrate.sh` | runs the comparison over the real pairs and measures the generator's parameters into `seed/params.csv` | seconds |
+| `calibrate.sh` | runs the comparison over the real pairs and measures the generator's inputs into `seed/`; removes any synthetic year made from older inputs | seconds |
 | `generate.sh` | the synthetic year in `bronze/week=NN/`, one file an hour | under an hour |
 | `silver.sh` | the comparison over every hour, into `silver/week=NN/` | under an hour |
-| `validate.sh` | rows, size and churn per snapshot, real against each synthetic week | minutes |
+| `validate.sh` | rows, size, churn, items, quantities and prices, real against each synthetic week | minutes |
 | `time.sh` | each case at each memory limit and thread count, with the page cache dropped first | hours: see below |
 | `report.sh` | `results/report.md`: the machine, the parameters, the validation, the timings and the disk per week | seconds |
 
@@ -52,8 +52,11 @@ timings if the validation fails. Every step resumes where it stopped.
 Each runs at 1 and 2 threads, three times. Measured: wall time, CPU time,
 peak resident memory, the largest spill, and the exit status. A run that
 fails, for example out of memory, is recorded as failed, which is a result
-too. `MEMS`, `SMALL_MEMS`, `THREADS`, `REPEATS`, `COLD` and `TIMEOUT` change
-the matrix.
+too: it is counted, its first error is reported, and its output is kept in
+`results/logs/`. A recorded run is not repeated; `RETRY_FAILED=1` repeats the
+failed ones. `MEMS`, `SMALL_MEMS`, `THREADS`, `REPEATS`, `COLD`, `TIMEOUT` and
+`SPILL_MAX_GB` change the matrix. With `COLD=1`, the default, the run stops if
+it cannot drop the page cache, rather than report warm timings as cold.
 
 The year-long scans read the whole of bronze from the boot volume, so they
 are probably limited by the disk rather than the CPU. Two passes give the
@@ -106,11 +109,21 @@ The last real snapshot is the starting state. Each hour:
 2. Listings past their expiry hour go. Others behind the front are cancelled
    at the measured rate.
 3. New postings bring the count back to the real count, give or take 5% over
-   the day. Each copies an existing listing's item and quantity. The measured
-   share undercut the item's lowest price; the rest take the copied price
-   within 10%. Durations are 12, 24 or 48 hours, with the measured share at
-   12. Ids rise at the measured step.
+   the day. Each draws an item and quantity from the last real snapshot, so
+   both keep the real spread all year. Its price is the item's lowest price
+   in that snapshot times a ratio drawn from the real postings, each measured
+   against its item's lowest price an hour before. So prices hold steady
+   over the year, which is what sizing needs, rather than following a
+   market. Durations are 12, 24 or
+   48 hours, with the measured share at 12. Ids rise at the measured step.
 
-Assumed rather than measured: the daily swing, the 10% price spread, the
-split between 24 and 48 hours, and how far a part-buy takes a quantity down.
-Only rows, size and churn are tested against the real snapshots.
+Assumed rather than measured: the daily swing, the split between 24 and 48
+hours, and how far a part-buy takes a quantity down. Pairs of real snapshots
+more than about an hour apart are left out of the measuring.
+
+The validation tests six things every week, each within 10% of the real
+snapshots: rows and size per snapshot, the share of listings gone each hour,
+distinct items, mean quantity, and the median item's price against its real
+price. Rows and churn hold by construction; the other four would show drift.
+`all.sh` times nothing unless all six pass. If one fails, the generator needs
+changing, and `calibrate.sh` then starts the year again.

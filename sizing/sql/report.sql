@@ -1,16 +1,25 @@
 -- Summarises the timings and the disk used. Placeholder: @DATA@.
 .mode markdown
-.print '### Timings: median of the repeats, with the spread'
+.print '### Timings: median of the runs that finished, with the spread'
 .print ''
-SELECT "case", memory_gb, threads, count(*) AS runs,
-       median(wall_s) AS wall_s, min(wall_s) AS wall_min, max(wall_s) AS wall_max,
-       median(user_s + sys_s) AS cpu_s,
+.print 'Failed runs are counted, not timed; the first error of each is in the next table.'
+.print ''
+CREATE TABLE t AS
+  SELECT * FROM read_csv('@DATA@/results/timings.csv', all_varchar = false, types = {'error': 'VARCHAR'});
+SELECT "case", memory_gb, threads,
+       count(*) FILTER (WHERE exit = 0) AS ok, count(*) FILTER (WHERE exit <> 0) AS failed,
+       median(wall_s) FILTER (WHERE exit = 0) AS wall_s,
+       min(wall_s) FILTER (WHERE exit = 0) AS wall_min, max(wall_s) FILTER (WHERE exit = 0) AS wall_max,
+       round(median(user_s + sys_s) FILTER (WHERE exit = 0), 1) AS cpu_s,
        round(max(max_rss_kb) / 1024) AS peak_rss_mb,
        round(max(spill_max_bytes) / 1e6) AS spill_mb,
-       round(median(read_bytes / wall_s) / 1e6, 1) AS read_mb_per_s,
-       max(exit) AS worst_exit
-FROM read_csv('@DATA@/results/timings.csv')
-GROUP BY ALL ORDER BY "case", memory_gb, threads;
+       round(median(read_bytes / wall_s) FILTER (WHERE exit = 0) / 1e6, 1) AS read_mb_per_s
+FROM t GROUP BY ALL ORDER BY "case", memory_gb, threads;
+
+.print ''
+.print '### Failed runs'
+.print ''
+SELECT "case", memory_gb, threads, "repeat", exit, wall_s, error FROM t WHERE exit <> 0 ORDER BY ALL;
 
 .print ''
 .print '### Disk per week'

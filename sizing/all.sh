@@ -8,8 +8,10 @@
 "$HERE/generate.sh"
 "$HERE/silver.sh"
 "$HERE/validate.sh" >/dev/null
-if grep -q FAIL "$DATA/results/validation.md"; then
-  echo "the synthetic year is not within 10% of the real snapshots: see $DATA/results/validation.md" >&2
+# Six tested metrics, each must pass; fewer pass lines means a failure or a
+# check that did not run.
+if [ "$(grep -c '| pass ' "$DATA/results/validation.md")" -ne 6 ]; then
+  echo "the synthetic year is not within 10% of the real snapshots on every tested metric: see $DATA/results/validation.md" >&2
   exit 1
 fi
 "$HERE/time.sh"
