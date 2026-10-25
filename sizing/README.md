@@ -66,7 +66,7 @@ second and third repeats.
 ## Running it on the non-production VM
 
 As `ubuntu`, which can read E5's Blizzard file through `sudo` and drop the
-page cache. The data goes to `~/sizing-data`, about 35 GB at real volumes.
+page cache. The data goes to `~/sizing-data`, 20 to 35 GB at real volumes, depending on how well the real data compresses.
 
 ```bash
 git clone https://github.com/delphside/dark-portal.git ~/dark-portal
@@ -121,14 +121,17 @@ The last real snapshot is the starting state. Each hour:
    market. Durations are 12, 24 or
    48 hours, with the measured share at 12. Ids rise at the measured step.
 
-Assumed rather than measured: the daily swing, the split between 24 and 48
-hours, and how far a part-buy takes a quantity down. Pairs of real snapshots
-more than about an hour apart are left out of the measuring.
+The split between 24- and 48-hour postings cannot be seen (both show as
+VERY_LONG), so it is solved for the measured expiry rate, approximately.
+Assumed rather than measured: the daily swing, and how far a part-buy takes a
+quantity down. Pairs of real snapshots not 45 to 75 minutes apart are left
+out of the measuring.
 
 The validation tests six things every week, each within 10% of the real
 snapshots: rows and size per snapshot, the share of listings gone each hour,
 distinct items, mean quantity, and the median item's price against its real
 price. Rows and items hold by construction, and churn by calibration; size,
-quantity and price would show drift.
+quantity and price would show drift. Churn is the one most likely to fail,
+since the expiry part of it rests on the approximate duration split.
 `all.sh` times nothing unless all six pass. If one fails, the generator needs
 changing, and `calibrate.sh` then starts the year again.
