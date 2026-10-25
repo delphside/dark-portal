@@ -37,6 +37,15 @@ CREATE OR REPLACE TEMP TABLE nxt AS
 -- lowest price now instead, the ratios compound and prices climb week on week.
 -- The measured share of prices of a gold or more are whole silver. Ids rise
 -- at the measured step.
+-- An item the hour left with no listings gets one back, as a real market
+-- keeps its rarer items listed; these count towards the target.
+INSERT INTO nxt
+  SELECT getvariable('maxid') + ceil(row_number() OVER (ORDER BY pool.item) * (SELECT id_step FROM p))::BIGINT AS id,
+         pool.item, pool.quantity, pool.seed_minp AS unit_price, @H@ + 48 AS expires_h
+  FROM pool
+  WHERE pool.rn IN (SELECT min(rn) FROM pool GROUP BY item)
+    AND pool.item NOT IN (SELECT item FROM nxt);
+SET VARIABLE maxid = (SELECT max(id) FROM nxt);
 SET VARIABLE posts = (
   SELECT greatest(0, round((SELECT seed_rows FROM p)
            * (1 + 0.05 * sin(2 * pi() * (@H@ % 24) / 24) + 0.02 * (u(@H@, 0, 9) - 0.5))

@@ -18,6 +18,8 @@ find "$DATA/bronze" "$DATA/silver" -name '*.parquet' -printf '%p,%s\n' >"$DATA/t
   echo
   echo '## Generator parameters'
   echo
+  echo "Collection accepts responses up to $MAXOBJ bytes, which sets its memory."
+  echo
   duck -markdown -c "FROM read_csv('$DATA/seed/params.csv')"
   echo
   echo '## Validation'

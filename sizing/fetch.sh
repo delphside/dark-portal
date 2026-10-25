@@ -26,7 +26,7 @@ unset secret
 
 # A snapshot is kept only when its last-modified time is newer than the last
 # one kept, so a restart, or a stale copy from Blizzard's cache, adds nothing.
-n=$(ls "$RAW"/c*.json 2>/dev/null | wc -l)
+n=$(find "$RAW" -maxdepth 1 -name 'c*.json' | wc -l)
 last=0
 [ "$n" -gt 0 ] && last=$(date -u -d "$(cat "$RAW/c$n.ts") UTC" +%s)
 for _ in $(seq 1 $((N * 8))); do
@@ -40,8 +40,8 @@ for _ in $(seq 1 $((N * 8))); do
   echo "$(date -u +%FT%TZ) curl=$rc status=$code size=$(stat -c %s "$RAW/tmp.json" 2>/dev/null || echo 0) lm=$lm" >>"$LOG"
   if [ "$rc" = 0 ] && [ "$code" = 200 ] && [ "$t" -gt "$last" ]; then
     n=$((n + 1))
-    mv "$RAW/tmp.json" "$RAW/c$n.json"
     date -u -d "@$t" '+%F %T' >"$RAW/c$n.ts"
+    mv "$RAW/tmp.json" "$RAW/c$n.json"
     echo "saved c$n.json" >>"$LOG"
     last=$t
   fi

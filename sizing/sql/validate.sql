@@ -17,6 +17,7 @@ CREATE TABLE snap AS
 CREATE TABLE ev AS
   WITH e AS (
     SELECT 'real' AS sample, hour_ts, event FROM read_parquet('@DATA@/seed/events/*.parquet')
+    WHERE hour_ts IN (SELECT hour_ts FROM read_csv('@DATA@/seed/pairs.csv'))
     UNION ALL
     SELECT lpad(week::VARCHAR, 2, '0'), hour_ts, event
     FROM read_parquet('@DATA@/silver/*/*.parquet', hive_partitioning = true))
