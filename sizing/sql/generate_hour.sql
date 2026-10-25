@@ -18,7 +18,8 @@ CREATE OR REPLACE TEMP TABLE k AS
          u(item, @H@, 3) < (SELECT partial_rate FROM p) AS part
   FROM q GROUP BY item;
 
--- What survives: not bought whole, not expired, not cancelled.
+-- What survives: not bought whole, not expired, not cancelled. As compare.sql
+-- reads it, only a listing that had more than two hours left can be cancelled.
 CREATE OR REPLACE TEMP TABLE nxt AS
   SELECT q.id, q.item,
          CASE WHEN k.part AND q.pos = k.k + 1
@@ -28,7 +29,7 @@ CREATE OR REPLACE TEMP TABLE nxt AS
   FROM q JOIN k USING (item)
   WHERE q.pos > k.k
     AND q.expires_h > @H@
-    AND NOT (q.pos > k.k + 1 AND u(q.id, @H@, 5) < (SELECT cancel_rate FROM p));
+    AND NOT (q.pos > k.k + 1 AND q.expires_h > @H@ + 1 AND u(q.id, @H@, 5) < (SELECT cancel_rate FROM p));
 
 -- New postings bring the count back to a target that swings 5% over the day.
 -- Each draws an (item, quantity) pair from the seed snapshot, so items and

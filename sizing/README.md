@@ -75,7 +75,9 @@ cd ~/dark-portal/sizing
 nohup ./fetch.sh >~/fetch.out 2>&1 &
 ```
 
-When `tail ~/sizing-data/seed/raw/fetch.log` says `done`:
+Avoid starting it on a Wednesday morning, when Blizzard's EU maintenance can
+hold the data still for hours. When `tail ~/sizing-data/seed/raw/fetch.log`
+says `done` (or `stopped`, and then `~/fetch.out` says why):
 
 ```bash
 ./calibrate.sh
@@ -126,6 +128,7 @@ more than about an hour apart are left out of the measuring.
 The validation tests six things every week, each within 10% of the real
 snapshots: rows and size per snapshot, the share of listings gone each hour,
 distinct items, mean quantity, and the median item's price against its real
-price. Rows and churn hold by construction; the other four would show drift.
+price. Rows and items hold by construction, and churn by calibration; size,
+quantity and price would show drift.
 `all.sh` times nothing unless all six pass. If one fails, the generator needs
 changing, and `calibrate.sh` then starts the year again.

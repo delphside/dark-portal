@@ -14,16 +14,24 @@ mkdir -p "$DATA/seed/raw" "$DATA/seed/real"
     SELECT (row_number() OVER (ORDER BY u(item, g, 0)) * 3 + 2000000000)::BIGINT AS id, item,
            (1 + floor(u(item, g, 1) * 200))::INTEGER AS quantity,
            (100 * item + floor(u(item, g, 2) * 20 * item))::BIGINT AS unit_price,
-           ['SHORT', 'MEDIUM', 'LONG', 'VERY_LONG'][1 + floor(u(item, g, 3) * 4)::INTEGER] AS time_left
+           CASE WHEN u(item, g, 3) < 0.03 THEN 'SHORT' WHEN u(item, g, 3) < 0.06 THEN 'MEDIUM'
+                WHEN u(item, g, 3) < 0.36 THEN 'LONG' ELSE 'VERY_LONG' END AS time_left
     FROM items, generate_series(1, n) AS s(g);"
   for i in 1 2 3 4; do
     if [ "$i" -gt 1 ]; then
-      # An hour's churn: 7% gone, as many new, ids rising.
+      # An hour's churn: SHORT listings expire, the others move down a band
+      # now and then, 4.5% of the rest go, and as many are posted, ids rising.
       echo "CREATE OR REPLACE TABLE t AS
-        WITH k AS (SELECT * FROM t WHERE u(id, $i, 4) > 0.07),
-        n AS (SELECT (SELECT max(id) FROM t) + 3 * row_number() OVER () AS id, item, quantity,
+        WITH k AS (
+          SELECT id, item, quantity, unit_price,
+                 CASE WHEN time_left = 'MEDIUM' THEN 'SHORT'
+                      WHEN time_left = 'LONG' AND u(id, $i, 6) < 0.1 THEN 'MEDIUM'
+                      WHEN time_left = 'VERY_LONG' AND u(id, $i, 6) < 0.03 THEN 'LONG'
+                      ELSE time_left END AS time_left
+          FROM t WHERE time_left <> 'SHORT' AND u(id, $i, 4) > 0.045),
+        n AS (SELECT (SELECT max(id) FROM t) + 3 * row_number() OVER (ORDER BY u(id, $i, 7)) AS id, item, quantity,
                      unit_price - 1 AS unit_price, CASE WHEN u(id, $i, 5) < 0.3 THEN 'LONG' ELSE 'VERY_LONG' END AS time_left
-              FROM t WHERE u(id, $i, 4) <= 0.07)
+              FROM t QUALIFY row_number() OVER (ORDER BY u(id, $i, 7)) <= (SELECT count(*) FROM t) - (SELECT count(*) FROM k))
         FROM k UNION ALL FROM n;"
     fi
     echo "COPY (SELECT list({'id': id, 'item': {'id': item}, 'quantity': quantity, 'unit_price': unit_price, 'time_left': time_left}) AS auctions FROM t)

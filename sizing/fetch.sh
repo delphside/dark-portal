@@ -10,6 +10,7 @@ ENV_FILE=${BLIZZARD_ENV:-/srv/dp/e5/blizzard.env}
 URL='https://eu.api.blizzard.com/data/wow/auctions/commodities?namespace=dynamic-eu&locale=en_GB'
 RAW=$DATA/seed/raw
 LOG=$RAW/fetch.log
+trap 'echo "stopped ($?): see ~/fetch.out" >>"$LOG"' ERR
 
 # The secret goes to curl on its standard input, never on a command line.
 # Tolerates `export`, quotes and CRLF line endings in the file.
@@ -19,8 +20,8 @@ id=$(value BLIZZARD_CLIENT_ID)
 secret=$(value BLIZZARD_CLIENT_SECRET)
 unset creds
 token=$(printf 'user = "%s:%s"\n' "$id" "$secret" |
-  curl -fsS -K - -d grant_type=client_credentials https://oauth.battle.net/token |
-  sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')
+  curl -fsS --max-time 60 -K - -d grant_type=client_credentials https://oauth.battle.net/token |
+  sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p' || true)
 unset secret
 [ ${#token} -gt 20 ] || { echo 'no token: check the client in blizzard.env' >&2; exit 1; }
 
@@ -33,7 +34,7 @@ for _ in $(seq 1 $((N * 8))); do
   [ "$n" -ge "$N" ] && break
   rm -f "$RAW/h.txt" "$RAW/tmp.json"
   printf 'header = "Authorization: Bearer %s"\n' "$token" |
-    curl -sS --compressed -K - -D "$RAW/h.txt" -o "$RAW/tmp.json" "$URL" && rc=0 || rc=$?
+    curl -sS --compressed --connect-timeout 30 --max-time 300 -K - -D "$RAW/h.txt" -o "$RAW/tmp.json" "$URL" && rc=0 || rc=$?
   code=$(head -1 "$RAW/h.txt" 2>/dev/null | cut -d' ' -f2 || true)
   lm=$(grep -i '^last-modified' "$RAW/h.txt" 2>/dev/null | cut -d' ' -f2- | tr -d '\r' || true)
   t=$( [ -n "$lm" ] && date -u -d "$lm" +%s || echo 0)

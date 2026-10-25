@@ -58,6 +58,7 @@ drop_cache() {
 
 [ -f "$CSV" ] || echo 'case,memory_gb,threads,repeat,wall_s,user_s,sys_s,max_rss_kb,spill_max_bytes,read_bytes,exit,at,error' >"$CSV"
 mkdir -p "$DATA/results/logs"
+echo "$(date -u +%FT%TZ) cold=$COLD timeout_s=$TIMEOUT spill_cap_gb=$SPILL_MAX_GB maxobj=$MAXOBJ" >>"$DATA/results/settings.txt"
 cases=("$@")
 [ ${#cases[@]} -gt 0 ] || mapfile -t cases < <(all_cases | tr ' ' '\n')
 
@@ -104,7 +105,8 @@ for c in "${cases[@]}"; do
           0) error='' ;;
           124) error="timed out after $TIMEOUT s" ;;
           137) error='killed by signal 9, probably the kernel out of memory' ;;
-          *) error=$(grep -m1 -iE 'error|killed' "$log" | tr -d ',"' | cut -c1-120 || true)
+          *) grep -q max_temp_directory_size "$log" && error="spill cap of $SPILL_MAX_GB GB reached" ||
+             error=$(grep -m1 -iE 'error|killed' "$log" | tr -d ',"' | cut -c1-120 || true)
              error=${error:-"exit $status, no error line in the log"} ;;
         esac
         echo "$c,$m,$t,$r,$(tail -1 "$DATA/tmp/time.out"),$spill,$bytes,$status,$(date -u +%FT%TZ),$error" | tee -a "$CSV"
