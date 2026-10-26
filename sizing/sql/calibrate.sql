@@ -72,11 +72,16 @@ COPY (
          count(*) AS pairs
   FROM per)
   -- The split of 24- and 48-hour postings is not visible (both show
-  -- VERY_LONG), so it is solved for the measured expiry rate: a posting of d
-  -- hours survives to expire with chance about (1 - h)^d, h being the hourly
-  -- rate of sales and cancellations.
+  -- VERY_LONG), so it is solved for the measured expiry rate. In the
+  -- generator a posting of d hours can be bought in d - 1 hourly steps and
+  -- cancelled in d - 2, so it survives to expire with chance about
+  -- s(d) = (1 - front_rate)^(d - 1) * (1 - cancel_rate)^(d - 2).
   SELECT *, least(greatest(
-           (p12 * pow(1 - h, 12) + (1 - p12) * pow(1 - h, 24) - real_expired_rate / real_posted_rate)
-           / (pow(1 - h, 24) - pow(1 - h, 48)), 0), 1 - p12) AS p48
-  FROM (SELECT *, front_rate + cancel_rate AS h FROM base)
+           (p12 * s12 + (1 - p12) * s24 - real_expired_rate / real_posted_rate) / (s24 - s48),
+           0), 1 - p12) AS p48
+  FROM (
+    SELECT *, pow(1 - front_rate, 11) * pow(1 - cancel_rate, 10) AS s12,
+              pow(1 - front_rate, 23) * pow(1 - cancel_rate, 22) AS s24,
+              pow(1 - front_rate, 47) * pow(1 - cancel_rate, 46) AS s48
+    FROM base)
 ) TO '@SEED@/params.csv' (HEADER);
