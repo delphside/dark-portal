@@ -66,7 +66,12 @@ second and third repeats.
 ## Running it on the non-production VM
 
 As `ubuntu`, which can read E5's Blizzard file through `sudo` and drop the
-page cache. The data goes to `~/sizing-data`, 20 to 35 GB at real volumes, depending on how well the real data compresses.
+page cache. The data goes to `~/sizing-data`: 20 to 40 GB at real volumes,
+with room to spill, depending on how well the real data compresses. That fits
+the VM's free disk only while a bronze week is under about 0.5 GB.
+`generate.sh` checks after week 1 and stops if the year will not fit. Then
+either grow the boot volume, or set `SIZING_WEEKS` lower, which shortens the
+year-long cases to the weeks there are.
 
 ```bash
 git clone https://github.com/delphside/dark-portal.git ~/dark-portal

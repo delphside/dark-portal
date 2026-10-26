@@ -27,7 +27,10 @@ render() {
 need_free() {
   local free
   free=$(df -BG --output=avail "$DATA" | tail -1 | tr -dc 0-9)
-  [ "$free" -ge "$1" ] || { echo "stopped: $2 needs $1 GB free, $free GB is" >&2; exit 1; }
+  [ "$free" -ge "$1" ] || {
+    echo "stopped: $2 needs $1 GB free, $free GB is. Grow the boot volume, or set SIZING_WEEKS lower (README)" >&2
+    exit 1
+  }
 }
 
 week_dir() { printf 'week=%02d' "$1"; }
