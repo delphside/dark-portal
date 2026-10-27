@@ -10,6 +10,11 @@
 - Dark Portal's records are in the programme repository's live checkout, under
   `applications/dark-portal/`, never in the pinned submodule.
 
+## The session on the web
+
+- The application's own notes issue, where a web session leaves its note for
+  the local session when no issue concerns the work, is #11.
+
 ## Changes
 
 - Commits and pull requests say `Refs #N`, never `Closes #N`: this repository
