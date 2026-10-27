@@ -6,6 +6,8 @@
 --                  new postings are drawn, with each item's lowest price
 --   ratios.parquet each real posting's price over its item's lowest price an
 --                  hour before, from which new postings are priced
+--   ladder.parquet each item's prices in the last real snapshot, to which new
+--                  postings' prices are snapped
 CREATE TABLE s AS
   SELECT snapshot_ts, count(*) AS n, count(DISTINCT item) AS items, max(id) AS maxid,
          count(*) FILTER (WHERE time_left IN ('LONG', 'VERY_LONG')) AS n_long
