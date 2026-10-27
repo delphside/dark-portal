@@ -36,7 +36,10 @@ CREATE OR REPLACE TEMP TABLE nxt AS
 -- quantities keep the seed's spread all year, and a price ratio from the real
 -- postings, applied to the item's lowest price in the seed. Applied to the
 -- lowest price now instead, the ratios compound and prices climb week on week.
--- The measured share of prices of a gold or more are whole silver. Ids rise
+-- The price is then snapped up to the next price the item had in the seed,
+-- as real postings mostly match a listed price; above the item's highest it
+-- stays, and the measured share of those of a gold or more are whole silver.
+-- Ids rise
 -- at the measured step.
 -- An item the hour left with no listings gets one back, as a real market
 -- keeps its rarer items listed; these count towards the target.
@@ -60,15 +63,20 @@ INSERT INTO nxt
   t AS (
     SELECT draws.r, pool.item, pool.quantity, pool.seed_minp, ratios.ratio
     FROM draws JOIN pool ON pool.rn = draws.pool_rn JOIN ratios ON ratios.rn = draws.ratio_rn),
-  priced AS (SELECT t.*, greatest(1, round(t.seed_minp * t.ratio)) AS price FROM t)
+  priced AS (SELECT t.*, greatest(1, round(t.seed_minp * t.ratio)) AS price FROM t),
+  snapped AS (
+    SELECT priced.*, ladder.unit_price AS ladder_price
+    FROM priced ASOF LEFT JOIN ladder
+      ON ladder.item = priced.item AND ladder.unit_price >= priced.price)
   SELECT getvariable('maxid') + ceil(r * (SELECT id_step FROM p))::BIGINT AS id,
          item, quantity,
-         (CASE WHEN price >= 10000 AND u(r, @H@, 11) < (SELECT round_share FROM p)
-               THEN round(price / 100) * 100 ELSE price END)::BIGINT AS unit_price,
+         coalesce(ladder_price,
+                  CASE WHEN price >= 10000 AND u(r, @H@, 11) < (SELECT round_share FROM p)
+                       THEN round(price / 100) * 100 ELSE price END)::BIGINT AS unit_price,
          @H@ + CASE WHEN u(r, @H@, 8) < (SELECT p12 FROM p) THEN 12
                     WHEN u(r, @H@, 8) < (SELECT 1 - p48 FROM p) THEN 24
                     ELSE 48 END AS expires_h
-  FROM priced;
+  FROM snapped;
 
 COPY (
   SELECT TIMESTAMP '@TS@' AS snapshot_ts, id, item, quantity, unit_price,

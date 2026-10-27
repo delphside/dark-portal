@@ -1,8 +1,9 @@
 #!/bin/bash
 # Runs the hourly comparison over each pair of real snapshots, then measures
-# the generator's inputs from them (seed/params.csv, pool.parquet and
-# ratios.parquet). New inputs make the synthetic year and everything after it
-# stale, so those are removed, and the next all.sh starts again.
+# the generator's inputs from them (seed/params.csv, pool.parquet,
+# ratios.parquet and ladder.parquet). New inputs make the synthetic year and
+# everything after it stale, so those are removed, and the next all.sh starts
+# again.
 . "$(dirname "$0")/lib.sh"
 
 rm -rf "$DATA"/bronze/* "$DATA"/silver/* "$DATA"/tmp/state-*.parquet \
