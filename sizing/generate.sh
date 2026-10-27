@@ -24,10 +24,13 @@ for w in $(seq 1 "$WEEKS"); do
   dir=$DATA/bronze/$(week_dir "$w")
   mkdir -p "$dir"
   {
+    # Stop at the first error, so a broken hour fails the week, not just itself.
+    echo ".bail on"
     echo "CREATE MACRO u(a, b, c) AS (hash(a, b, c) % 1000003) / 1000003.0;"
     echo "CREATE TABLE p AS FROM read_csv('$DATA/seed/params.csv');"
     echo "CREATE TABLE pool AS FROM read_parquet('$DATA/seed/pool.parquet');"
     echo "CREATE TABLE ratios AS FROM read_parquet('$DATA/seed/ratios.parquet');"
+    echo "CREATE TABLE ladder AS FROM read_parquet('$DATA/seed/ladder.parquet');"
     echo "SET VARIABLE pool_size = (SELECT count(*) FROM pool);"
     echo "SET VARIABLE ratio_count = (SELECT count(*) FROM ratios);"
     echo "CREATE TABLE cur AS FROM read_parquet('$(state $((w - 1)))');"

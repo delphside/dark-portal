@@ -1,7 +1,7 @@
 -- One synthetic hour: table cur (the last hour) to the next snapshot, which
 -- becomes cur. Placeholders: @H@ the hour index, @TS@ its time, @OUT@ the
--- bronze file. Expects macro u, tables p (params.csv), pool, ratios and cur,
--- and variables pool_size and ratio_count.
+-- bronze file. Expects macro u, tables p (params.csv), pool, ratios, ladder
+-- and cur, and variables pool_size and ratio_count.
 SET VARIABLE maxid = (SELECT max(id) FROM cur);
 
 -- Each item's queue, price ascending and newest first, as compare.sql reads it.
@@ -36,8 +36,11 @@ CREATE OR REPLACE TEMP TABLE nxt AS
 -- quantities keep the seed's spread all year, and a price ratio from the real
 -- postings, applied to the item's lowest price in the seed. Applied to the
 -- lowest price now instead, the ratios compound and prices climb week on week.
--- The measured share of prices of a gold or more are whole silver. Ids rise
--- at the measured step.
+-- The price is then snapped to the nearest price the item had in the seed,
+-- as real postings mostly match a listed price; nearest, not next above, so
+-- prices do not climb where an item's prices are far apart. Above the item's
+-- highest it stays, and the measured share of those of a gold or more are
+-- whole silver. Ids rise at the measured step.
 -- An item the hour left with no listings gets one back, as a real market
 -- keeps its rarer items listed; these count towards the target.
 INSERT INTO nxt
@@ -60,15 +63,27 @@ INSERT INTO nxt
   t AS (
     SELECT draws.r, pool.item, pool.quantity, pool.seed_minp, ratios.ratio
     FROM draws JOIN pool ON pool.rn = draws.pool_rn JOIN ratios ON ratios.rn = draws.ratio_rn),
-  priced AS (SELECT t.*, greatest(1, round(t.seed_minp * t.ratio)) AS price FROM t)
+  priced AS (SELECT t.*, greatest(1, round(t.seed_minp * t.ratio)) AS price FROM t),
+  up AS (
+    SELECT priced.*, ladder.unit_price AS above
+    FROM priced ASOF LEFT JOIN ladder
+      ON ladder.item = priced.item AND ladder.unit_price >= priced.price),
+  snapped AS (
+    SELECT up.*,
+           CASE WHEN ladder.unit_price IS NOT NULL
+                     AND up.price - ladder.unit_price < up.above - up.price
+                THEN ladder.unit_price ELSE up.above END AS ladder_price
+    FROM up ASOF LEFT JOIN ladder
+      ON ladder.item = up.item AND ladder.unit_price <= up.price)
   SELECT getvariable('maxid') + ceil(r * (SELECT id_step FROM p))::BIGINT AS id,
          item, quantity,
-         (CASE WHEN price >= 10000 AND u(r, @H@, 11) < (SELECT round_share FROM p)
-               THEN round(price / 100) * 100 ELSE price END)::BIGINT AS unit_price,
+         coalesce(ladder_price,
+                  CASE WHEN price >= 10000 AND u(r, @H@, 11) < (SELECT round_share FROM p)
+                       THEN round(price / 100) * 100 ELSE price END)::BIGINT AS unit_price,
          @H@ + CASE WHEN u(r, @H@, 8) < (SELECT p12 FROM p) THEN 12
                     WHEN u(r, @H@, 8) < (SELECT 1 - p48 FROM p) THEN 24
                     ELSE 48 END AS expires_h
-  FROM priced;
+  FROM snapped;
 
 COPY (
   SELECT TIMESTAMP '@TS@' AS snapshot_ts, id, item, quantity, unit_price,

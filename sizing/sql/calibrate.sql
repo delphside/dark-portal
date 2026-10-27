@@ -6,6 +6,8 @@
 --                  new postings are drawn, with each item's lowest price
 --   ratios.parquet each real posting's price over its item's lowest price an
 --                  hour before, from which new postings are priced
+--   ladder.parquet each item's prices in the last real snapshot, to which new
+--                  postings' prices are snapped
 CREATE TABLE s AS
   SELECT snapshot_ts, count(*) AS n, count(DISTINCT item) AS items, max(id) AS maxid,
          count(*) FILTER (WHERE time_left IN ('LONG', 'VERY_LONG')) AS n_long
@@ -39,6 +41,15 @@ COPY (
          min(unit_price) OVER (PARTITION BY item) AS seed_minp
   FROM last
 ) TO '@SEED@/pool.parquet' (FORMAT parquet);
+-- Each item's prices in the last real snapshot. Real postings mostly match a
+-- price already listed, so new postings are snapped to the nearest of these;
+-- priced freely, the synthetic year had three times the distinct prices and
+-- compressed 22% worse (first real run, 2026-10-27).
+COPY (
+  SELECT DISTINCT item, unit_price
+  FROM read_parquet('@SEED@/real/*.parquet')
+  WHERE snapshot_ts = (SELECT max(snapshot_ts) FROM s)
+) TO '@SEED@/ladder.parquet' (FORMAT parquet);
 
 CREATE TABLE per AS
   SELECT pairs.hour_ts, any_value(prev_n) AS prev_n, any_value(prev_items) AS prev_items,
@@ -72,16 +83,19 @@ COPY (
          count(*) AS pairs
   FROM per)
   -- The split of 24- and 48-hour postings is not visible (both show
-  -- VERY_LONG), so it is solved for the measured expiry rate. In the
-  -- generator a posting of d hours can be bought in d - 1 hourly steps and
-  -- cancelled in d - 2, so it survives to expire with chance about
-  -- s(d) = (1 - front_rate)^(d - 1) * (1 - cancel_rate)^(d - 2).
+  -- VERY_LONG), so it is solved for the measured expiry rate. Sales take the
+  -- front of the queue, which is mostly new postings, so a posting is either
+  -- bought (sold / posted of them) or never reaches the front; one that is
+  -- not bought survives d - 2 hourly chances of cancelling, and expires with
+  -- chance about s(d) = (1 - sold / posted) * (1 - cancel_rate)^(d - 2).
+  -- Assuming every listing is bought at front_rate an hour instead left too
+  -- few to expire, and p48 came out below 0 (first real run, 2026-10-27).
   SELECT *, least(greatest(
            (p12 * s12 + (1 - p12) * s24 - real_expired_rate / real_posted_rate) / (s24 - s48),
            0), 1 - p12) AS p48
   FROM (
-    SELECT *, pow(1 - front_rate, 11) * pow(1 - cancel_rate, 10) AS s12,
-              pow(1 - front_rate, 23) * pow(1 - cancel_rate, 22) AS s24,
-              pow(1 - front_rate, 47) * pow(1 - cancel_rate, 46) AS s48
+    SELECT *, greatest(1 - front_rate / real_posted_rate, 0.01) * pow(1 - cancel_rate, 10) AS s12,
+              greatest(1 - front_rate / real_posted_rate, 0.01) * pow(1 - cancel_rate, 22) AS s24,
+              greatest(1 - front_rate / real_posted_rate, 0.01) * pow(1 - cancel_rate, 46) AS s48
     FROM base)
 ) TO '@SEED@/params.csv' (HEADER);
