@@ -42,7 +42,7 @@ COPY (
   FROM last
 ) TO '@SEED@/pool.parquet' (FORMAT parquet);
 -- Each item's prices in the last real snapshot. Real postings mostly match a
--- price already listed, so new postings are snapped up to the next of these;
+-- price already listed, so new postings are snapped to the nearest of these;
 -- priced freely, the synthetic year had three times the distinct prices and
 -- compressed 22% worse (first real run, 2026-10-27).
 COPY (
