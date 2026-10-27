@@ -17,7 +17,4 @@
 
 ## Changes
 
-- Commits and pull requests say `Refs #N`, never `Closes #N`: this repository
-  does not close issues from merged pull requests (owner, 2026-10-24), so an
-  issue is closed by hand after its post-deployment check.
 - No commit stamp yet: it is set with the first release (#11).
