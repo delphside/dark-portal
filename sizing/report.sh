@@ -34,6 +34,22 @@ find "$DATA/bronze" "$DATA/silver" -name '*.parquet' -printf '%p,%s\n' >"$DATA/t
   echo
   echo '## Results'
   echo
+  cat <<'EOF'
+### The cases
+
+Each case is one SQL file in `sql/`. A suffix `-4`, `-26` or `-52` is the
+number of weeks of history the query scans, counted back from the last.
+
+| case | what it does | the job it stands for |
+| --- | --- | --- |
+| `read` | a cold `cat` of one bronze week, for the disk's throughput | none: a measure of the disk |
+| `collect` | one Blizzard response, as JSON, to one bronze Parquet file | the hourly job, first half |
+| `compare` | two consecutive bronze snapshots to the hour's events in silver: posted, sold, part-sold, cancelled, expired | the hourly job, second half |
+| `price` | each item's lowest, typical and highest price per day, and units listed, from bronze | an on-demand history query |
+| `volume` | each item's daily units sold, value, median sold price, postings and cancels, from silver | an on-demand history query |
+| `lifetime` | each listing's posting joined to its end, from silver, for time to sell, cancel or expire | none: the worst case, rebuilding from history what the hourly job carries forward |
+
+EOF
   render "$HERE/sql/report.sql" DATA="$DATA" | duck
 } >"$DATA/results/report.md"
 echo "written: $DATA/results/report.md"
