@@ -1,0 +1,69 @@
+# Keeps the board's PR State current whenever a pull request or its review
+# changes, so it no longer depends on which session opened the pull request.
+#
+# `PR State` is derived, never typed (the programme's docs/1.6), as Tile Lite
+# Elite's does: `board-pr-state.py` reads GitHub's own state and writes the
+# field. Without it a Dark Portal pull request reached the board only through
+# the programme's hourly add, with PR State unset (owner, 2026-11-03).
+#
+# **It runs the script from the programme's main**, not the pinned submodule,
+# because the pin predates the fix that adds only open pull requests; without
+# it the first run would add this repository's whole history to the board.
+#
+# **It needs `BOARD_TOKEN`.** The automatic workflow token cannot write a
+# Projects v2 field. The token is the owner's to create: a fine-grained token
+# with read and write on the organisation's projects and read on this
+# repository's pull requests, stored as the repository secret `BOARD_TOKEN`.
+# Without it this run warns and changes nothing, rather than failing every
+# pull request.
+name: PR State
+
+on:
+  pull_request:
+    types: [opened, reopened, closed, ready_for_review, converted_to_draft,
+            review_requested, review_request_removed]
+  pull_request_review:
+    types: [submitted, dismissed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One sync at a time: each run reads every pull request, so a later run
+# supersedes an earlier one that has not finished.
+concurrency:
+  group: pr-state
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: set the board's PR State
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The pinned programme: its programme file (config/programme.toml), #485.
+          submodules: true
+
+      # The programme's records, at the head of its main: this application's
+      # programme profile is read there. `PROGRAMME_DIR` is the variable
+      # `programme/scripts/board/records.py` reads.
+      - uses: actions/checkout@v7
+        with:
+          repository: delphside/programme
+          ref: main
+          path: .programme-live
+
+      - name: Point the scripts at the programme's records
+        run: echo "PROGRAMME_DIR=$GITHUB_WORKSPACE/.programme-live" >> "$GITHUB_ENV"
+
+      - name: Sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.BOARD_TOKEN }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::warning::BOARD_TOKEN is not set, so PR State was not synced. See this file's header."
+            exit 0
+          fi
+          python3 .programme-live/scripts/board/board-pr-state.py
