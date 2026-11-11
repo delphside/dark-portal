@@ -6,7 +6,8 @@
 
 - The generic rules, skills and agents are in the `programme/` submodule
   (`delphside/programme`), pinned at a commit of this repository's choosing.
-  Run `git submodule update --init` after a clone or a pull that moves the pin.
+  `.claude/skills` and `.claude/agents` link into it. Run
+  `git submodule update --init` after a clone or a pull that moves the pin.
 - **The `docs/1.x` paths in the imported rules are read in `programme/`.**
 - **Records are in the live checkout.**
   - `records/` and `applications/` paths are read and changed in the programme
