@@ -8,7 +8,8 @@ measurements and the design live on the issue. The rules for the body are in
 Who reviews, and when Claude merges, is
 [1.2 §2.2](https://github.com/delphside/programme/blob/main/docs/1.2-change-lifecycle.md#22-when-to-branch-and-what-pre-approved-means).
 Where the change owes the owner's review, add him as reviewer at creation and
-ask for it in the chat.
+ask for it in the chat, and list what he is to check under *Review*; where it
+does not, *Review* says `No review owed:` and the reason, which the board reads.
 
 Replace `N` on the `Refs #N` line with the issue this delivers, or write
 `Activity: <id>`, and `Initiative: <id>` where there is one, for BAU work.
@@ -34,6 +35,10 @@ Which part of the scope this delivers, named against its issue or activity.
 Scope this pull request does not carry, and why. *Nothing* is a valid answer,
 and a blank heading is not.
 -->
+
+## Review
+
+<!-- `No review owed:` and the reason, or what the owner is to check. -->
 
 ## Review rounds
 
