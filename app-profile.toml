@@ -10,3 +10,16 @@ application = "dark-portal"
 [environments.production]
 # Private: reached through SSH to its host, so no fixed URL.
 env = ["PROD_URL"]
+
+[hosts.production]
+# Read by programme/scripts/board/board-hosts.py over ssh, read-only. The hosts
+# are the infrastructure application's; this says which are this application's.
+ssh = "dark-portal"
+env = ["PROD_SSH_HOST"]
+
+[hosts.nonprod]
+ssh = "dark-portal-nonprod"
+env = ["NONPROD_SSH_HOST"]
+# Its kernel and Docker should match production's, except while an upgrade is
+# being proven here first.
+compare_with = "production"
