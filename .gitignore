@@ -42,6 +42,8 @@ Thumbs.db
 !.claude/skills/
 !.claude/agents/
 !.claude/settings.json
+# The wrapper the settings run, which finds the programme's hooks.
+!.claude/programme-hook.sh
 
 # CI checks the programme repository's live copy out here; PROGRAMME_DIR points at it.
 /.programme-live/
