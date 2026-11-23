@@ -11,9 +11,17 @@ gives. Keep `None owed:` where 1.1's *what owes none* row covers the change;
 otherwise replace it with the record. `board-digest.py` reads the section's
 opening words, so `None owed:` or the record opens it, and
 `board-review-record.py` checks the record on the pull request.
+
+The `Claims:` line names the files this pull request expects to change, in
+the form
+[1.2](https://github.com/delphside/programme/blob/main/docs/1.2-change-lifecycle.md#naming-the-files-a-change-will-touch)
+gives, so that another thread's `board-overlap.py` lists it before that thread
+edits one; keep it current.
 -->
 
 Refs #N
+
+Claims:
 
 <!--
 The `Refs #N` line:
