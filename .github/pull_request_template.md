@@ -9,7 +9,8 @@ Who reviews, and when Claude merges, is
 [1.1](https://github.com/delphside/programme/blob/main/docs/1.1-programme-tooling.md#claudes-tooling)
 gives. Keep `None owed:` where 1.1's *what owes none* row covers the change;
 otherwise replace it with the record. `board-digest.py` reads the section's
-opening words, so `None owed:` or the record opens it.
+opening words, so `None owed:` or the record opens it, and
+`board-review-record.py` checks the record on the pull request.
 -->
 
 Refs #N
