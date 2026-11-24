@@ -20,7 +20,8 @@
 ## The session on the web
 
 - The application's own notes issue, where a web session leaves its note for
-  the local session when no issue concerns the work, is #11.
+  the local session when no issue concerns the work, is #49 *Notes for the
+  local session*.
 
 ## Changes
 
