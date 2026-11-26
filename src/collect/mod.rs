@@ -9,6 +9,7 @@
 //! The run is [`run`]; every wait and the time go through a [`Clock`], and
 //! Blizzard's base URLs through [`Endpoints`], so a test stubs both.
 
+pub(crate) mod backoff;
 pub mod blizzard;
 pub mod clock;
 pub(crate) mod failure;
@@ -22,22 +23,20 @@ pub mod window;
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 pub use blizzard::Endpoints;
 pub use clock::{Clock, SystemClock};
 
+use backoff::Backoff;
 use blizzard::Blizzard;
-use failure::{Failure, client_secret_refused, io_failure};
+use failure::{Failure, io_failure};
 use session::Session;
 
 use crate::config::Config;
 use crate::error::{ErrorType, Report};
-use crate::settings::collection::{
-    POLL_INTERVAL, REGION, RETRY_BACKOFF_INITIAL, RETRY_BACKOFF_MAX,
-};
+use crate::settings::collection::{POLL_INTERVAL, REGION};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::Hour;
 
@@ -65,10 +64,6 @@ fn run_hooked(
         Err(report) => *report,
     }
 }
-
-/// The least a `Retry-After` is waited, so a `0` is not a hot loop. An
-/// implementation guard, not a setting: Blizzard's own figure is the wait.
-pub(crate) const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// The folder an hour's file goes in.
 fn bronze_dir(data_dir: &Path) -> PathBuf {
@@ -118,7 +113,7 @@ fn collect(
     let mut session = Session::new(config, clock, blizzard);
 
     // 2 to 5, until the hour is written or the retry window closes.
-    let mut backoff = RETRY_BACKOFF_INITIAL;
+    let mut backoff = Backoff::new();
     let mut last: Option<Report>;
     let mut retries: u32 = 0;
     // False where the temporary file was cleared by a run that collected the
@@ -132,7 +127,7 @@ fn collect(
                 break;
             }
             Ok(Attempt::NotYet) => {
-                backoff = RETRY_BACKOFF_INITIAL;
+                backoff.reset();
                 last = Some(
                     Report::error(
                         ErrorType::TechnicalBlip,
@@ -146,8 +141,7 @@ fn collect(
             Err(Failure::Retry { report, after }) => {
                 report.log();
                 retries += 1;
-                let wait = after.map_or(backoff, |a| a.max(MIN_RETRY_AFTER));
-                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                let wait = backoff.wait(after);
                 last = Some(*report);
                 wait
             }
@@ -276,10 +270,11 @@ fn attempt(
     temporary: &Path,
     clock: &dyn Clock,
 ) -> Result<Attempt, Failure> {
-    let response = match request(session) {
-        Err(Failure::Refused) => return Err(client_secret_refused()),
-        other => other?,
-    };
+    // Steps 2 and 3: the request, with a new token taken once where a cached
+    // one is refused.
+    let response = session
+        .request(&mut || Ok(()), &|blizzard, token| blizzard.snapshot(token))
+        .map_err(|staged| staged.failure)?;
     let fetched_at: DateTime<Utc> = clock.now();
 
     let served = Hour::containing(response.last_modified);
@@ -315,20 +310,6 @@ fn attempt(
     let summary = snapshot::write_parquet(response.body, &meta, temporary)?;
     tracing::info!(rows = summary.rows, "parsed the snapshot");
     Ok(Attempt::Written)
-}
-
-/// Steps 2 and 3: the request, with a new token taken once where a cached
-/// one is refused.
-fn request(session: &mut Session<'_>) -> Result<blizzard::SnapshotResponse, Failure> {
-    let token = session.token()?;
-    match session.blizzard().snapshot(&token) {
-        Err(Failure::Refused) if !session.is_fresh() => {
-            tracing::info!("the cached token was refused; taking a new one");
-            let token = session.renew()?;
-            session.blizzard().snapshot(&token)
-        }
-        other => other,
-    }
 }
 
 #[cfg(test)]

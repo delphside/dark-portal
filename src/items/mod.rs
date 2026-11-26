@@ -2,48 +2,61 @@
 //! *Item data* and the after-the-pivot rows of *When it fails*,
 //! `docs/5.2.1-collection.md`, set it out.
 //!
-//! The step comes after the pivot, so a failure that leaves an item for the
-//! next run is an *error* the step carries on past, and the step exits `3`
-//! where there is one. An item Blizzard has no data for (404) is recorded:
-//! data, not an error.
+//! **The pivot is the rename** of the run's file into place, under the
+//! VM-wide lock: before it nothing is kept but a temporary file named for the
+//! run, and after it the responses are in bronze for good. A failure before
+//! the first fetch (bronze cannot be read, the folder cannot be made) stops
+//! the run with a fatal. From the first fetch on, a failure that leaves an
+//! item for the next run is an *error* the step carries on past, and the step
+//! exits `3` where there is one. An item Blizzard has no data for (404) is
+//! recorded: data, not an error.
+//!
+//! **A blip is Blizzard's state, not the item's.** A timeout, an unreachable
+//! host or a 429, 502, 503 or 504 pauses the whole fetch (the backoff, or
+//! `Retry-After`), and the item goes to the end of the queue. An item gets
+//! [`ITEM_ATTEMPTS`] attempts in a run; a success resets the backoff.
 //!
 //! **How long the step runs.** Requests start at the item fetch rate. The
-//! step ends before the next hourly run starts, at the hourly timer start
-//! past the step's own start ([`next_hourly_start`]):
+//! fetch ends [`LOCK_WAIT`] before the next hourly run starts
+//! ([`fetch_end`]), so the write and the longest wait for the lock fit before
+//! that start:
 //!
-//! - no request starts unless it can time out before then, and an item's
-//!   retries stop when their next wait would pass it;
-//! - the wait for the VM-wide lock is the lock wait or the time left, if less.
+//! - no request starts, the token's included, unless it can time out before
+//!   the fetch ends;
+//! - a pause that would pass the end stops the fetch.
 //!
-//! Items the step did not reach are left for the next run, as one error
+//! The items the fetch did not reach are left for the next run, as one error
 //! saying how many.
-//!
-//! [`run`] reads the IDs bronze lacks; [`fetch_ids`] fetches the IDs it is
-//! given, which is what `dp daily` calls for the items that answered 404.
 
 mod pacer;
 mod store;
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::path::Path;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
+use crate::collect::backoff::Backoff;
 use crate::collect::blizzard::{Blizzard, ItemAnswer};
-use crate::collect::failure::{Failure, client_secret_refused, io_failure};
-use crate::collect::session::Session;
-use crate::collect::{Clock, Endpoints, MIN_RETRY_AFTER, lock, random_suffix, temporary_name};
+use crate::collect::failure::{Failure, io_failure};
+use crate::collect::session::{Session, Stage, Staged};
+use crate::collect::{Clock, Endpoints, lock, random_suffix, temporary_name};
 use crate::config::Config;
 use crate::error::{ErrorType, Report, Severity};
-use crate::settings::collection::{
-    HOURLY_TIMER_START_MINUTE, HTTP_TIMEOUT_OTHER, RETRY_BACKOFF_INITIAL, RETRY_BACKOFF_MAX,
-};
+use crate::settings::collection::{HOURLY_TIMER_START_MINUTE, HTTP_TIMEOUT_OTHER};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::{Hour, ItemId};
 use pacer::Pacer;
 use store::{Responses, items_dir};
+
+/// The attempts an item gets in one run. A blip pauses the whole fetch, so an
+/// item that meets one on each of three turns, with the pauses between, more
+/// likely has a fault of its own than Blizzard has; it waits for the next run
+/// and the others are not held up. An implementation guard, not a setting.
+const ITEM_ATTEMPTS: u32 = 3;
 
 /// Runs `dp items`: fetches every item ID in bronze's snapshot files that its
 /// item files have no response for. The report is the run's result: `Ok`, or
@@ -58,17 +71,6 @@ pub fn run(config: &Config, clock: &dyn Clock, endpoints: Endpoints) -> Report {
     fetch(config, clock, &Blizzard::new(endpoints), &ids)
 }
 
-/// Fetches `ids` and writes what came back, as [`run`] does for the IDs
-/// bronze lacks.
-pub fn fetch_ids(
-    config: &Config,
-    clock: &dyn Clock,
-    endpoints: Endpoints,
-    ids: &[ItemId],
-) -> Report {
-    fetch(config, clock, &Blizzard::new(endpoints), ids)
-}
-
 /// The start of the next hourly run after `now`: the hourly timer start's
 /// minute, in this hour if it is still ahead, otherwise in the next.
 pub fn next_hourly_start(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -81,108 +83,10 @@ pub fn next_hourly_start(now: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
-/// What one item's lookup came to.
-enum Outcome {
-    /// Blizzard answered: 200 with its body, or 404 with none.
-    Response { status: u16, body: Option<String> },
-    /// The item is fetched on the next run.
-    Waits(Box<Report>),
-    /// No time was left to ask: the item is fetched on the next run.
-    OutOfTime,
-    /// The item is fetched on the next run, and so is every item after it:
-    /// the token cannot be had.
-    Stops(Box<Report>),
-}
-
-/// The step's state while it fetches.
-struct Fetching<'a> {
-    clock: &'a dyn Clock,
-    blizzard: &'a Blizzard,
-    session: Session<'a>,
-    pacer: Pacer,
-    deadline: DateTime<Utc>,
-}
-
-impl Fetching<'_> {
-    /// Whether a request started now can end before the deadline.
-    fn has_time(&self) -> bool {
-        self.clock.now() + timeout() <= self.deadline
-    }
-
-    /// One request, with a new token taken once where the cached one is
-    /// refused. The `bool` of a failure is true where it ends the step.
-    fn attempt(&mut self, id: ItemId) -> Result<ItemAnswer, (Failure, bool)> {
-        let token = self.session.token().map_err(|f| (f, true))?;
-        match self.blizzard.item(&token, id) {
-            Err(Failure::Refused) if !self.session.is_fresh() => {
-                tracing::info!("the cached token was refused; taking a new one");
-                let token = self.session.renew().map_err(|f| (f, true))?;
-                self.pacer.wait(self.clock);
-                match self.blizzard.item(&token, id) {
-                    Err(Failure::Refused) => Err((client_secret_refused(), true)),
-                    other => other.map_err(|f| (f, false)),
-                }
-            }
-            Err(Failure::Refused) => Err((client_secret_refused(), true)),
-            other => other.map_err(|f| (f, false)),
-        }
-    }
-
-    /// One item, retried with backoff or after `Retry-After` while the
-    /// deadline allows.
-    fn item(&mut self, id: ItemId) -> Outcome {
-        let item = id.0.to_string();
-        let mut backoff = RETRY_BACKOFF_INITIAL;
-        let mut retries: u32 = 0;
-        loop {
-            self.pacer.wait(self.clock);
-            if !self.has_time() {
-                return Outcome::OutOfTime;
-            }
-            let (failure, ends_step) = match self.attempt(id) {
-                Ok(ItemAnswer::Found(body)) => {
-                    return Outcome::Response {
-                        status: 200,
-                        body: Some(body),
-                    };
-                }
-                Ok(ItemAnswer::NotFound) => {
-                    return Outcome::Response {
-                        status: 404,
-                        body: None,
-                    };
-                }
-                Err(failed) => failed,
-            };
-            let failure = failure.with_metadata("item", item.clone());
-            match failure {
-                Failure::Retry { report, after } => {
-                    report.log();
-                    retries += 1;
-                    let wait = after.map_or(backoff, |a| a.max(MIN_RETRY_AFTER));
-                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
-                    let wait_end =
-                        self.clock.now() + ChronoDuration::from_std(wait).unwrap_or_default();
-                    if wait_end + timeout() > self.deadline {
-                        let mut report = *report;
-                        report
-                            .metadata
-                            .insert("retries".to_owned(), retries.to_string());
-                        return Outcome::Waits(Box::new(report));
-                    }
-                    self.clock.sleep(wait);
-                }
-                other => {
-                    let report = carried(other).with_metadata("item", item);
-                    return if ends_step {
-                        Outcome::Stops(Box::new(report))
-                    } else {
-                        Outcome::Waits(Box::new(report))
-                    };
-                }
-            }
-        }
-    }
+/// When the fetch started at `start` ends: the lock wait before the next
+/// hourly run.
+pub fn fetch_end(start: DateTime<Utc>) -> DateTime<Utc> {
+    next_hourly_start(start) - ChronoDuration::from_std(LOCK_WAIT).unwrap_or_default()
 }
 
 fn timeout() -> ChronoDuration {
@@ -194,9 +98,7 @@ fn carried(failure: Failure) -> Report {
     let mut report = match failure {
         Failure::Stop(report) => *report,
         Failure::Retry { report, .. } => *report,
-        Failure::Refused => {
-            return carried(client_secret_refused());
-        }
+        Failure::Refused => unreachable!("the session turns a refusal into the client secret"),
         Failure::Gone => Report::error(
             ErrorType::Unexpected,
             "ITEM_FILE_GONE",
@@ -209,14 +111,9 @@ fn carried(failure: Failure) -> Report {
 
 /// A failure that stops the step before it fetched anything.
 fn stopped(failure: Failure) -> Report {
-    match failure {
-        Failure::Stop(report) => *report,
-        other => {
-            let mut report = carried(other);
-            report.outcome = Severity::Fatal;
-            report
-        }
-    }
+    let mut report = carried(failure);
+    report.outcome = Severity::Fatal;
+    report
 }
 
 /// The items the step did not get to.
@@ -228,6 +125,15 @@ fn left(count: usize, why: &str) -> Report {
     )
     .with_metadata("items", count.to_string())
     .with_metadata("why", why)
+}
+
+/// The gate's refusal: no request can end before the fetch does.
+fn fetch_ended() -> Failure {
+    Failure::stop(
+        ErrorType::TechnicalBlip,
+        "ITEM_FETCH_ENDED",
+        "The fetch ends before another request could finish.",
+    )
 }
 
 fn fetch(config: &Config, clock: &dyn Clock, blizzard: &Blizzard, ids: &[ItemId]) -> Report {
@@ -250,61 +156,110 @@ fn fetch(config: &Config, clock: &dyn Clock, blizzard: &Blizzard, ids: &[ItemId]
         Err(failure) => return stopped(failure),
     };
 
-    let mut fetching = Fetching {
-        clock,
-        blizzard,
-        session: Session::new(config, clock, blizzard),
-        pacer: Pacer::new(),
-        deadline: next_hourly_start(started),
-    };
+    let end = fetch_end(started);
+    let mut session = Session::new(config, clock, blizzard);
+    let mut pacer = Pacer::new();
+    let mut backoff = Backoff::new();
+    let mut queue: VecDeque<(ItemId, u32)> = ids.iter().map(|&id| (id, 0)).collect();
     let mut errors: Vec<Report> = Vec::new();
     let mut not_found: u64 = 0;
-    for (n, &id) in ids.iter().enumerate() {
-        match fetching.item(id) {
-            Outcome::OutOfTime => {
-                errors.push(left(ids.len() - n, "the next hourly run starts soon"));
+
+    while let Some((id, attempts)) = queue.pop_front() {
+        // Before every request, the token's too: the fetch rate, and the end.
+        let mut gate = || {
+            pacer.wait(clock);
+            if clock.now() + timeout() <= end {
+                Ok(())
+            } else {
+                Err(fetch_ended())
+            }
+        };
+        let answer = session.request(&mut gate, &|blizzard, token| blizzard.item(token, id));
+        let (status, body) = match answer {
+            Ok(ItemAnswer::Found(body)) => (200, Some(body)),
+            Ok(ItemAnswer::NotFound) => (404, None),
+            Err(Staged {
+                stage: Stage::Gate, ..
+            }) => {
+                queue.push_front((id, attempts));
+                errors.push(left(
+                    queue.len(),
+                    "the fetch ends before the next hourly run",
+                ));
                 break;
             }
-            Outcome::Response { status, body } => {
-                if status == 404 {
-                    not_found += 1;
-                    Report::warning(
-                        "ITEM_NOT_FOUND",
-                        "Blizzard has no data for the item yet; dp daily asks again.",
-                    )
-                    .with_metadata("item", id.0.to_string())
-                    .with_metadata("http_status", "404")
-                    .log();
+            Err(Staged {
+                failure: Failure::Retry { report, after },
+                ..
+            }) => {
+                report.log();
+                let attempts = attempts + 1;
+                let wait = backoff.wait(after);
+                if attempts < ITEM_ATTEMPTS {
+                    queue.push_back((id, attempts));
+                } else {
+                    let mut report = *report;
+                    report.metadata.insert("item".to_owned(), id.0.to_string());
+                    report
+                        .metadata
+                        .insert("attempts".to_owned(), attempts.to_string());
+                    errors.push(report);
                 }
-                // Written as it comes: the response is not kept in Rust.
-                if let Err(failure) = responses.push(id, clock.now(), status, body.as_deref()) {
-                    errors.push(carried(failure));
-                    errors.push(left(ids.len() - n, "the responses cannot be kept"));
-                    break;
+                // Blizzard's state, not the item's: nothing is asked until
+                // it has had its wait.
+                if !queue.is_empty() {
+                    if clock.now() + ChronoDuration::from_std(wait).unwrap_or_default() + timeout()
+                        > end
+                    {
+                        errors.push(left(
+                            queue.len(),
+                            "the wait would pass the end of the fetch",
+                        ));
+                        break;
+                    }
+                    clock.sleep(wait);
                 }
+                continue;
             }
-            Outcome::Waits(report) => errors.push(*report),
-            Outcome::Stops(report) => {
-                errors.push(*report);
-                if n + 1 < ids.len() {
-                    errors.push(left(ids.len() - n - 1, "no access token"));
+            Err(Staged {
+                stage: Stage::Token,
+                failure,
+            }) => {
+                // No token: every item after this one would meet the same.
+                errors.push(carried(failure).with_metadata("item", id.0.to_string()));
+                if !queue.is_empty() {
+                    errors.push(left(queue.len(), "no access token"));
                 }
                 break;
             }
+            Err(Staged { failure, .. }) => {
+                errors.push(carried(failure).with_metadata("item", id.0.to_string()));
+                continue;
+            }
+        };
+        backoff.reset();
+        if status == 404 {
+            not_found += 1;
+            Report::warning(
+                "ITEM_NOT_FOUND",
+                "Blizzard has no data for the item yet; dp daily asks again.",
+            )
+            .with_metadata("item", id.0.to_string())
+            .with_metadata("http_status", "404")
+            .log();
+        }
+        // Written as it comes: the response is not kept in Rust.
+        if let Err(failure) = responses.push(id, clock.now(), status, body.as_deref()) {
+            errors.push(carried(failure));
+            errors.push(left(queue.len() + 1, "the responses cannot be kept"));
+            break;
         }
     }
 
     let fetched = responses.rows();
     if fetched > 0 {
         let file = dir.join(&file_name);
-        if let Err(report) = publish(
-            config,
-            clock,
-            &responses,
-            &temporary,
-            &file,
-            fetching.deadline,
-        ) {
+        if let Err(report) = publish(config, clock, &responses, &temporary, &file) {
             errors.push(*report);
             errors.push(left(
                 usize::try_from(fetched).unwrap_or(usize::MAX),
@@ -363,9 +318,8 @@ fn publish(
     responses: &Responses,
     temporary: &Path,
     file: &Path,
-    deadline: DateTime<Utc>,
 ) -> Result<(), Box<Report>> {
-    let result = place(config, clock, responses, temporary, file, deadline);
+    let result = place(config, clock, responses, temporary, file);
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
@@ -378,11 +332,9 @@ fn place(
     responses: &Responses,
     temporary: &Path,
     file: &Path,
-    deadline: DateTime<Utc>,
 ) -> Result<(), Failure> {
     responses.write(temporary)?;
-    let remaining = (deadline - clock.now()).to_std().unwrap_or_default();
-    let _lock = lock::acquire(&config.lock_file, LOCK_WAIT.min(remaining), clock)?;
+    let _lock = lock::acquire(&config.lock_file, LOCK_WAIT, clock)?;
     if file.exists() {
         return Err(Failure::unexpected(
             "ITEM_FILE_EXISTS",

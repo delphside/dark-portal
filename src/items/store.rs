@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use duckdb::{Connection, params};
 
 use crate::collect::failure::{Failure, io_failure};
-use crate::collect::snapshot::{duckdb_failure, quoted, sync_file};
+use crate::collect::snapshot::{duckdb_failure, quoted, sync_file, timestamp};
 use crate::error::{ErrorType, Report};
 use crate::settings::collection::REGION;
 use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
@@ -27,13 +27,16 @@ fn snapshots_dir(data_dir: &Path) -> PathBuf {
 }
 
 /// Whether `dir` holds a finished Parquet file: a temporary file does not end
-/// in `.parquet`.
-fn has_parquet(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries
+/// in `.parquet`. A folder that is not there holds none; one that cannot be
+/// read is *technical, fundamental*.
+fn has_parquet(dir: &Path) -> Result<bool, Failure> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => Ok(entries
             .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
-    })
+            .any(|e| e.file_name().to_string_lossy().ends_with(".parquet"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_failure(&e, "reading a bronze folder")),
+    }
 }
 
 fn read_failure(message: &str) -> Failure {
@@ -62,7 +65,7 @@ fn open() -> Result<Connection, Failure> {
 /// response for, a 404 included, in ascending order.
 pub fn ids_to_fetch(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
     let snapshots = snapshots_dir(data_dir);
-    if !has_parquet(&snapshots) {
+    if !has_parquet(&snapshots)? {
         return Ok(Vec::new());
     }
     let glob = |dir: &Path| quoted(&dir.join("*.parquet").to_string_lossy());
@@ -71,7 +74,7 @@ pub fn ids_to_fetch(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
         glob(&snapshots)
     );
     let items = items_dir(data_dir);
-    if has_parquet(&items) {
+    if has_parquet(&items)? {
         sql.push_str(&format!(
             " EXCEPT SELECT item FROM read_parquet({})",
             glob(&items)
@@ -128,12 +131,14 @@ impl Responses {
         status: u16,
         body: Option<&str>,
     ) -> Result<(), Failure> {
-        let at = format!("{}+00", fetched_at.format("%Y-%m-%d %H:%M:%S%.6f"));
         self.connection
-            .prepare_cached(
-                "INSERT INTO response VALUES (?, CAST(? AS TIMESTAMPTZ), ?, CAST(? AS JSON))",
+            .execute(
+                &format!(
+                    "INSERT INTO response VALUES (?, {}, ?, CAST(? AS JSON))",
+                    timestamp(fetched_at)
+                ),
+                params![item.0, status, body],
             )
-            .and_then(|mut statement| statement.execute(params![item.0, at, status, body]))
             .map_err(|e| duckdb_failure(&e.to_string()))?;
         self.rows += 1;
         Ok(())

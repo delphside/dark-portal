@@ -276,7 +276,8 @@ impl Blizzard {
             _ => Err(Failure::unexpected(
                 "ITEM_BODY_UNUSABLE",
                 "Blizzard's item response could not be read.",
-            )),
+            )
+            .with_metadata("http_status", "200")),
         }
     }
 }

@@ -261,6 +261,15 @@ fn logging<T>(f: impl FnOnce() -> T) -> (T, String) {
     (result, text)
 }
 
+/// The waits a run asked for that are a pause and not the fetch rate's.
+fn waits(w: &World) -> Vec<Duration> {
+    w.clock
+        .slept()
+        .into_iter()
+        .filter(|d| *d >= Duration::from_secs(1))
+        .collect()
+}
+
 // Which items, and the file
 
 #[test]
@@ -481,7 +490,7 @@ fn a_request_after_a_long_gap_is_not_delayed_again() {
 }
 
 #[test]
-fn n_items_take_at_least_n_minus_one_intervals() {
+fn n_items_and_the_token_request_take_at_least_one_interval_each_but_the_first() {
     let w = World::at("rate", START);
     let ids: Vec<u32> = (1..=25).collect();
     w.snapshot("2026-11-26T11", &ids);
@@ -494,8 +503,9 @@ fn n_items_take_at_least_n_minus_one_intervals() {
 
     assert_eq!(exit(&report), 0, "{report:?}");
     let taken = w.clock.now() - at(START);
-    assert!(taken >= chrono::Duration::milliseconds(24 * 20), "{taken}");
-    assert_eq!(w.clock.slept().len(), 24);
+    assert!(taken >= chrono::Duration::milliseconds(25 * 20), "{taken}");
+    // The token request is a request too: 26 in all, 25 spacings.
+    assert_eq!(w.clock.slept().len(), 25);
     assert_eq!(read_rows(&w.file()).len(), 25);
 }
 
@@ -520,7 +530,7 @@ fn thousands_of_items_are_fetched_and_written_at_the_rate() {
     assert_eq!(read_rows(&w.file()).len(), 2_000);
     let taken = w.clock.now() - at(START);
     assert!(
-        taken >= chrono::Duration::milliseconds(1_999 * 20),
+        taken >= chrono::Duration::milliseconds(2_000 * 20),
         "{taken}"
     );
 }
@@ -532,7 +542,7 @@ fn a_blip_is_retried_with_backoff_and_the_item_is_kept() {
     let w = World::at("blip", START);
     w.snapshot("2026-11-26T11", &[10]);
     w.stub.token_ok(5);
-    for status in [503, 502, 504] {
+    for status in [503, 502] {
         w.stub.item_answer(10, ResponseTemplate::new(status), 1);
     }
     w.stub.item_ok(10);
@@ -540,14 +550,14 @@ fn a_blip_is_retried_with_backoff_and_the_item_is_kept() {
     let report = w.go();
 
     assert_eq!(exit(&report), 0, "{report:?}");
-    // 30 s, doubled, then 2 minutes: the backoff is the snapshot's.
+    // 30 s, then doubled: the backoff is the snapshot's.
     let waits: Vec<Duration> = w
         .clock
         .slept()
         .into_iter()
         .filter(|d| *d >= Duration::from_secs(1))
         .collect();
-    assert_eq!(waits, [30, 60, 120].map(Duration::from_secs));
+    assert_eq!(waits, [30, 60].map(Duration::from_secs));
     assert_eq!(read_rows(&w.file())[0].1, 200);
 }
 
@@ -586,10 +596,10 @@ fn a_retry_after_of_zero_is_not_a_hot_loop() {
 }
 
 #[test]
-fn a_blip_that_lasts_ends_with_the_item_for_the_next_run_before_the_next_hourly_run() {
+fn an_item_that_meets_a_blip_every_time_gets_three_attempts_then_waits_for_the_next_run() {
     for status in [429, 502, 503, 504] {
-        let w = World::at(&format!("lasting-{status}"), "2026-11-26T12:30:00Z");
-        w.snapshot("2026-11-26T12", &[10]);
+        let w = World::at(&format!("lasting-{status}"), START);
+        w.snapshot("2026-11-26T11", &[10]);
         w.stub.token_ok(5);
         w.stub.item_answer(10, ResponseTemplate::new(status), 100);
 
@@ -601,25 +611,18 @@ fn a_blip_that_lasts_ends_with_the_item_for_the_next_run_before_the_next_hourly_
         assert_eq!(error.error_type, Some(ErrorType::TechnicalBlip));
         assert_eq!(error.metadata["item"], "10");
         assert_eq!(error.metadata["http_status"], status.to_string());
-        assert!(error.metadata.contains_key("retries"));
+        assert_eq!(error.metadata["attempts"], "3");
+        assert_eq!(w.stub.item_requests(10), 3);
         assert!(w.item_files().is_empty(), "nothing was fetched, so no file");
-        // 30 s, 1 min and 2 min fit before 12:35; a 4 min wait does not.
-        assert_eq!(
-            w.clock
-                .slept()
-                .iter()
-                .filter(|d| **d >= Duration::from_secs(1))
-                .count(),
-            3
-        );
-        assert!(w.clock.now() + timeout() <= at("2026-11-26T12:35:00Z"));
+        // Paused after the first two; after the third nothing is left to ask.
+        assert_eq!(waits(&w), [30, 60].map(Duration::from_secs));
     }
 }
 
 #[test]
 fn a_timeout_is_a_blip() {
-    let w = World::at("timeout", "2026-11-26T12:30:00Z");
-    w.snapshot("2026-11-26T12", &[10]);
+    let w = World::at("timeout", START);
+    w.snapshot("2026-11-26T11", &[10]);
     w.stub.token_ok(5);
     w.stub.item_answer(
         10,
@@ -638,9 +641,9 @@ fn a_timeout_is_a_blip() {
 
 #[test]
 fn an_unreachable_blizzard_is_a_blip() {
-    let mut w = World::at("unreachable", "2026-11-26T12:30:00Z");
-    w.snapshot("2026-11-26T12", &[10]);
-    cache_token(&w.config.data_dir, "tok", "2026-11-27T12:30:00Z");
+    let mut w = World::at("unreachable", START);
+    w.snapshot("2026-11-26T11", &[10]);
+    cache_token(&w.config.data_dir, "tok", "2026-11-27T11:36:00Z");
     // Nothing listens on port 1.
     let endpoints = Endpoints {
         oauth: "http://127.0.0.1:1".into(),
@@ -656,9 +659,9 @@ fn an_unreachable_blizzard_is_a_blip() {
 }
 
 #[test]
-fn an_item_that_keeps_failing_ends_at_the_deadline_and_the_others_are_still_fetched() {
-    let w = World::at("deadline", "2026-11-26T12:30:00Z");
-    w.snapshot("2026-11-26T12", &[10, 20, 30]);
+fn a_failing_low_id_does_not_starve_the_higher_ones_and_the_backoff_resets_on_success() {
+    let w = World::at("no-starve", START);
+    w.snapshot("2026-11-26T11", &[10, 20, 30]);
     w.stub.token_ok(5);
     w.stub.item_answer(10, ResponseTemplate::new(503), 100);
     w.stub.item_ok(20);
@@ -667,20 +670,74 @@ fn an_item_that_keeps_failing_ends_at_the_deadline_and_the_others_are_still_fetc
     let report = w.go();
 
     assert_eq!(exit(&report), 3, "{report:?}");
-    assert!(w.clock.now() + timeout() <= at("2026-11-26T12:35:00Z"));
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].metadata["item"], "10");
+    assert_eq!(w.stub.item_requests(10), 3);
     assert_eq!(
         read_rows(&w.file()).iter().map(|r| r.0).collect::<Vec<_>>(),
         [20, 30]
     );
+    // The first failure paused 30 s; the successes reset the backoff, so the
+    // second pause is 30 s again and not 60 s.
+    assert_eq!(waits(&w), [30, 30].map(Duration::from_secs));
 }
 
 #[test]
-fn items_the_deadline_leaves_are_counted_and_no_request_starts_past_it() {
-    // 50 ms before the last moment a request can still time out in time:
-    // the pacer's 20 ms spacing runs the clock out after three requests.
-    let w = World::at("out-of-time", "2026-11-26T12:34:49.950Z");
+fn a_blip_pauses_the_whole_fetch_not_only_the_item() {
+    let w = World::at("pause-all", START);
+    w.snapshot("2026-11-26T11", &[10, 20]);
+    w.stub.token_ok(5);
+    w.stub.item_answer(10, ResponseTemplate::new(503), 1);
+    w.stub.item_ok(10);
+    w.stub.item_ok(20);
+
+    assert_eq!(exit(&w.go()), 0);
+
+    // 10 failed, so 20 was asked only after the pause, then 10 again at the end.
+    assert_eq!(waits(&w), [Duration::from_secs(30)]);
+    assert_eq!(read_rows(&w.file()).len(), 2);
+}
+
+#[test]
+fn a_retry_after_past_the_end_of_the_fetch_sends_no_further_requests() {
+    let w = World::at("long-retry-after", START);
+    w.snapshot("2026-11-26T11", &[10, 20]);
+    w.stub.token_ok(5);
+    w.stub.item_answer(
+        10,
+        ResponseTemplate::new(429).insert_header("retry-after", "3600"),
+        100,
+    );
+    w.stub.item_ok(20);
+
+    let report = w.go();
+
+    assert_eq!(exit(&report), 3, "{report:?}");
+    assert_eq!(w.stub.requests("GET"), 1);
+    assert!(waits(&w).is_empty());
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].reason, "ITEMS_LEFT_FOR_NEXT_RUN");
+    assert_eq!(report.errors[0].metadata["items"], "2");
+}
+
+#[test]
+fn the_fetch_ends_the_lock_wait_before_the_next_hourly_run() {
+    assert_eq!(
+        fetch_end(at("2026-11-26T11:36:00Z")),
+        at("2026-11-26T12:25:00Z")
+    );
+    assert_eq!(
+        fetch_end(at("2026-11-26T11:00:00Z")),
+        at("2026-11-26T11:25:00Z")
+    );
+}
+
+#[test]
+fn items_the_end_of_the_fetch_leaves_are_counted_and_no_request_starts_past_it() {
+    // The last moment a request can still time out before the fetch ends is
+    // 12:24:50: the pacer's 20 ms spacing runs the clock out after three
+    // requests, the token's the first.
+    let w = World::at("out-of-time", "2026-11-26T12:24:49.950Z");
     w.snapshot("2026-11-26T12", &[1, 2, 3, 4, 5]);
     w.stub.token_ok(5);
     for id in 1..=5 {
@@ -692,9 +749,25 @@ fn items_the_deadline_leaves_are_counted_and_no_request_starts_past_it() {
     assert_eq!(exit(&report), 3, "{report:?}");
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].reason, "ITEMS_LEFT_FOR_NEXT_RUN");
-    assert_eq!(report.errors[0].metadata["items"], "2");
-    assert_eq!(w.stub.item_requests(4) + w.stub.item_requests(5), 0);
-    assert_eq!(read_rows(&w.file()).len(), 3, "what was fetched is kept");
+    assert_eq!(report.errors[0].metadata["items"], "3");
+    assert_eq!(
+        w.stub.item_requests(3) + w.stub.item_requests(4) + w.stub.item_requests(5),
+        0
+    );
+    assert_eq!(read_rows(&w.file()).len(), 2, "what was fetched is kept");
+}
+
+#[test]
+fn no_token_request_starts_past_the_end_of_the_fetch() {
+    let w = World::at("token-late", "2026-11-26T12:24:55Z");
+    w.snapshot("2026-11-26T12", &[10]);
+    w.stub.token_ok(5);
+
+    let report = w.go();
+
+    assert_eq!(exit(&report), 3);
+    assert_eq!(w.stub.requests("POST") + w.stub.requests("GET"), 0);
+    assert_eq!(report.errors[0].metadata["items"], "1");
 }
 
 #[test]
@@ -783,6 +856,37 @@ fn a_token_endpoint_that_refuses_the_secret_leaves_every_item_for_the_next_run()
 }
 
 #[test]
+fn a_cached_token_refused_and_the_new_one_refused_too_is_the_client_secret() {
+    let w = World::at("401-both", START);
+    w.snapshot("2026-11-26T11", &[10, 20]);
+    cache_token(&w.config.data_dir, "tok-stale", "2026-11-27T11:36:00Z");
+    w.stub
+        .mount(item_mock(10, "tok-stale").respond_with(ResponseTemplate::new(401)));
+    w.stub.token_ok(5);
+    w.stub.item_answer(10, ResponseTemplate::new(401), 100);
+
+    let report = w.go();
+
+    assert_eq!(exit(&report), 3, "{report:?}");
+    assert_eq!(w.stub.requests("POST"), 1, "a new token is taken once");
+    assert_eq!(
+        w.stub.item_requests(10),
+        2,
+        "the cached token, then the new one"
+    );
+    assert_eq!(report.errors[0].reason, "CLIENT_SECRET_REFUSED");
+    assert_eq!(
+        report.errors[0].error_type,
+        Some(ErrorType::TechnicalFundamental)
+    );
+    assert_eq!(report.errors[0].metadata["http_status"], "401");
+    assert_eq!(report.errors[0].metadata["item"], "10");
+    assert_eq!(report.errors[1].metadata["items"], "1");
+    assert_eq!(w.stub.item_requests(20), 0);
+    assert!(w.item_files().is_empty());
+}
+
+#[test]
 fn a_404_is_recorded_with_no_body_logged_as_a_warning_and_is_exit_0() {
     let w = World::at("404", START);
     w.snapshot("2026-11-26T11", &[10, 20]);
@@ -868,6 +972,7 @@ fn a_body_that_cannot_be_read_waits_for_the_next_run() {
 
         assert_eq!(exit(&report), 3, "{unreadable:?}: {report:?}");
         assert_eq!(report.errors[0].reason, "ITEM_BODY_UNUSABLE");
+        assert_eq!(report.errors[0].metadata["http_status"], "200");
         assert_eq!(report.errors[0].error_type, Some(ErrorType::Unexpected));
         assert!(w.item_files().is_empty());
     }
@@ -927,8 +1032,10 @@ fn a_lock_held_past_the_wait_leaves_the_items_for_the_next_run_and_no_file() {
 }
 
 #[test]
-fn the_lock_wait_is_cut_to_the_time_left_before_the_next_hourly_run() {
-    let w = World::at("locked-late", "2026-11-26T12:30:00Z");
+fn a_fetch_that_runs_to_its_end_still_waits_for_the_lock_before_the_next_hourly_run() {
+    // Started so the whole fetch is left: the lock wait is the full lock wait,
+    // and it ends before the next hourly run starts.
+    let w = World::at("locked-late", "2026-11-26T12:24:30Z");
     w.snapshot("2026-11-26T12", &[10]);
     w.stub.token_ok(5);
     w.stub.item_ok(10);
@@ -943,6 +1050,12 @@ fn the_lock_wait_is_cut_to_the_time_left_before_the_next_hourly_run() {
     let report = w.go();
 
     assert_eq!(exit(&report), 3);
+    assert_eq!(report.errors[0].reason, "LOCK_WAIT_EXPIRED");
+    assert!(
+        w.clock.now() >= at("2026-11-26T12:34:30Z"),
+        "{}",
+        w.clock.now()
+    );
     assert!(
         w.clock.now() <= at("2026-11-26T12:35:00Z"),
         "{}",
@@ -997,20 +1110,16 @@ fn an_empty_set_of_responses_is_a_file_with_no_rows_and_the_columns() {
     assert!(read_rows(&file).is_empty());
 }
 
-// For dp daily
-
 #[test]
-fn fetch_ids_asks_for_the_ids_it_is_given_even_where_bronze_has_a_response() {
-    let w = World::at("daily", START);
-    w.snapshot("2026-11-26T11", &[20]);
-    w.earlier_items("2026-11-26T093600.parquet", &[(20, 404)]);
-    w.stub.token_ok(5);
-    w.stub.item_ok(20);
+fn a_snapshots_folder_that_cannot_be_read_is_fundamental_not_empty() {
+    let w = World::at("unreadable-folder", START);
+    let eu = w.config.data_dir.join("bronze/commodities/eu");
+    fs::create_dir_all(eu.parent().unwrap()).unwrap();
+    // A file where the folder should be cannot be listed.
+    fs::write(&eu, "not a folder").unwrap();
 
-    let report = fetch_ids(&w.config, &w.clock, w.stub.endpoints(), &[ItemId(20)]);
+    let report = w.go();
 
-    assert_eq!(exit(&report), 0, "{report:?}");
-    assert_eq!(read_rows(&w.file())[0].1, 200);
-    // The latest response is the one that is now 200: nothing is left to fetch.
-    assert!(ids_to_fetch(&w.config.data_dir).unwrap().is_empty());
+    assert_eq!(report.reason, "LOCAL_IO_FAILED");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
 }
