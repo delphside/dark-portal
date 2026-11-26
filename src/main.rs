@@ -1,0 +1,32 @@
+//! The `dp` binary: parses the command line, runs the job, and ends with the
+//! exit status its report gives.
+
+use std::process::ExitCode;
+
+use clap::Parser;
+use dp::cli::{self, Cli};
+use dp::error::{ExitStatus, exit_status};
+
+fn main() -> ExitCode {
+    // Logs go to stderr, which systemd sends to the journal.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(refusal) => {
+            let _ = refusal.print();
+            // Help and version are answers; a bad flag is a usage error, 64.
+            return if refusal.use_stderr() {
+                ExitStatus::Usage.into()
+            } else {
+                ExitStatus::Completed.into()
+            };
+        }
+    };
+
+    let report = cli::run(cli.command);
+    report.log();
+    exit_status(&report).into()
+}

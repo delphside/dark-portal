@@ -1,0 +1,6 @@
+[toolchain]
+# Pins the compiler for CI and a developer machine alike, as Tile Lite Elite's
+# toolchain file does (programme docs/1.10 *Each language's standard and
+# checks*). Bumping it is an ordinary, diffable commit.
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
