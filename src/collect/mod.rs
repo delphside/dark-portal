@@ -11,10 +11,13 @@
 
 pub mod blizzard;
 pub mod clock;
-mod failure;
-mod lock;
+pub(crate) mod failure;
+pub(crate) mod lock;
+pub(crate) mod session;
 pub mod snapshot;
-mod token;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub(crate) mod token;
 pub mod window;
 
 use std::fs::File;
@@ -28,12 +31,12 @@ pub use clock::{Clock, SystemClock};
 
 use blizzard::Blizzard;
 use failure::{Failure, client_secret_refused, io_failure};
-use token::{Token, TokenCache};
+use session::Session;
 
 use crate::config::Config;
 use crate::error::{ErrorType, Report};
 use crate::settings::collection::{
-    POLL_INTERVAL, REGION, RETRY_BACKOFF_INITIAL, RETRY_BACKOFF_MAX, TOKEN_MARGIN,
+    POLL_INTERVAL, REGION, RETRY_BACKOFF_INITIAL, RETRY_BACKOFF_MAX,
 };
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::Hour;
@@ -65,7 +68,7 @@ fn run_hooked(
 
 /// The least a `Retry-After` is waited, so a `0` is not a hot loop. An
 /// implementation guard, not a setting: Blizzard's own figure is the wait.
-const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
+pub(crate) const MIN_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// The folder an hour's file goes in.
 fn bronze_dir(data_dir: &Path) -> PathBuf {
@@ -78,48 +81,6 @@ enum Attempt {
     NotYet,
     /// The hour's file is written under its temporary name.
     Written,
-}
-
-/// The token a run holds: the cached one, or a new one.
-struct Session<'a> {
-    config: &'a Config,
-    clock: &'a dyn Clock,
-    blizzard: &'a Blizzard,
-    cache: TokenCache,
-    token: Option<Token>,
-    /// True where the token was taken from Blizzard in this run.
-    fresh: bool,
-}
-
-impl Session<'_> {
-    /// The token to use: the cached one while it has more than the token
-    /// margin left, otherwise a new one.
-    fn token(&mut self) -> Result<Token, Failure> {
-        let now = self.clock.now();
-        if self.token.is_none() {
-            self.token = self.cache.load();
-        }
-        if let Some(token) = &self.token
-            && token.has_more_than(TOKEN_MARGIN, now)
-        {
-            return Ok(token.clone());
-        }
-        self.renew()
-    }
-
-    /// Takes a new token and caches it.
-    fn renew(&mut self) -> Result<Token, Failure> {
-        let token = self.blizzard.token(
-            &self.config.blizzard_client_id,
-            &self.config.blizzard_client_secret,
-            self.clock.now(),
-        )?;
-        self.cache.store(&token)?;
-        self.token = Some(token.clone());
-        self.fresh = true;
-        tracing::info!("took a new Blizzard access token");
-        Ok(token)
-    }
 }
 
 fn collect(
@@ -154,14 +115,7 @@ fn collect(
     std::fs::create_dir_all(&dir)
         .map_err(|e| unwrap_stop(io_failure(&e, "creating the bronze folder")))?;
 
-    let mut session = Session {
-        config,
-        clock,
-        blizzard,
-        cache: TokenCache::new(&config.data_dir),
-        token: None,
-        fresh: false,
-    };
+    let mut session = Session::new(config, clock, blizzard);
 
     // 2 to 5, until the hour is written or the retry window closes.
     let mut backoff = RETRY_BACKOFF_INITIAL;
@@ -245,12 +199,12 @@ fn collect(
 }
 
 /// The temporary name of an hour's file for a run: its `pid` and `random`.
-fn temporary_name(hour_file: &str, pid: u32, random: &str) -> String {
+pub(crate) fn temporary_name(hour_file: &str, pid: u32, random: &str) -> String {
     format!("{hour_file}.{pid}-{random}.tmp")
 }
 
 /// 16 hex characters from the kernel's random source.
-fn random_suffix() -> Result<String, Failure> {
+pub(crate) fn random_suffix() -> Result<String, Failure> {
     use std::io::Read;
     let mut bytes = [0u8; 8];
     File::open("/dev/urandom")
@@ -367,11 +321,11 @@ fn attempt(
 /// one is refused.
 fn request(session: &mut Session<'_>) -> Result<blizzard::SnapshotResponse, Failure> {
     let token = session.token()?;
-    match session.blizzard.snapshot(&token) {
-        Err(Failure::Refused) if !session.fresh => {
+    match session.blizzard().snapshot(&token) {
+        Err(Failure::Refused) if !session.is_fresh() => {
             tracing::info!("the cached token was refused; taking a new one");
             let token = session.renew()?;
-            session.blizzard.snapshot(&token)
+            session.blizzard().snapshot(&token)
         }
         other => other,
     }

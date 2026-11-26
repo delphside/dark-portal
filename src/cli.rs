@@ -1,5 +1,5 @@
 //! The command line: one subcommand per job
-//! (`docs/5.1.1-architecture.md`). `collect` is built; the others
+//! (`docs/5.1.1-architecture.md`). `collect` and `items` are built; the others
 //! are stubs until their increments are.
 
 use clap::{Parser, Subcommand};
@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use crate::collect::{self, Endpoints, SystemClock};
 use crate::config::Config;
 use crate::error::{ErrorType, Report};
+use crate::items;
 
 /// The exit statuses, for `--help` (1.10, *What a script's exit status
 /// means*).
@@ -60,13 +61,16 @@ impl Command {
     }
 }
 
-/// Runs a command. `collect` runs; every other command is a stub for now: it
+/// Runs a command. `collect` and `items` run; every other command is a stub for now: it
 /// logs that it is not built yet and stops with an *unexpected* fatal, exit
 /// `70`.
 pub fn run(command: Command) -> Report {
-    if command == Command::Collect {
+    if matches!(command, Command::Collect | Command::Items) {
         return match Config::from_env() {
-            Ok(config) => collect::run(&config, &SystemClock, Endpoints::blizzard()),
+            Ok(config) if command == Command::Collect => {
+                collect::run(&config, &SystemClock, Endpoints::blizzard())
+            }
+            Ok(config) => items::run(&config, &SystemClock, Endpoints::blizzard()),
             Err(report) => *report,
         };
     }

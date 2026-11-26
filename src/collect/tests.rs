@@ -10,18 +10,16 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use duckdb::Connection;
-use tokio::runtime::Runtime;
 use wiremock::matchers::{header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 use super::blizzard::{Blizzard, Timeouts};
 use super::clock::FakeClock;
+use super::test_support::{SECRET, Stub, TOKEN, http_date};
 use super::*;
 use crate::config::Secret;
 use crate::error::{ExitStatus, exit_status};
 
-const SECRET: &str = "the-client-secret";
-const TOKEN: &str = "tok-new-7f3a";
 const BODY: &str = r#"{"_links":{},"auctions":[
     {"id":1,"item":{"id":10},"quantity":5,"unit_price":123,"time_left":"SHORT"},
     {"id":2,"item":{"id":10},"quantity":7,"unit_price":130,"time_left":"LONG"},
@@ -31,68 +29,7 @@ fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
-/// The stubbed Blizzard: one server for both hosts, on its own runtime so the
-/// blocking client under test can call it.
-struct Stub {
-    runtime: Runtime,
-    server: MockServer,
-}
-
 impl Stub {
-    fn new() -> Stub {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let server = runtime.block_on(MockServer::start());
-        Stub { runtime, server }
-    }
-
-    fn mount(&self, mock: Mock) {
-        self.runtime.block_on(mock.mount(&self.server));
-    }
-
-    fn endpoints(&self) -> Endpoints {
-        Endpoints {
-            oauth: self.server.uri(),
-            api: self.server.uri(),
-        }
-    }
-
-    fn requests(&self, verb: &str) -> usize {
-        self.runtime
-            .block_on(self.server.received_requests())
-            .unwrap()
-            .iter()
-            .filter(|r| r.method.as_str() == verb)
-            .count()
-    }
-
-    /// The token endpoint gives `TOKEN`, up to `times` times.
-    fn token_ok(&self, times: u64) {
-        self.mount(
-            Mock::given(method("POST"))
-                .and(path("/token"))
-                .and(header(
-                    "authorization",
-                    format!("Basic {}", STANDARD.encode(format!("client-id:{SECRET}"))).as_str(),
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-                    r#"{{"access_token":"{TOKEN}","token_type":"bearer","expires_in":86399}}"#
-                )))
-                .up_to_n_times(times),
-        );
-    }
-
-    fn token_status(&self, status: u16) {
-        self.mount(
-            Mock::given(method("POST"))
-                .and(path("/token"))
-                .respond_with(ResponseTemplate::new(status)),
-        );
-    }
-
     /// A snapshot answer, `times` times, to a request bearing `bearer`.
     fn snapshot(&self, bearer: &str, last_modified: &str, times: u64) {
         self.mount(
@@ -120,13 +57,6 @@ fn snapshot_mock(bearer: &str) -> wiremock::MockBuilder {
         .and(path("/data/wow/auctions/commodities"))
         .and(query_param("namespace", "dynamic-eu"))
         .and(header("authorization", format!("Bearer {bearer}").as_str()))
-}
-
-fn http_date(rfc3339: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .unwrap()
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
 }
 
 fn ok(last_modified_rfc3339: &str, body: &str) -> ResponseTemplate {
@@ -192,15 +122,7 @@ impl World {
 
     /// Puts a token in the cache, expiring at `expires_at`.
     fn cache_token(&self, value: &str, expires_at: &str) {
-        fs::create_dir_all(self.token_cache().parent().unwrap()).unwrap();
-        let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
-            .unwrap()
-            .timestamp();
-        fs::write(
-            self.token_cache(),
-            format!(r#"{{"access_token":"{value}","expires_at":{expires}}}"#),
-        )
-        .unwrap();
+        test_support::cache_token(&self.config.data_dir, value, expires_at);
     }
 }
 

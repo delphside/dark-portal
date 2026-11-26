@@ -8,5 +8,6 @@ pub mod cli;
 pub mod collect;
 pub mod config;
 pub mod error;
+pub mod items;
 pub mod settings;
 pub mod types;

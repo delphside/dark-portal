@@ -244,7 +244,7 @@ pub struct SnapshotMeta {
     pub fetched_at: DateTime<Utc>,
 }
 
-fn duckdb_failure(message: &str) -> Failure {
+pub(crate) fn duckdb_failure(message: &str) -> Failure {
     if says_disk_full(message) {
         io_failure(
             &io::Error::from(io::ErrorKind::StorageFull),
@@ -255,7 +255,7 @@ fn duckdb_failure(message: &str) -> Failure {
             Report::fatal(
                 ErrorType::Unexpected,
                 "BRONZE_WRITE_FAILED",
-                "DuckDB could not write the snapshot file.",
+                "DuckDB could not write the bronze file.",
             )
             .with_metadata("detail", message),
         ))
@@ -263,11 +263,11 @@ fn duckdb_failure(message: &str) -> Failure {
 }
 
 /// A SQL string literal.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-fn timestamp(moment: DateTime<Utc>) -> String {
+pub(crate) fn timestamp(moment: DateTime<Utc>) -> String {
     format!(
         "CAST('{}+00' AS TIMESTAMPTZ)",
         moment.format("%Y-%m-%d %H:%M:%S%.6f")

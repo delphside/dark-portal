@@ -15,7 +15,10 @@ use super::failure::{Failure, client_secret_refused};
 use super::token::Token;
 use crate::config::Secret;
 use crate::error::ErrorType;
-use crate::settings::collection::{HTTP_TIMEOUT_OTHER, HTTP_TIMEOUT_SNAPSHOT, NAMESPACE};
+use crate::settings::collection::{
+    HTTP_TIMEOUT_OTHER, HTTP_TIMEOUT_SNAPSHOT, ITEM_LOCALE, ITEM_NAMESPACE, NAMESPACE,
+};
+use crate::types::ItemId;
 
 /// Blizzard's base URLs. A test points them at a stub; a run uses
 /// [`Endpoints::blizzard`].
@@ -58,6 +61,15 @@ pub struct SnapshotResponse {
     pub last_modified: DateTime<Utc>,
     /// The body, to be read as a stream.
     pub body: Box<dyn Read + Send>,
+}
+
+/// What Blizzard answered to an item lookup that is data and not a failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ItemAnswer {
+    /// 200: the body, as Blizzard sent it.
+    Found(String),
+    /// 404: Blizzard has no data for the item yet.
+    NotFound,
 }
 
 /// The client.
@@ -232,5 +244,39 @@ impl Blizzard {
             last_modified,
             body: Box::new(response.into_body().into_reader()),
         })
+    }
+
+    /// Asks for an item's data. A 200 gives its body unchanged, once it is
+    /// known to be a JSON object, and a 404 is [`ItemAnswer::NotFound`]: data,
+    /// not a failure. Every other answer is sorted as the snapshot's are.
+    pub fn item(&self, token: &Token, item: ItemId) -> Result<ItemAnswer, Failure> {
+        let url = format!(
+            "{}/data/wow/item/{}?namespace={ITEM_NAMESPACE}&locale={ITEM_LOCALE}",
+            self.endpoints.api, item.0
+        );
+        let response = self
+            .other_agent
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token.expose()))
+            .call()
+            .map_err(|e| transport(&e))?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(ItemAnswer::NotFound);
+        }
+        if status != 200 {
+            return Err(status_failure(status, retry_after(&response), "item"));
+        }
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| transport(&e))?;
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Object(_)) => Ok(ItemAnswer::Found(text)),
+            _ => Err(Failure::unexpected(
+                "ITEM_BODY_UNUSABLE",
+                "Blizzard's item response could not be read.",
+            )),
+        }
     }
 }
