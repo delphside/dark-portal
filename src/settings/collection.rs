@@ -41,3 +41,6 @@ pub const TOKEN_MARGIN: Duration = Duration::from_secs(60 * 60);
 
 /// "item fetch rate": item requests a second, 50.
 pub const ITEM_FETCH_RATE_PER_SECOND: u32 = 50;
+
+/// "item attempts": the requests an item gets in one run, 3.
+pub const ITEM_ATTEMPTS: u32 = 3;

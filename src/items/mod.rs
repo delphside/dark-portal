@@ -2,11 +2,10 @@
 //! *Item data* and the after-the-pivot rows of *When it fails*,
 //! `docs/5.2.1-collection.md`, set it out.
 //!
-//! **The pivot is the rename** of the run's file into place, under the
-//! VM-wide lock: before it nothing is kept but a temporary file named for the
-//! run, and after it the responses are in bronze for good. A failure before
-//! the first fetch (bronze cannot be read, the folder cannot be made) stops
-//! the run with a fatal. From the first fetch on, a failure that leaves an
+//! **The pivot is the first request.** A failure before it (bronze cannot be
+//! read, the folder cannot be made) stops the run with a fatal. From it on,
+//! each item is a unit of work: the responses reach bronze by the rename of
+//! the run's file into place under the VM-wide lock, and a failure that leaves an
 //! item for the next run is an *error* the step carries on past, and the step
 //! exits `3` where there is one. An item Blizzard has no data for (404) is
 //! recorded: data, not an error.
@@ -52,11 +51,7 @@ use crate::types::{Hour, ItemId};
 use pacer::Pacer;
 use store::{Responses, items_dir};
 
-/// The attempts an item gets in one run. A blip pauses the whole fetch, so an
-/// item that meets one on each of three turns, with the pauses between, more
-/// likely has a fault of its own than Blizzard has; it waits for the next run
-/// and the others are not held up. An implementation guard, not a setting.
-const ITEM_ATTEMPTS: u32 = 3;
+use crate::settings::collection::ITEM_ATTEMPTS;
 
 /// Runs `dp items`: fetches every item ID in bronze's snapshot files that its
 /// item files have no response for. The report is the run's result: `Ok`, or
