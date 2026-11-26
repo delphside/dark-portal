@@ -136,6 +136,19 @@ fixed_values! {
     }
 }
 
+impl TimeLeft {
+    /// The lower bound of the band, in minutes: 0, 30, 120 or 720
+    /// (`docs/5.4.5-data-dictionary.md`, *Types*).
+    pub fn lower_bound_minutes(self) -> u32 {
+        match self {
+            TimeLeft::Short => 0,
+            TimeLeft::Medium => 30,
+            TimeLeft::Long => 2 * 60,
+            TimeLeft::VeryLong => 12 * 60,
+        }
+    }
+}
+
 fixed_values! {
     /// The hours a listing was posted for.
     Duration {

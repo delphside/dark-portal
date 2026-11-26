@@ -1,0 +1,230 @@
+//! `dp transform`: processes every bronze hour after the high-water mark, in
+//! order, into silver (5.1.1 *The hourly run*, `docs/5.1.1-architecture.md`;
+//! the rules are 5.2.2, `docs/5.2.2-listing-lifecycle-and-events.md`).
+//!
+//! **The lake.** [`crate::lake`] opens it and applies its migrations; this is
+//! the one job that writes silver.
+//!
+//! **An hour is one transaction.** Its events, histories, records and
+//! `meta.processed` row commit together or not at all, so the high-water mark
+//! (`meta.processed`'s latest hour for the market) is only ever an hour whose
+//! silver is whole. A failed hour leaves it where it was and stops the run;
+//! the next run reprocesses that hour (5.2.1 *When it fails*,
+//! `docs/5.2.1-collection.md`). The hours before it stay committed.
+//!
+//! **A missed hour** is a bronze hour missing between two that are there: it is
+//! recorded in `meta.gap`, in the later hour's transaction, and that hour's
+//! span is the hours since the previous held.
+//!
+//! **The lock.** The VM-wide lock is held from before the lake is opened to
+//! the end. `dp hourly` will hold it across its steps and call
+//! [`process_hours`] itself.
+//!
+//! **Errors.** After the pivot an hour's failure is an error to `dp hourly`
+//! (exit `3`, from `dp hourly`'s own summary); `dp transform` run alone ends
+//! with its error's type, so [`run`] returns a fatal.
+//!
+//! **Clock.** The time of `found_at` and `committed_at`, and an hour's time
+//! against its bound, come from the [`Clock`] (G19: the documents name no
+//! clock seam, so this is the collection's).
+//!
+//! Gold's hour rows, which 5.2.2's matrix writes at *hour closed*, are a later
+//! increment; the place for them is the end of `sql/transform/4-apply.sql`.
+
+mod bronze;
+mod hour;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
+mod vocabulary;
+
+use std::path::Path;
+use std::time::Duration;
+
+use crate::collect::failure::Failure;
+use crate::collect::{Clock, lock};
+use crate::config::Config;
+use crate::error::{ErrorType, Report, Severity};
+use crate::lake::{Backend, Lake, lake_failure};
+use crate::settings::scheduling::LOCK_WAIT;
+use crate::settings::transform::HOURLY_PROCESSING_BOUND;
+use crate::types::Hour;
+
+pub use hour::{HourSummary, MARKET, Step};
+pub use vocabulary::HourWarning;
+
+/// Runs `dp transform` on the production lake. The report is the run's
+/// result: `Ok` where every hour after the mark is processed (nothing to do
+/// included), a warning where an hour ran past the hourly processing bound,
+/// and a fatal, by its type, where an hour or the lake failed.
+pub fn run(config: &Config, clock: &dyn Clock) -> Report {
+    run_with(
+        config,
+        clock,
+        &Backend::DuckLake {
+            data_dir: config.data_dir.clone(),
+        },
+    )
+}
+
+/// As [`run`], on the given backend: a test's way to use a plain DuckDB file.
+pub fn run_with(config: &Config, clock: &dyn Clock, backend: &Backend) -> Report {
+    run_hooked(config, clock, backend, &|_, _| Ok(()))
+}
+
+pub(crate) fn run_hooked(
+    config: &Config,
+    clock: &dyn Clock,
+    backend: &Backend,
+    hook: hour::Hook,
+) -> Report {
+    let _lock = match lock::acquire(&config.lock_file, LOCK_WAIT, clock) {
+        Ok(lock) => lock,
+        Err(failure) => return fatal(failure),
+    };
+    match open_and_process(config, clock, backend, hook) {
+        Ok(report) => report,
+        Err(report) => *report,
+    }
+}
+
+fn open_and_process(
+    config: &Config,
+    clock: &dyn Clock,
+    backend: &Backend,
+    hook: hour::Hook,
+) -> Result<Report, Box<Report>> {
+    let lake =
+        Lake::open(backend, &config.data_dir.join("state/duckdb-tmp")).map_err(into_fatal)?;
+    lake.migrate(clock.now()).map_err(into_fatal)?;
+    let outcome = process_hours(&lake, &config.data_dir, clock, hook);
+    for (warning, id) in &outcome.warnings {
+        Report::warning(warning.code(), warning.message())
+            .with_metadata("id", id.to_string())
+            .log();
+    }
+    match outcome.failure {
+        Some(report) => Err(Box::new(report)),
+        None => Ok(finished(&outcome)),
+    }
+}
+
+fn into_fatal(failure: Failure) -> Box<Report> {
+    Box::new(fatal(failure))
+}
+
+/// A failure as the fatal that stops the run.
+fn fatal(failure: Failure) -> Report {
+    let mut report = match failure {
+        Failure::Stop(report) => *report,
+        Failure::Retry { report, .. } => *report,
+        Failure::Refused | Failure::Gone => Report::fatal(
+            ErrorType::Unexpected,
+            "TRANSFORM_FAILED",
+            "The transform stopped on a failure it does not know.",
+        ),
+    };
+    report.outcome = Severity::Fatal;
+    report
+}
+
+/// What [`process_hours`] did.
+#[derive(Debug)]
+pub struct Outcome {
+    /// Each hour committed, in order.
+    pub hours: Vec<HourSummary>,
+    /// Each listing warned of, across the hours.
+    pub warnings: Vec<(HourWarning, u64)>,
+    /// The longest an hour took, and which.
+    pub slowest: Option<(Hour, Duration)>,
+    /// What stopped the run, as a fatal report.
+    pub failure: Option<Report>,
+}
+
+/// [`process_hours`] with no hook: the lake is open, and the caller holds the
+/// lock.
+pub fn catch_up(lake: &Lake, data_dir: &Path, clock: &dyn Clock) -> Outcome {
+    process_hours(lake, data_dir, clock, &|_, _| Ok(()))
+}
+
+/// The high-water mark: the latest hour processed for the market.
+pub fn high_water_mark(lake: &Lake) -> Result<Option<Hour>, Failure> {
+    let millis: Option<i64> = lake
+        .connection()
+        .query_row(
+            &format!(
+                "SELECT epoch_ms(max(hour)) FROM meta.processed WHERE market = {}",
+                crate::collect::snapshot::quoted(MARKET.as_str())
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| lake_failure(&e.to_string(), "reading the high-water mark"))?;
+    Ok(millis.map(|ms| Hour(ms / 3_600_000)))
+}
+
+/// Processes every bronze hour after the high-water mark, in order, each as
+/// one transaction, stopping at the first that fails. The lake is open, its
+/// migrations are applied and the lock is held: all the caller's.
+pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour::Hook) -> Outcome {
+    let mut outcome = Outcome {
+        hours: Vec::new(),
+        warnings: Vec::new(),
+        slowest: None,
+        failure: None,
+    };
+    let result = (|| -> Result<(), Failure> {
+        vocabulary::install(lake)?;
+        let mark = high_water_mark(lake)?;
+        let mut previous = mark;
+        for hour in bronze::hours(data_dir)? {
+            if mark.is_some_and(|mark| hour <= mark) {
+                continue;
+            }
+            let started = clock.now();
+            let summary = hour::process(lake, data_dir, clock, hour, previous, hook)?;
+            let took = (clock.now() - started).to_std().unwrap_or_default();
+            tracing::info!(
+                hour = %bronze::hour_name(hour),
+                events = summary.events,
+                ended = summary.ended,
+                live = summary.live,
+                seconds = took.as_secs_f64(),
+                "processed the hour"
+            );
+            if outcome.slowest.is_none_or(|(_, slowest)| took > slowest) {
+                outcome.slowest = Some((hour, took));
+            }
+            outcome.warnings.extend(summary.warnings.iter().copied());
+            outcome.hours.push(summary);
+            previous = Some(hour);
+        }
+        Ok(())
+    })();
+    if let Err(failure) = result {
+        outcome.failure = Some(fatal(
+            failure.with_metadata("hours_processed", outcome.hours.len().to_string()),
+        ));
+    }
+    outcome
+}
+
+/// The report of a run that stopped on nothing: a warning where an hour ran
+/// past the bound (5.4.1 *hourly processing bound*), otherwise `Ok`.
+fn finished(outcome: &Outcome) -> Report {
+    let report = match outcome.slowest {
+        Some((hour, took)) if took > HOURLY_PROCESSING_BOUND => Report::warning(
+            "HOUR_PROCESSING_OVER_BOUND",
+            "An hour took longer to transform than the hourly processing bound.",
+        )
+        .with_metadata("hour", bronze::hour_name(hour))
+        .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
+        .with_metadata(
+            "bound_seconds",
+            HOURLY_PROCESSING_BOUND.as_secs().to_string(),
+        ),
+        _ => Report::ok(),
+    };
+    report.with_metadata("hours", outcome.hours.len().to_string())
+}

@@ -66,7 +66,7 @@ fn run_hooked(
 }
 
 /// The folder an hour's file goes in.
-fn bronze_dir(data_dir: &Path) -> PathBuf {
+pub(crate) fn bronze_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("bronze/commodities").join(REGION)
 }
 
