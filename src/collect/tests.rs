@@ -276,9 +276,19 @@ fn a_run_in_a_collected_hour_exits_0_and_asks_blizzard_nothing() {
 #[test]
 fn the_temporary_file_is_named_for_the_run() {
     assert_eq!(
-        temporary_name("2026-11-26T11.parquet", 4242),
-        "2026-11-26T11.parquet.4242.tmp"
+        temporary_name("2026-11-26T11.parquet", 4242, "00ff00ff00ff00ff"),
+        "2026-11-26T11.parquet.4242-00ff00ff00ff00ff.tmp"
     );
+}
+
+#[test]
+fn the_random_suffix_is_16_hex_characters_and_differs_between_calls() {
+    let (a, b) = (random_suffix().unwrap(), random_suffix().unwrap());
+    for suffix in [&a, &b] {
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+    assert_ne!(a, b);
 }
 
 #[test]
@@ -287,7 +297,11 @@ fn another_runs_half_written_file_is_never_renamed_into_place() {
     // run A (this one) finishes: A must publish its own file, and clear B's
     // once the hour is in place.
     let w = World::at("interleave", AT_1135);
-    let other = format!("2026-11-26T11.parquet.{}.tmp", std::process::id() + 1);
+    // Same pid, as another container's PID 1 would have; only the suffix differs.
+    let other = format!(
+        "2026-11-26T11.parquet.{}-0123456789abcdef.tmp",
+        std::process::id()
+    );
     fs::create_dir_all(bronze_dir(&w.config.data_dir)).unwrap();
     fs::write(w.bronze(&other), "run B, half written").unwrap();
     w.stub.token_ok(5);
@@ -864,4 +878,54 @@ fn the_lock_is_free_again_once_the_run_ends() {
 
     let other = File::open(&w.config.lock_file).unwrap();
     assert!(other.try_lock().is_ok());
+}
+
+// A winner clears this run's temporary file
+
+/// Plays the winner between this run's write and its lock: the hour is
+/// published (or not) and every temporary file of the hour is cleared.
+fn winner(w: &World, publish: bool) -> impl Fn() + use<> {
+    let dir = bronze_dir(&w.config.data_dir);
+    move || {
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".tmp") {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        if publish {
+            fs::write(dir.join("2026-11-26T11.parquet"), "the winner's").unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_run_whose_file_a_winner_cleared_exits_0_as_already_collected() {
+    let w = World::at("cleared", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot(TOKEN, LM_11, 5);
+    let hook = winner(&w, true);
+
+    let blizzard = Blizzard::new(w.stub.endpoints());
+    let report = run_hooked(&w.config, &w.clock, blizzard, &hook);
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert_eq!(report.metadata["result"], "already collected");
+    assert_eq!(
+        fs::read(w.bronze("2026-11-26T11.parquet")).unwrap(),
+        b"the winner's"
+    );
+}
+
+#[test]
+fn a_file_that_vanished_with_no_hour_in_place_is_fundamental_exit_2() {
+    let w = World::at("vanished", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot(TOKEN, LM_11, 5);
+    let hook = winner(&w, false);
+
+    let blizzard = Blizzard::new(w.stub.endpoints());
+    let report = run_hooked(&w.config, &w.clock, blizzard, &hook);
+
+    assert_eq!(report.reason, "TEMPORARY_FILE_GONE");
+    assert_eq!(exit(&report), 2);
 }

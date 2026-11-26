@@ -281,6 +281,25 @@ pub fn write_parquet<R: Read>(
     meta: &SnapshotMeta,
     temporary: &Path,
 ) -> Result<ParseSummary, Failure> {
+    // The name is the run's own, so a file already there is a clash, which is
+    // refused and not shared.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)
+        .map_err(|e| io_failure(&e, "reserving the temporary file"))?;
+    let result = write_into(body, meta, temporary);
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+fn write_into<R: Read>(
+    body: R,
+    meta: &SnapshotMeta,
+    temporary: &Path,
+) -> Result<ParseSummary, Failure> {
     let connection = Connection::open_in_memory().map_err(|e| duckdb_failure(&e.to_string()))?;
     connection
         .execute_batch(&format!(
@@ -327,11 +346,6 @@ pub fn write_parquet<R: Read>(
         summary
     };
 
-    match std::fs::remove_file(temporary) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_failure(&e, "removing a stale temporary file")),
-    }
     connection
         .execute_batch(&format!(
             "COPY (SELECT {} AS hour, {} AS last_modified, {} AS fetched_at, \
@@ -344,10 +358,18 @@ pub fn write_parquet<R: Read>(
         ))
         .map_err(|e| duckdb_failure(&e.to_string()))?;
     // The file is on disk before the rename that makes it the hour's.
-    std::fs::File::open(temporary)
-        .and_then(|file| file.sync_all())
-        .map_err(|e| io_failure(&e, "syncing the snapshot file"))?;
+    sync_file(temporary)?;
     Ok(summary)
+}
+
+/// Syncs a file. One that is not there was cleared by a run that collected the
+/// hour first: [`Failure::Gone`].
+pub fn sync_file(path: &Path) -> Result<(), Failure> {
+    match std::fs::File::open(path).and_then(|file| file.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Failure::Gone),
+        Err(e) => Err(io_failure(&e, "syncing the snapshot file")),
+    }
 }
 
 #[cfg(test)]
@@ -580,22 +602,21 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_temporary_file_is_overwritten() {
-        let path = temp("stale");
-        std::fs::write(&path, "left by a killed run").unwrap();
-        write_parquet(TWO.as_bytes(), &meta(), &path).unwrap();
-        let db = Connection::open_in_memory().unwrap();
-        let count: i64 = db
-            .query_row(
-                &format!(
-                    "SELECT count(*) FROM read_parquet({})",
-                    quoted(&path.to_string_lossy())
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
+    fn a_temporary_file_that_is_already_there_is_refused_not_shared() {
+        let path = temp("clash");
+        std::fs::write(&path, "another run's").unwrap();
+        let Err(Failure::Stop(report)) = write_parquet(TWO.as_bytes(), &meta(), &path) else {
+            panic!("expected a stop");
+        };
+        assert_eq!(report.reason, "LOCAL_IO_FAILED");
+        assert_eq!(std::fs::read(&path).unwrap(), b"another run's");
+    }
+
+    #[test]
+    fn a_file_cleared_by_another_run_is_gone_not_an_error_by_itself() {
+        let path = temp("gone");
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(sync_file(&path), Err(Failure::Gone)));
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub enum Failure {
     },
     /// Blizzard refused the access token (401).
     Refused,
+    /// The run's temporary file is gone: a run that collected the hour first
+    /// cleared it. Not an error if the hour is in place once the lock is held.
+    Gone,
     /// Stop the run with this report.
     Stop(Box<Report>),
 }
@@ -49,7 +52,7 @@ impl Failure {
             Failure::Retry { report, .. } | Failure::Stop(report) => {
                 report.metadata.insert(key.to_owned(), value.into());
             }
-            Failure::Refused => {}
+            Failure::Refused | Failure::Gone => {}
         }
         self
     }

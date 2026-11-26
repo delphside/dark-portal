@@ -46,7 +46,18 @@ pub fn run(config: &Config, clock: &dyn Clock, endpoints: Endpoints) -> Report {
 }
 
 fn run_with(config: &Config, clock: &dyn Clock, blizzard: Blizzard) -> Report {
-    match collect(config, clock, &blizzard) {
+    run_hooked(config, clock, blizzard, &|| {})
+}
+
+/// As [`run_with`], calling `before_lock` once the snapshot is written and
+/// before the lock is taken: a test's place to play another run.
+fn run_hooked(
+    config: &Config,
+    clock: &dyn Clock,
+    blizzard: Blizzard,
+    before_lock: &dyn Fn(),
+) -> Report {
+    match collect(config, clock, &blizzard, before_lock) {
         Ok(report) => report,
         Err(report) => *report,
     }
@@ -111,14 +122,24 @@ impl Session<'_> {
     }
 }
 
-fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Report, Box<Report>> {
+fn collect(
+    config: &Config,
+    clock: &dyn Clock,
+    blizzard: &Blizzard,
+    before_lock: &dyn Fn(),
+) -> Result<Report, Box<Report>> {
     let hour = window::current_hour(clock.now());
     let window_end = window::window_end(hour);
     let dir = bronze_dir(&config.data_dir);
     let file = dir.join(window::file_name(hour));
     let hour_label = window::file_name(hour);
-    // Named for the run, so two runs in one hour never share a file.
-    let temporary = dir.join(temporary_name(&hour_label, std::process::id()));
+    // Named for the run (its pid, which is not unique across containers, and
+    // a random suffix), so two runs in one hour never share a file.
+    let temporary = dir.join(temporary_name(
+        &hour_label,
+        std::process::id(),
+        &random_suffix().map_err(unwrap_stop)?,
+    ));
 
     let done = |what: &str| {
         Report::ok()
@@ -146,9 +167,16 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
     let mut backoff = RETRY_BACKOFF_INITIAL;
     let mut last: Option<Report>;
     let mut retries: u32 = 0;
+    // False where the temporary file was cleared by a run that collected the
+    // hour first; the hour must then be in place once the lock is held.
+    let mut written = true;
     loop {
         let wait = match attempt(&mut session, hour, &temporary, clock) {
             Ok(Attempt::Written) => break,
+            Err(Failure::Gone) => {
+                written = false;
+                break;
+            }
             Ok(Attempt::NotYet) => {
                 backoff = RETRY_BACKOFF_INITIAL;
                 last = Some(
@@ -178,14 +206,23 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
         clock.sleep(wait);
     }
 
+    before_lock();
     // The pivot: the lock is held for the rename only.
     let _lock = lock::acquire(&config.lock_file, LOCK_WAIT, clock).map_err(unwrap_stop)?;
     if file.exists() {
         let _ = std::fs::remove_file(&temporary);
         return Ok(done("already collected"));
     }
-    std::fs::rename(&temporary, &file)
-        .map_err(|e| unwrap_stop(io_failure(&e, "renaming the snapshot into place")))?;
+    if !written {
+        return Err(Box::new(temporary_gone()));
+    }
+    std::fs::rename(&temporary, &file).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Box::new(temporary_gone())
+        } else {
+            unwrap_stop(io_failure(&e, "renaming the snapshot into place"))
+        }
+    })?;
     // The rename is durable only once its folder is.
     File::open(&dir)
         .and_then(|folder| folder.sync_all())
@@ -207,9 +244,29 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
     Ok(done("collected"))
 }
 
-/// The temporary name of an hour's file for the run `pid`.
-fn temporary_name(hour_file: &str, pid: u32) -> String {
-    format!("{hour_file}.{pid}.tmp")
+/// The temporary name of an hour's file for a run: its `pid` and `random`.
+fn temporary_name(hour_file: &str, pid: u32, random: &str) -> String {
+    format!("{hour_file}.{pid}-{random}.tmp")
+}
+
+/// 16 hex characters from the kernel's random source.
+fn random_suffix() -> Result<String, Failure> {
+    use std::io::Read;
+    let mut bytes = [0u8; 8];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|e| io_failure(&e, "reading random bytes"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// The run's temporary file is gone and the hour is not in place: something
+/// other than a run that collected the hour removed it.
+fn temporary_gone() -> Report {
+    Report::fatal(
+        ErrorType::TechnicalFundamental,
+        "TEMPORARY_FILE_GONE",
+        "The snapshot's temporary file was removed and the hour is not collected; run again.",
+    )
 }
 
 /// Removes the temporary files of an hour other than `own`, which are left by
@@ -249,6 +306,7 @@ fn unwrap_stop(failure: Failure) -> Box<Report> {
     match failure {
         Failure::Stop(report) => report,
         Failure::Retry { report, .. } => report,
+        Failure::Gone => Box::new(temporary_gone()),
         Failure::Refused => Box::new(Report::fatal(
             ErrorType::TechnicalFundamental,
             "TOKEN_REFUSED",
