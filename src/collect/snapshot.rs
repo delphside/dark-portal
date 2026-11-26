@@ -350,7 +350,7 @@ fn write_into<R: Read>(
         .execute_batch(&format!(
             "COPY (SELECT {} AS hour, {} AS last_modified, {} AS fetched_at, \
              id, item, quantity, unit_price, time_left FROM listing) \
-             TO {} (FORMAT PARQUET, COMPRESSION ZSTD);",
+             TO {} (FORMAT PARQUET, COMPRESSION ZSTD, USE_TMP_FILE false);",
             timestamp(meta.hour),
             timestamp(meta.last_modified),
             timestamp(meta.fetched_at),
@@ -509,6 +509,7 @@ mod tests {
 
     fn temp(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dp-snap-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("x.parquet.tmp")
     }

@@ -156,6 +156,7 @@ fn parsing_300_000_listings_takes_no_more_memory_than_30_000() {
     // includes DuckDB's own memory, before and after 300,000 rows.
     let before = high_water_mark_kib();
     let directory = std::env::temp_dir().join(format!("dp-memory-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
     let file = directory.join("snapshot.parquet.tmp");
     let moment = DateTime::parse_from_rfc3339("2026-11-26T10:00:00Z")
