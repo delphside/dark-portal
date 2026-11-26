@@ -25,6 +25,14 @@ pub enum Failure {
     Stop(Box<Report>),
 }
 
+/// Whether an HTTP status from a dependency is a *blip* to ask again after a
+/// wait (1.10 *The type of an error*): a 429, 502, 503 or 504, and a 408, the
+/// server's own timeout. Every adapter's table starts here; a 500 is not one,
+/// and is *unexpected*.
+pub fn is_blip_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 502 | 503 | 504)
+}
+
 impl Failure {
     /// A blip to retry.
     pub fn blip(reason: &str, message: &str, after: Option<Duration>) -> Failure {
@@ -119,6 +127,16 @@ mod tests {
         ));
         assert_eq!(report.reason, "DISK_FULL");
         assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+    }
+
+    #[test]
+    fn a_blip_status_is_the_type_tables_and_a_500_is_not_one() {
+        for status in [408, 429, 502, 503, 504] {
+            assert!(is_blip_status(status), "{status}");
+        }
+        for status in [200, 400, 401, 403, 404, 500, 501] {
+            assert!(!is_blip_status(status), "{status}");
+        }
     }
 
     #[test]

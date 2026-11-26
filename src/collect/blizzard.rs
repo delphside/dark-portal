@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use ureq::Agent;
 
-use super::failure::{Failure, client_secret_refused};
+use super::failure::{Failure, client_secret_refused, is_blip_status};
 use super::token::Token;
 use crate::config::Secret;
 use crate::error::ErrorType;
@@ -140,7 +140,7 @@ fn status_failure(status: u16, after: Option<Duration>, what: &str) -> Failure {
 
 fn status_kind(status: u16, after: Option<Duration>, what: &str) -> Failure {
     match status {
-        429 | 502 | 503 | 504 => Failure::blip(
+        _ if is_blip_status(status) => Failure::blip(
             "BLIZZARD_BUSY",
             "Blizzard answered that it is busy or down for now.",
             after,

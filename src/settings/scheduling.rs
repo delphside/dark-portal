@@ -21,3 +21,8 @@ pub const DAILY_TIMER_START_MINUTE: u32 = 50;
 /// "day close bound": 15 minutes for the close of the days in one run; a close
 /// over it is logged as a warning and is not aborted.
 pub const DAY_CLOSE_BOUND: Duration = Duration::from_secs(15 * 60);
+
+/// "temporary file margin": 2 minutes added to the end of the work that
+/// wrote a temporary file before it is stale; chosen: the write and two jobs'
+/// clocks.
+pub const TEMPORARY_FILE_MARGIN: Duration = Duration::from_secs(2 * 60);

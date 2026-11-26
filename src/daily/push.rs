@@ -22,7 +22,8 @@
 //! the others would meet (the bucket or the network still down after that, the
 //! access refused) ends the push, and the error says how many were left. No
 //! object is started that cannot end before the deadline; the error says how
-//! many were left.
+//! many were left. A blip that the next attempt cleared is a warning
+//! ([`Pushing::retried`]), as collect's `COLLECTED_AFTER_RETRIES` is.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -121,6 +122,9 @@ pub(crate) struct Pushing {
     pub objects: usize,
     /// Each failure the push carried on past.
     pub errors: Vec<Report>,
+    /// Each object that was put after a blip was asked again, with how many
+    /// times it was.
+    pub retried: Vec<(String, u32)>,
 }
 
 /// Whether the others would meet a failure too: the bucket or the network, or
@@ -156,20 +160,21 @@ impl Within<'_> {
 
 /// Puts one object, asking again after a blip while there are attempts left
 /// and the wait and the next attempt end before the deadline. A failure that
-/// is given up is returned as it last was, the attempts counted on it.
+/// is given up is returned as it last was, the attempts counted on it. Where
+/// the object is put, how many times it was asked again.
 fn put_retrying(
     transport: &dyn Transport,
     within: &Within<'_>,
     backoff: &mut Backoff,
     object: &str,
     file: &Path,
-) -> Result<(), Failure> {
+) -> Result<u32, Failure> {
     let mut attempts = 0;
     loop {
         match transport.put(object, file) {
             Ok(()) => {
                 backoff.reset();
-                return Ok(());
+                return Ok(attempts);
             }
             Err(Failure::Retry { report, after }) => {
                 attempts += 1;
@@ -244,8 +249,11 @@ pub(crate) fn push(
             break;
         }
         match put_retrying(transport, within, &mut backoff, object, file) {
-            Ok(()) => {
+            Ok(retries) => {
                 pushing.objects += 1;
+                if retries > 0 {
+                    pushing.retried.push((object.clone(), retries));
+                }
                 if on_host.contains(object) {
                     recorded.insert(object.clone());
                 }

@@ -17,8 +17,8 @@ use crate::collect::bronze_dir;
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::window::window_end;
 use crate::items::{fetch_end, items_dir};
-use crate::settings::collection::{HTTP_TIMEOUT_SNAPSHOT, POLL_INTERVAL};
-use crate::settings::scheduling::LOCK_WAIT;
+use crate::settings::collection::HTTP_TIMEOUT_SNAPSHOT;
+use crate::settings::scheduling::{LOCK_WAIT, TEMPORARY_FILE_MARGIN};
 use crate::transform::bronze::hour_of;
 
 fn chrono_of(duration: Duration) -> ChronoDuration {
@@ -27,10 +27,10 @@ fn chrono_of(duration: Duration) -> ChronoDuration {
 
 /// The moment after which no run can still be writing a temporary file whose
 /// run's work ends at `work_ends`: the lock wait later, when the run has the
-/// lock at last, and the poll interval more for its write and for the clocks
-/// of two jobs. The one place the rule is.
+/// lock at last, and the temporary file margin more for its write and for the
+/// clocks of two jobs. The one place the rule is.
 fn stale_after(work_ends: DateTime<Utc>) -> DateTime<Utc> {
-    work_ends + chrono_of(LOCK_WAIT) + chrono_of(POLL_INTERVAL)
+    work_ends + chrono_of(LOCK_WAIT) + chrono_of(TEMPORARY_FILE_MARGIN)
 }
 
 /// The moment after which no run can still be writing the temporary file

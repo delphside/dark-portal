@@ -9,13 +9,15 @@
 //! text, which a library may build from it. Changing the mechanism replaces
 //! [`Par`] and [`from_config`], and nothing else.
 
+use std::cell::Cell;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use ureq::Agent;
+use ureq::{Agent, SendBody};
 
-use crate::collect::failure::{Failure, io_failure};
+use crate::collect::failure::{Failure, io_failure, is_blip_status};
 use crate::config::{Config, Secret};
 use crate::error::ErrorType;
 use crate::settings::storage::BUCKET_PUSH_TIMEOUT;
@@ -25,10 +27,10 @@ pub(crate) trait Transport {
     /// Puts `file` in the bucket as `object`, a name with `/` between its
     /// parts, replacing any object of that name. One attempt: a failure the
     /// caller may try again after a wait (a timeout, the bucket unreachable,
-    /// a 429 or 503) is a [`Failure::Retry`], carrying the bucket's
-    /// `Retry-After` where it gave one. Otherwise a failure's type says what
-    /// to do: a *blip* is the bucket or the network, *fundamental* is the
-    /// access ([`ACCESS_REFUSED`]) or the file, and the rest is *unexpected*.
+    /// a 408, 429, 502, 503 or 504) is a [`Failure::Retry`], carrying the
+    /// bucket's `Retry-After` where it gave one. Otherwise a failure's type
+    /// says what to do: *fundamental* is the access ([`ACCESS_REFUSED`]) or
+    /// the file, and the rest, a 500 included, is *unexpected*.
     fn put(&self, object: &str, file: &Path) -> Result<(), Failure>;
 }
 
@@ -87,16 +89,47 @@ fn percent_encoded(object: &str) -> String {
     out
 }
 
+/// A file read for the upload, which keeps the error that reading it gave:
+/// the HTTP library reports it as an I/O error like the network's, and the
+/// two are told apart by this.
+struct Watched<'a> {
+    file: &'a File,
+    failed: &'a Cell<Option<std::io::Error>>,
+}
+
+impl Read for Watched<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf).inspect_err(|e| {
+            self.failed
+                .set(Some(std::io::Error::new(e.kind(), "reading the file")));
+        })
+    }
+}
+
 impl Transport for Par {
     fn put(&self, object: &str, file: &Path) -> Result<(), Failure> {
         let file = File::open(file).map_err(|e| io_failure(&e, "opening a file to push"))?;
-        let response = self
+        let length = file
+            .metadata()
+            .map_err(|e| io_failure(&e, "reading the size of a file to push"))?
+            .len();
+        let failed = Cell::new(None);
+        let mut reader = Watched {
+            file: &file,
+            failed: &failed,
+        };
+        let sent = self
             .agent
             .put(self.url(object))
             .header("Content-Type", "application/octet-stream")
-            .send(&file)
-            // Its text is not kept: it may name the URL.
-            .map_err(|e| transport(&e))?;
+            .header("Content-Length", length.to_string())
+            .send(SendBody::from_reader(&mut reader));
+        // A read error is the file's, whatever the library made of it.
+        if let Some(error) = failed.take() {
+            return Err(io_failure(&error, "reading a file to push"));
+        }
+        // Its text is not kept: it may name the URL.
+        let response = sent.map_err(|e| transport(&e))?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
             return Ok(());
@@ -139,16 +172,11 @@ fn refusal(status: u16, after: Option<Duration>) -> Failure {
             ACCESS_REFUSED,
             "The bucket refused the push; check the bucket access in DP_BUCKET_ACCESS_FILE.",
         ),
-        // Busy: the push asks again after the wait.
-        429 | 503 => Failure::blip(
+        // Busy or down for now: the push asks again after the wait.
+        _ if is_blip_status(status) => Failure::blip(
             "BUCKET_BUSY",
-            "The bucket answered that it is busy for now; the push tries again, and then the next run does.",
+            "The bucket answered that it is busy or down for now; the push tries again, and then the next run does.",
             after,
-        ),
-        408 | 500 | 502 | 504 => Failure::stop(
-            ErrorType::TechnicalBlip,
-            "BUCKET_BUSY",
-            "The bucket answered that it is busy or down for now; the next run pushes the file.",
         ),
         _ => Failure::unexpected(
             "BUCKET_UNEXPECTED_STATUS",
@@ -229,8 +257,8 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_bucket_is_a_blip_and_any_other_status_is_unexpected() {
-        for status in [408, 429, 500, 502, 503, 504] {
+    fn a_busy_or_down_bucket_is_a_blip_and_any_other_status_is_unexpected() {
+        for status in [408, 429, 502, 503, 504] {
             let stub = Stub::new();
             stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
             let report = refused(
@@ -244,15 +272,18 @@ mod tests {
                 "{status}"
             );
         }
-        let stub = Stub::new();
-        stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(418)));
-        let report = refused(par(&stub).put("a.parquet", &file("odd", b"x")).unwrap_err());
-        assert_eq!(report.error_type, Some(ErrorType::Unexpected));
+        // A 500 is not a blip: the 1.10 type table makes it unexpected.
+        for status in [418, 500] {
+            let stub = Stub::new();
+            stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
+            let report = refused(par(&stub).put("a.parquet", &file("odd", b"x")).unwrap_err());
+            assert_eq!(report.error_type, Some(ErrorType::Unexpected), "{status}");
+        }
     }
 
     #[test]
-    fn a_429_or_503_is_asked_again_after_the_retry_after_and_the_others_are_not() {
-        for status in [429, 503] {
+    fn a_blip_status_is_asked_again_after_the_retry_after_and_the_others_are_not() {
+        for status in [408, 429, 502, 503, 504] {
             let stub = Stub::new();
             stub.mount(
                 Mock::given(method("PUT"))
@@ -273,7 +304,7 @@ mod tests {
             .put("a.parquet", &file("no-retry-after", b"x"))
             .unwrap_err();
         assert!(matches!(failure, Failure::Retry { after: None, .. }));
-        for status in [408, 500, 502, 504] {
+        for status in [500, 418] {
             let stub = Stub::new();
             stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
             let failure = par(&stub)
@@ -342,6 +373,22 @@ mod tests {
         );
         assert_eq!(report.error_type, Some(ErrorType::TechnicalFundamental));
         assert_eq!(stub.requests("PUT"), 0);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_mid_upload_is_a_local_failure_not_the_buckets() {
+        // A folder opens as a file and fails at its first read, which the
+        // HTTP library reports as an I/O error like a lost connection's.
+        let stub = Stub::new();
+        stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)));
+        let folder = file("unreadable", b"x");
+        let report = refused(
+            par(&stub)
+                .put("a.parquet", folder.parent().unwrap())
+                .unwrap_err(),
+        );
+        assert_eq!(report.reason, "LOCAL_IO_FAILED");
+        assert_eq!(report.error_type, Some(ErrorType::TechnicalFundamental));
     }
 
     #[test]

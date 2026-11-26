@@ -24,9 +24,9 @@ use crate::collect::snapshot::{quoted, timestamp};
 use crate::collect::test_support::{SECRET, Stub, TOKEN};
 use crate::collect::window::window_end;
 use crate::config::Secret;
-use crate::error::exit_status;
-use crate::settings::collection::{HTTP_TIMEOUT_SNAPSHOT, POLL_INTERVAL};
-use crate::settings::scheduling::DAY_CLOSE_BOUND;
+use crate::error::{Severity, exit_status};
+use crate::settings::collection::HTTP_TIMEOUT_SNAPSHOT;
+use crate::settings::scheduling::{DAY_CLOSE_BOUND, TEMPORARY_FILE_MARGIN};
 use crate::transform::MARKET;
 use crate::transform::test_support::{World, h, item_file, l};
 use crate::types::Hour;
@@ -712,6 +712,72 @@ fn a_day_with_hours_left_in_the_lake_is_closed_and_one_with_none_is_warned_of() 
 }
 
 #[test]
+fn a_day_warned_of_is_not_warned_of_again_the_next_night() {
+    // Same lake as above, a night later: the days named are recorded and are
+    // not named again.
+    let w = world("daily-too-old-once");
+    {
+        let lake = w.open();
+        let market = quoted(MARKET.as_str());
+        let gaps: Vec<String> = (24..24 * 40)
+            .map(|n| format!("({market}, {0}, {0})", at(n)))
+            .collect();
+        lake.execute(
+            &format!("INSERT INTO meta.gap VALUES {};", gaps.join(", ")),
+            "seeding gaps",
+        )
+        .unwrap();
+        flat(&lake, 24 * 40..24 * 41, false);
+    }
+    let first = go_at(&w, "2026-12-30T00:50:00Z", None);
+    assert_eq!(code(&first), 0, "{first:?}");
+    assert!(first.metadata["days_expired_unclosed"].ends_with(",2026-12-01"));
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_expired"), 12);
+    let next = go_at(&w, "2026-12-31T00:50:00Z", None);
+    assert_eq!(code(&next), 0, "{next:?}");
+    assert!(
+        !next.metadata.contains_key("days_expired_unclosed"),
+        "{next:?}"
+    );
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_expired"), 12);
+}
+
+#[test]
+fn a_day_with_no_item_row_is_closed_once_and_recorded() {
+    // The lake holds hours with no listing: the day closes to no `item_day`
+    // rows, is recorded closed, and a later run does not close it again.
+    let w = World::new("daily-empty-day");
+    {
+        let lake = w.open();
+        let market = quoted(MARKET.as_str());
+        let rows: Vec<String> = (0..24)
+            .map(|n| format!("({market}, {0}, 'bronze/x.parquet', NULL, {0})", at(n)))
+            .collect();
+        lake.execute(
+            &format!("INSERT INTO meta.processed VALUES {};", rows.join(", ")),
+            "seeding processed hours",
+        )
+        .unwrap();
+    }
+    let report = go(&w);
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.metadata["days_closed"], "2026-11-20");
+    assert!(day_rows(&w).is_empty());
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 1);
+    let again = go_at(&w, "2026-11-21T01:05:00Z", None);
+    assert_eq!(again.metadata["days_closed"], "", "{again:?}");
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 1);
+}
+
+#[test]
+fn a_failed_close_records_no_day_closed() {
+    let w = world("daily-close-rolls-back");
+    let report = hooked(&w, &|| Err(io_failure(&io::Error::other("x"), "hook")));
+    assert_ne!(code(&report), 0);
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 0);
+}
+
+#[test]
 fn daily_closes_the_day_from_what_the_transform_wrote() {
     // The whole path: bronze snapshots to gold by `dp transform`, then `dp
     // daily`. A second listing at 95 for one hour is the day's lowest and
@@ -996,6 +1062,13 @@ fn a_busy_bucket_is_asked_again_after_the_backoff_and_then_pushed() {
     let clock = FakeClock::at(NOW);
     let report = go_clock(&w, &clock, Some(&bucket));
     assert_eq!(code(&report), 0, "{report:?}");
+    // 1.10: a retry that cleared the blip is a warning, as collect's is.
+    assert_eq!(report.outcome, Severity::Warning);
+    assert_eq!(report.reason, "PUSHED_AFTER_RETRIES");
+    assert_eq!(
+        report.metadata["objects_pushed_after_retries"],
+        "daily/item.parquet"
+    );
     assert_eq!(
         bucket.objects(),
         ["daily/item_day.parquet", "daily/item.parquet"]
@@ -1022,6 +1095,15 @@ fn a_retry_after_is_the_wait_before_the_push_asks_again() {
     let report = go_clock(&w, &clock, Some(&bucket));
     assert_eq!(code(&report), 0, "{report:?}");
     assert_eq!(clock.slept(), [secs(7)]);
+}
+
+#[test]
+fn a_push_that_needed_no_retry_is_no_warning() {
+    let mut w = world("daily-push-no-retry");
+    with_bucket(&mut w);
+    let report = go_at(&w, NOW, Some(&Bucket::default()));
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert!(!report.metadata.contains_key("objects_pushed_after_retries"));
 }
 
 #[test]
@@ -1616,13 +1698,14 @@ fn a_snapshot_temporary_file_is_left_until_its_window_the_http_timeout_and_the_l
 {
     // The window of hour 23:00 closes at 00:25, where a collect run may have
     // just written and not yet taken the lock: its request can time out at
-    // 00:26, the lock wait runs to 00:36, and the margin (the poll interval)
+    // 00:26, the lock wait runs to 00:36, and the temporary file margin
     // to 00:38. The rule is the settings', not these minutes.
     let w = world("daily-tmp-window");
     let name = "bronze/commodities/eu/2026-11-20T23.parquet.1-bb.tmp";
     host_file(&w, name, b"x");
     let stale_at = window_end(Hour(h(23).0))
-        + ChronoDuration::from_std(HTTP_TIMEOUT_SNAPSHOT + LOCK_WAIT + POLL_INTERVAL).unwrap();
+        + ChronoDuration::from_std(HTTP_TIMEOUT_SNAPSHOT + LOCK_WAIT + TEMPORARY_FILE_MARGIN)
+            .unwrap();
     assert_eq!(stale_at.to_rfc3339(), "2026-11-21T00:38:00+00:00");
     for early in ["2026-11-21T00:10:00Z", "2026-11-21T00:37:59Z"] {
         assert_eq!(code(&go_at(&w, early, None)), 0);
@@ -1636,7 +1719,7 @@ fn a_snapshot_temporary_file_is_left_until_its_window_the_http_timeout_and_the_l
 fn an_item_temporary_file_is_left_until_the_next_hourly_run_and_the_margin_are_past() {
     // A run started at 23:36 fetches until 00:25 (the lock wait before the
     // 00:35 hourly run), may wait the lock wait for the lock, and writes: the
-    // margin (the poll interval) after 00:35 is 00:37.
+    // temporary file margin after 00:35 is 00:37.
     let w = world("daily-tmp-items");
     let name = "bronze/items/2026-11-20T233600.parquet.9-dd.tmp";
     host_file(&w, name, b"x");
@@ -1785,6 +1868,72 @@ fn daily_exits_3_when_an_item_retry_fails_and_the_next_run_repeats_it() {
         crate::items::ids_not_found(&w.config.data_dir)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn an_item_that_answers_200_on_the_retry_is_pushed_the_next_night_not_that_one() {
+    // The push runs before the items are asked again, so the file the retry
+    // writes is not in this night's push and is not recorded as pushed; the
+    // next night pushes it.
+    let mut w = world_with_secret("daily-items-then-push");
+    with_bucket(&mut w);
+    items_that_answered_404(&w);
+    let stub = blizzard(&[
+        (
+            7,
+            ResponseTemplate::new(200).set_body_string(r#"{"id":7,"name":"Seven"}"#),
+        ),
+        (8, ResponseTemplate::new(404)),
+    ]);
+    let bucket = Bucket::default();
+    let report = run_with(
+        &w.config,
+        &FakeClock::at(NOW),
+        stub.endpoints(),
+        &w.backend(),
+        Some(&bucket),
+    );
+    assert_eq!(code(&report), 0, "{report:?}");
+    let on_host = push::bronze_files(&w.config.data_dir).unwrap();
+    let fetched: Vec<&String> = on_host
+        .iter()
+        .filter(|f| f.starts_with("bronze/items/2026-11-21"))
+        .collect();
+    assert_eq!(fetched.len(), 1, "{on_host:?}");
+    let fetched = fetched[0].clone();
+    assert!(
+        !bucket.objects().contains(&fetched),
+        "{:?}",
+        bucket.objects()
+    );
+    assert!(
+        !push::pushed(&w.config.data_dir, "bucket")
+            .unwrap()
+            .contains(&fetched)
+    );
+
+    {
+        let lake = w.open();
+        flat(&lake, 24..48, false);
+    }
+    let report = run_with(
+        &w.config,
+        &FakeClock::at("2026-11-22T00:50:00Z"),
+        stub.endpoints(),
+        &w.backend(),
+        Some(&bucket),
+    );
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert!(
+        bucket.objects().contains(&fetched),
+        "{:?}",
+        bucket.objects()
+    );
+    assert!(
+        push::pushed(&w.config.data_dir, "bucket")
+            .unwrap()
+            .contains(&fetched)
     );
 }
 

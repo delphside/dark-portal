@@ -7,17 +7,18 @@
 //! the hour after it, so a day whose last hour is not yet processed is not
 //! closable.
 //!
-//! **A day is closed** where `item_day` holds a row of it. A closable day not
-//! closed is closed, every one in one transaction, which is the run's pivot.
-//! The day before today (UTC) must be closable or the run does nothing and ends
-//! `75` ([`Closing::NotYet`]): a day that cannot yet be closed is no reason to
-//! close an older one, and the next run decides all of them again. Where the
-//! lake holds nothing that is the day's (a day with no listing in any hour) it
-//! has no row to show it closed, and each run closes it again to no rows. A day
-//! whose 00:00 is past the hourly keep but whose later hours are not is closed,
-//! since expiry runs after the close. A closable day whose every hour is past
-//! the hourly keep is not closed, since its hours are gone: it is reported in
-//! [`Closing::Closed`]'s `expired`.
+//! **A day is closed** where `meta.day_closed` holds a row of it, written in
+//! the transaction that closes it for every day closed, one in which no item
+//! had a row included. A closable day not closed is closed, every one in one
+//! transaction, which is the run's pivot. The day before today (UTC) must be
+//! closable or the run does nothing and ends `75` ([`Closing::NotYet`]): a day
+//! that cannot yet be closed is no reason to close an older one, and the next
+//! run decides all of them again. A day whose 00:00 is past the hourly keep but
+//! whose later hours are not is closed, since expiry runs after the close. A
+//! closable day never closed whose every hour is past the hourly keep cannot be
+//! closed, since its hours are gone: it is reported in [`Closing::Closed`]'s
+//! `expired` once, and recorded in `meta.day_expired` in the same transaction,
+//! so the next run does not report it again.
 
 use std::collections::BTreeSet;
 
@@ -40,7 +41,8 @@ type Day = i64;
 pub(crate) enum Closing {
     /// The days now closed, oldest first: none where every closable day was
     /// closed already; and the closable days not closed because every hour of
-    /// them is past the hourly keep, oldest first.
+    /// them is past the hourly keep, oldest first, which were not reported
+    /// before.
     Closed {
         days: Vec<NaiveDate>,
         expired: Vec<NaiveDate>,
@@ -110,8 +112,13 @@ pub(crate) fn close(
     )?;
     let closed = numbers(
         lake,
-        "SELECT DISTINCT CAST(day - DATE '1970-01-01' AS BIGINT) FROM gold.item_day",
+        "SELECT CAST(day - DATE '1970-01-01' AS BIGINT) FROM meta.day_closed",
         "reading the closed days",
+    )?;
+    let reported = numbers(
+        lake,
+        "SELECT CAST(day - DATE '1970-01-01' AS BIGINT) FROM meta.day_expired",
+        "reading the days reported as expired",
     )?;
 
     let today = Hour::containing(now).0.div_euclid(hours_per_day());
@@ -129,45 +136,61 @@ pub(crate) fn close(
     if open.contains(&yesterday) && !closable(yesterday) {
         return Ok(Closing::NotYet(date_of(yesterday)));
     }
-    let expired: Vec<NaiveDate> = gone_days
+    let expired: Vec<Day> = gone_days
         .into_iter()
-        .filter(|day| closable(*day))
-        .map(date_of)
+        .filter(|day| closable(*day) && !reported.contains(day))
         .collect();
     let days: Vec<Day> = open.into_iter().filter(|day| closable(*day)).collect();
-    if days.is_empty() {
-        return Ok(Closing::Closed {
-            days: Vec::new(),
-            expired,
-        });
+    if days.is_empty() && expired.is_empty() {
+        return Ok(Closing::nothing());
     }
 
     let doing = "closing the days";
-    lake.execute(
-        "CREATE OR REPLACE TEMP TABLE closing_day(day DATE, start_hour TIMESTAMPTZ, \
-         first_hour BIGINT, last_hour BIGINT, hours_held UTINYINT);",
-        doing,
-    )?;
-    let rows: Vec<String> = days
-        .iter()
-        .map(|&day| {
-            let from = first.max(first_hour_of(day));
-            let to = first_hour_of(day + 1) - 1;
-            let held = processed.range(from..=to).count();
-            format!(
-                "(DATE '{}', {}, {from}, {to}, {held})",
-                date_of(day),
-                timestamp(Hour(first_hour_of(day)).start().expect("an hour in range"))
-            )
-        })
-        .collect();
-    lake.execute(
-        &format!("INSERT INTO closing_day VALUES {};", rows.join(", ")),
-        doing,
-    )?;
+    if !days.is_empty() {
+        lake.execute(
+            "CREATE OR REPLACE TEMP TABLE closing_day(day DATE, start_hour TIMESTAMPTZ, \
+             first_hour BIGINT, last_hour BIGINT, hours_held UTINYINT);",
+            doing,
+        )?;
+        let rows: Vec<String> = days
+            .iter()
+            .map(|&day| {
+                let from = first.max(first_hour_of(day));
+                let to = first_hour_of(day + 1) - 1;
+                let held = processed.range(from..=to).count();
+                format!(
+                    "(DATE '{}', {}, {from}, {to}, {held})",
+                    date_of(day),
+                    timestamp(Hour(first_hour_of(day)).start().expect("an hour in range"))
+                )
+            })
+            .collect();
+        lake.execute(
+            &format!("INSERT INTO closing_day VALUES {};", rows.join(", ")),
+            doing,
+        )?;
+    }
+    let recorded_at = timestamp(now);
     let result = (|| {
         lake.begin()?;
-        lake.execute(CLOSE_SQL, doing)?;
+        if !days.is_empty() {
+            lake.execute(CLOSE_SQL, doing)?;
+            // Every day closed is recorded, one with no item row too.
+            lake.execute(
+                &format!("INSERT INTO meta.day_closed SELECT day, {recorded_at} FROM closing_day;"),
+                doing,
+            )?;
+        }
+        if !expired.is_empty() {
+            let rows: Vec<String> = expired
+                .iter()
+                .map(|&day| format!("(DATE '{}', {recorded_at})", date_of(day)))
+                .collect();
+            lake.execute(
+                &format!("INSERT INTO meta.day_expired VALUES {};", rows.join(", ")),
+                doing,
+            )?;
+        }
         before_commit()?;
         lake.commit()
     })();
@@ -177,6 +200,6 @@ pub(crate) fn close(
     }
     Ok(Closing::Closed {
         days: days.into_iter().map(date_of).collect(),
-        expired,
+        expired: expired.into_iter().map(date_of).collect(),
     })
 }

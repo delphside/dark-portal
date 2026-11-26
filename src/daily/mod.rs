@@ -9,7 +9,7 @@
 //! on a full disk and `70` on an unexpected error. After it each step is a unit
 //! of work, a failure of one is an *error* the run carries on past, and the run
 //! exits `3`: the next run repeats the step, since each is repeatable (a closed
-//! day is not closed again).
+//! day is not closed again, which `meta.day_closed` says).
 //!
 //! **A day that cannot be closed stops the run** (`75`, before the pivot): a
 //! later step would work on a day the lake does not yet hold.
@@ -206,8 +206,22 @@ impl Steps<'_> {
         errors.extend(
             export::export_with(&lake, &config.data_dir, self.clock, self.held, self.write).errors,
         );
-        let pushed = self.push(deadline, &mut errors);
-        report = report.with_metadata("objects_pushed", pushed.to_string());
+        let pushing = self.push(deadline, &mut errors);
+        report = report.with_metadata("objects_pushed", pushing.objects.to_string());
+        for (object, retries) in &pushing.retried {
+            pushed_after_retries(object, *retries).log();
+        }
+        if !pushing.retried.is_empty() {
+            report = report.with_metadata(
+                "objects_pushed_after_retries",
+                pushing
+                    .retried
+                    .iter()
+                    .map(|(object, _)| object.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
         self.expire(&lake, now, deadline, &mut errors, &mut report);
         match temporary::clear_stale(&config.data_dir, now) {
             Ok(removed) => {
@@ -219,6 +233,16 @@ impl Steps<'_> {
         report = report.with_metadata("items_asked_again", not_found.to_string());
 
         if errors.is_empty() {
+            // A push that needed retrying is a warning for a person to look
+            // at, as collect's is, and no failure.
+            if !pushing.retried.is_empty() {
+                let mut warned = Report::warning(
+                    "PUSHED_AFTER_RETRIES",
+                    "An object was put in the bucket after retrying it.",
+                );
+                warned.metadata = report.metadata;
+                return Ok(warned);
+            }
             return Ok(report);
         }
         let mut failed = Report::error(
@@ -267,19 +291,19 @@ impl Steps<'_> {
         ids.len()
     }
 
-    /// Pushes to the bucket where there is one; how many objects were put.
-    fn push(&self, deadline: DateTime<Utc>, errors: &mut Vec<Report>) -> usize {
+    /// Pushes to the bucket where there is one.
+    fn push(&self, deadline: DateTime<Utc>, errors: &mut Vec<Report>) -> push::Pushing {
         let (Some(transport), Some(bucket)) = (self.transport, self.config.bucket.as_deref())
         else {
-            return 0;
+            return push::Pushing::default();
         };
         let within = push::Within {
             clock: self.clock,
             deadline,
         };
-        let pushing = push::push(&self.config.data_dir, bucket, transport, &within, self.held);
-        errors.extend(pushing.errors);
-        pushing.objects
+        let mut pushing = push::push(&self.config.data_dir, bucket, transport, &within, self.held);
+        errors.append(&mut pushing.errors);
+        pushing
     }
 
     /// The deletions, each its own step.
@@ -399,6 +423,16 @@ fn day_expired(day: chrono::NaiveDate) -> Report {
         "A day was never closed and every hour of it is past the hourly keep; it cannot be closed.",
     )
     .with_metadata("day", day.to_string())
+}
+
+/// An object was put after the push asked again `retries` times.
+fn pushed_after_retries(object: &str, retries: u32) -> Report {
+    Report::warning(
+        "PUSHED_AFTER_RETRIES",
+        "An object was put in the bucket after retrying it.",
+    )
+    .with_metadata("object", object)
+    .with_metadata("retries", retries.to_string())
 }
 
 /// The failures of a deletion of files, as errors.

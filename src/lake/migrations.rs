@@ -47,6 +47,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "reference",
         sql: include_str!("../../sql/migrations/004-reference.sql"),
     },
+    Migration {
+        version: 5,
+        name: "day-closed",
+        sql: include_str!("../../sql/migrations/005-day-closed.sql"),
+    },
 ];
 
 impl Lake {
@@ -177,13 +182,15 @@ mod tests {
     #[test]
     fn an_empty_lake_gets_every_migration_in_order() {
         let (lake, _dir) = open("empty");
-        assert_eq!(lake.migrate(now()).unwrap(), vec![1, 2, 3, 4]);
+        assert_eq!(lake.migrate(now()).unwrap(), vec![1, 2, 3, 4, 5]);
         assert_eq!(
             tables(&lake),
             [
                 "gold.item_day",
                 "gold.item_hour",
                 "gold.price_level_hour",
+                "meta.day_closed",
+                "meta.day_expired",
                 "meta.gap",
                 "meta.migration",
                 "meta.processed",
@@ -208,9 +215,34 @@ mod tests {
                 (1, "meta".to_owned()),
                 (2, "silver".to_owned()),
                 (3, "gold".to_owned()),
-                (4, "reference".to_owned())
+                (4, "reference".to_owned()),
+                (5, "day-closed".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn a_lake_that_closed_days_before_the_day_closed_migration_counts_them_closed() {
+        let (lake, _dir) = open("backfill");
+        lake.migrate_with(&MIGRATIONS[..4], now()).unwrap();
+        lake.connection()
+            .execute_batch(
+                "INSERT INTO gold.item_day VALUES \
+                 (1, DATE '2026-11-20', 1, NULL, 1, 1, 1, 1, 24), \
+                 (2, DATE '2026-11-20', 1, NULL, 1, 1, 1, 1, 24), \
+                 (1, DATE '2026-11-21', 1, NULL, 1, 1, 1, 1, 24)",
+            )
+            .unwrap();
+        assert_eq!(lake.migrate(now()).unwrap(), vec![5]);
+        let days: Vec<String> = lake
+            .connection()
+            .prepare("SELECT CAST(day AS VARCHAR) FROM meta.day_closed ORDER BY day")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(days, ["2026-11-20", "2026-11-21"]);
     }
 
     #[test]
@@ -230,7 +262,7 @@ mod tests {
             .connection()
             .query_row("SELECT count(*) FROM meta.migration", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(records, 4);
+        assert_eq!(records, 5);
     }
 
     #[test]
@@ -250,14 +282,15 @@ mod tests {
     fn a_migration_that_fails_leaves_nothing_of_itself() {
         let (lake, _dir) = open("fails");
         lake.migrate(now()).unwrap();
-        // Version 5 half-works: its first statement is fine, its second is not.
+        // Version 6 half-works: its first statement is fine, its second is not.
         let broken = [
             MIGRATIONS[0],
             MIGRATIONS[1],
             MIGRATIONS[2],
             MIGRATIONS[3],
+            MIGRATIONS[4],
             Migration {
-                version: 5,
+                version: 6,
                 name: "broken",
                 sql: "CREATE TABLE silver.half (x INTEGER); CREATE TABLE no_such_schema.t (x INTEGER);",
             },
@@ -265,7 +298,7 @@ mod tests {
         let Err(Failure::Stop(report)) = lake.migrate_with(&broken, now()) else {
             panic!("expected a stop");
         };
-        assert_eq!(report.metadata["migration"], "5");
+        assert_eq!(report.metadata["migration"], "6");
         assert!(!tables(&lake).contains(&"silver.half".to_owned()));
         let versions: Vec<u32> = lake
             .connection()
@@ -275,7 +308,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(versions, [1, 2, 3, 4]);
+        assert_eq!(versions, [1, 2, 3, 4, 5]);
         // The lake still works after the rollback.
         assert!(lake.migrate(now()).unwrap().is_empty());
     }
