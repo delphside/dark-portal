@@ -10,8 +10,9 @@
 //! `name`, `item_class.name`, `item_subclass.name`, `sell_price` and
 //! `purchase_price` (`en_GB`, so the names are in British English as fetched).
 //! What a body lacks is null, except `sell_price`, which is then 0 (a vendor
-//! pays nothing), and `purchase_price`, which is also null where it is 0: no
-//! vendor sells the item.
+//! pays nothing). `purchase_price` is kept as given, 0 included: Blizzard sets
+//! it for items no vendor sells. `vendor_sells` is null (unknown) for every
+//! item; nothing here fills it.
 //!
 //! **When it runs.** Once in each `dp transform` run, after the hours, as its
 //! own transaction under the run's lock; see [`rebuild`].
@@ -79,7 +80,8 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
                      json_extract_string(body, '$.item_class.name'),
                      json_extract_string(body, '$.item_subclass.name'),
                      coalesce(TRY_CAST(json_extract_string(body, '$.sell_price') AS UBIGINT), 0),
-                     nullif(TRY_CAST(json_extract_string(body, '$.purchase_price') AS UBIGINT), 0),
+                     TRY_CAST(json_extract_string(body, '$.purchase_price') AS UBIGINT),
+                     CAST(NULL AS BOOLEAN),
                      fetched_at
                  FROM latest WHERE recency = 1;",
                 quoted(&glob.to_string_lossy())
@@ -153,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn an_item_gets_its_name_class_subclass_and_vendor_prices_from_its_body() {
+    fn an_item_gets_its_name_class_subclass_and_prices_from_its_body() {
         let w = World::new("ref-one");
         let potion = body("Armour Kit", "Consumable", "Potion", 250, Some(1000));
         item_file(
@@ -170,7 +172,8 @@ mod tests {
                 some("Consumable"),
                 some("Potion"),
                 250,
-                Some(1000)
+                Some(1000),
+                None
             )]
         );
         assert_eq!(
@@ -183,12 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn vendor_buy_price_is_null_where_blizzard_gives_none() {
-        // D23.2: no `purchase_price`; and 0, which says no vendor sells it.
+    fn purchase_price_is_kept_as_blizzard_gives_it_and_vendor_sells_is_unknown() {
+        // D23.1, D23.2: present as given, 0 kept as 0, null only where the
+        // body lacks it; nothing fills `vendor_sells`.
         let w = World::new("ref-buy");
         let none = body("Linen Cloth", "Tradeskill", "Cloth", 13, None);
         let zero = body("Wool Cloth", "Tradeskill", "Cloth", 25, Some(0));
-        let some_price = body("Flux", "Tradeskill", "Parts", 5, Some(300));
+        let some_price = body("Linen Cloth", "Tradeskill", "Cloth", 5, Some(55));
         item_file(
             &w,
             "2026-11-20T100000",
@@ -201,8 +205,9 @@ mod tests {
         let (rows, _) = rebuilt(&w);
         assert_eq!(
             rows.iter().map(|r| r.5).collect::<Vec<_>>(),
-            [None, None, Some(300)]
+            [None, Some(0), Some(55)]
         );
+        assert!(rows.iter().all(|r| r.6.is_none()));
     }
 
     #[test]
@@ -219,7 +224,7 @@ mod tests {
             )],
         );
         let (rows, _) = rebuilt(&w);
-        assert_eq!(rows, [(9, some("Odd"), None, None, 0, None)]);
+        assert_eq!(rows, [(9, some("Odd"), None, None, 0, None, None)]);
     }
 
     #[test]
@@ -248,7 +253,8 @@ mod tests {
                 some("Consumable"),
                 some("Elixir"),
                 120,
-                Some(900)
+                Some(900),
+                None
             )]
         );
     }
@@ -343,7 +349,7 @@ mod tests {
         );
         let lake = w.open();
         lake.execute(
-            "INSERT INTO reference.item VALUES (1, 'Stale', NULL, NULL, 0, NULL, now())",
+            "INSERT INTO reference.item VALUES (1, 'Stale', NULL, NULL, 0, NULL, NULL, now())",
             "seeding",
         )
         .unwrap();

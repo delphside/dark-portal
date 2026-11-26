@@ -181,7 +181,7 @@ totals AS (
 )
 SELECT p.item,
        coalesce(r.name, CAST(p.item AS VARCHAR)) AS name,
-       r.class, r.subclass, r.vendor_sell_price, r.vendor_buy_price,
+       r.class, r.subclass, r.vendor_sell_price,
        p.hour, p.lowest, p.units_listed, p.default_n,
        struct_extract(p.fill, 'price') AS fill_price,
        struct_extract(p.fill, 'units') AS fill_units,

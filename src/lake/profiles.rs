@@ -723,7 +723,7 @@ mod tests {
         lake.execute(
             &format!(
                 "INSERT INTO reference.item VALUES ({item}, '{name}', 'Consumable', 'Potion', \
-                 250, NULL, now())"
+                 250, NULL, NULL, now())"
             ),
             "seeding reference",
         )
@@ -808,21 +808,34 @@ mod tests {
     }
 
     #[test]
-    fn profile_carries_the_vendor_prices_beside_the_price() {
+    fn profile_carries_the_vendor_sell_price_and_leaves_the_buy_price_out() {
+        // D23: `purchase_price` and `vendor_sells` stay in `reference.item`.
         let (lake, _dir) = lake("profile-vendor");
         insert_hours(&lake, &series(1, 0..3, 1));
         reference_row(&lake, 1, "Flask");
-        lake.execute("UPDATE reference.item SET vendor_buy_price = 300", "x")
-            .unwrap();
-        let prices: (u64, Option<u64>) = lake
+        lake.execute(
+            "UPDATE reference.item SET purchase_price = 300, vendor_sells = true",
+            "x",
+        )
+        .unwrap();
+        let sell: u64 = lake
             .connection()
-            .query_row(
-                "SELECT vendor_sell_price, vendor_buy_price FROM profile",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT vendor_sell_price FROM profile", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(prices, (250, Some(300)));
+        assert_eq!(sell, 250);
+        let columns: Vec<String> = lake
+            .connection()
+            .prepare("SELECT column_name FROM (DESCRIBE profile)")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !columns
+                .iter()
+                .any(|c| c == "purchase_price" || c == "vendor_sells")
+        );
     }
 
     #[test]

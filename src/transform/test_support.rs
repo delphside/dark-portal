@@ -630,8 +630,8 @@ pub fn item_file(world: &World, name: &str, rows: &[(u32, &str, u16, Option<&str
         .unwrap();
 }
 
-/// `reference.item`: item, name, class, subclass, vendor sell price, vendor
-/// buy price.
+/// `reference.item`: item, name, class, subclass, vendor sell price,
+/// purchase price, whether a vendor sells it.
 pub type Reference = (
     u32,
     Option<String>,
@@ -639,12 +639,13 @@ pub type Reference = (
     Option<String>,
     u64,
     Option<u64>,
+    Option<bool>,
 );
 
 pub fn reference(lake: &Lake) -> Vec<Reference> {
     lake.connection()
         .prepare(
-            "SELECT item, name, class, subclass, vendor_sell_price, vendor_buy_price \
+            "SELECT item, name, class, subclass, vendor_sell_price, purchase_price, vendor_sells \
              FROM reference.item ORDER BY item",
         )
         .unwrap()
@@ -656,6 +657,7 @@ pub fn reference(lake: &Lake) -> Vec<Reference> {
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         })
         .unwrap()

@@ -7,7 +7,7 @@
 //!
 //! **What the bucket holds** is what `dp` has recorded as pushed, in
 //! `state/bucket-pushed.txt`: a first line naming the bucket (`DP_BUCKET`), then
-//! one host path to a line. The write access provisionally in use
+//! one host path to a line. The write access in use
 //! ([`super::transport`]) can write and not read, so the bucket is not asked. A
 //! record of another bucket holds nothing of this one's, so it is read as empty.
 //! A path is recorded once its push has succeeded, so a failed push is not
