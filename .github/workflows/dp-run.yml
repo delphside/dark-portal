@@ -1,0 +1,24 @@
+# Test `deploy/dp-run`, the units' script, with its bats suite
+# (deploy/tests/dp-run.bats; docs/5.3.2 *`dp-run`'s exit statuses*).
+name: dp-run
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bats:
+    name: bats
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install --yes bats
+
+      - name: Test
+        run: bats deploy/tests/dp-run.bats
