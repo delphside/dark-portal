@@ -186,12 +186,11 @@ impl Steps<'_> {
                 "close_over_bound",
                 (close_took > DAY_CLOSE_BOUND).to_string(),
             );
+        let mut warnings: Vec<Report> = Vec::new();
         if close_took > DAY_CLOSE_BOUND {
-            close_over_bound(close_took).log();
+            warnings.push(close_over_bound(close_took));
         }
-        for day in &expired {
-            day_expired(*day).log();
-        }
+        warnings.extend(expired.iter().map(|day| day_expired(*day)));
         if !expired.is_empty() {
             report = report.with_metadata(
                 "days_expired_unclosed",
@@ -208,9 +207,12 @@ impl Steps<'_> {
         );
         let pushing = self.push(deadline, &mut errors);
         report = report.with_metadata("objects_pushed", pushing.objects.to_string());
-        for (object, retries) in &pushing.retried {
-            pushed_after_retries(object, *retries).log();
-        }
+        warnings.extend(
+            pushing
+                .retried
+                .iter()
+                .map(|(object, retries)| pushed_after_retries(object, *retries)),
+        );
         if !pushing.retried.is_empty() {
             report = report.with_metadata(
                 "objects_pushed_after_retries",
@@ -232,18 +234,11 @@ impl Steps<'_> {
         let not_found = self.ask_again(deadline, &mut errors);
         report = report.with_metadata("items_asked_again", not_found.to_string());
 
+        for warning in &warnings {
+            warning.log();
+        }
         if errors.is_empty() {
-            // A push that needed retrying is a warning for a person to look
-            // at, as collect's is, and no failure.
-            if !pushing.retried.is_empty() {
-                let mut warned = Report::warning(
-                    "PUSHED_AFTER_RETRIES",
-                    "An object was put in the bucket after retrying it.",
-                );
-                warned.metadata = report.metadata;
-                return Ok(warned);
-            }
-            return Ok(report);
+            return Ok(warned(report, &warnings));
         }
         let mut failed = Report::error(
             worst_type(&errors),
@@ -414,6 +409,26 @@ fn close_over_bound(took: std::time::Duration) -> Report {
     )
     .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
     .with_metadata("bound_seconds", DAY_CLOSE_BOUND.as_secs().to_string())
+}
+
+/// The run's report where nothing failed: a warning whenever any warning was
+/// raised in the run (1.10 *The severity of an error*), the first one's
+/// reason leading and every reason listed; the report as it is where none was.
+/// The one place the run's severity is decided.
+fn warned(report: Report, warnings: &[Report]) -> Report {
+    let Some(first) = warnings.first() else {
+        return report;
+    };
+    let mut warned = Report::warning(&first.reason, &first.message);
+    warned.metadata = report.metadata;
+    warned.with_metadata(
+        "warnings",
+        warnings
+            .iter()
+            .map(|warning| warning.reason.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 /// A day that could be closed has no hour left to close it on.

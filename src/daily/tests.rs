@@ -705,6 +705,9 @@ fn a_day_with_hours_left_in_the_lake_is_closed_and_one_with_none_is_warned_of() 
     assert!(only_day(rows.clone(), "2026-12-01").is_empty());
     assert_eq!(only_day(rows.clone(), "2026-12-02").len(), 1);
     assert_eq!(only_day(rows, "2026-12-29").len(), 1);
+    // 1.10: a day that could not be closed is a warning.
+    assert_eq!(report.outcome, Severity::Warning, "{report:?}");
+    assert_eq!(report.reason, "DAY_EXPIRED_UNCLOSED");
     let expired = &report.metadata["days_expired_unclosed"];
     assert!(expired.starts_with("2026-11-20,2026-11-21,"), "{expired}");
     assert!(expired.ends_with(",2026-12-01"), "{expired}");
@@ -766,6 +769,25 @@ fn a_day_with_no_item_row_is_closed_once_and_recorded() {
     assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 1);
     let again = go_at(&w, "2026-11-21T01:05:00Z", None);
     assert_eq!(again.metadata["days_closed"], "", "{again:?}");
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 1);
+}
+
+#[test]
+fn a_day_with_item_rows_and_no_closed_record_is_replaced_not_doubled() {
+    // A lake rebuilt from bronze with `item_day` restored has no
+    // `meta.day_closed`: closing the day replaces its rows.
+    let w = world("daily-close-restored");
+    let first = go(&w);
+    assert_eq!(code(&first), 0, "{first:?}");
+    let closed = day_rows(&w);
+    assert_eq!(closed.len(), 1);
+    w.open()
+        .execute("DELETE FROM meta.day_closed;", "forgetting the closed days")
+        .unwrap();
+    let again = go(&w);
+    assert_eq!(code(&again), 0, "{again:?}");
+    assert_eq!(again.metadata["days_closed"], "2026-11-20");
+    assert_eq!(day_rows(&w), closed);
     assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 1);
 }
 
@@ -1338,6 +1360,16 @@ fn a_close_over_the_day_close_bound_is_a_warning_and_not_aborted() {
         );
         assert_eq!(code(&report), 0, "{report:?}");
         assert_eq!(report.metadata["close_over_bound"], over);
+        // 1.10: a close over the bound is a warning, and only then.
+        let expected = if over == "true" {
+            Severity::Warning
+        } else {
+            Severity::Ok
+        };
+        assert_eq!(report.outcome, expected, "{report:?}");
+        if over == "true" {
+            assert_eq!(report.reason, "DAY_CLOSE_OVER_BOUND");
+        }
         assert_eq!(day_rows(&w).len(), 1);
         drop(w);
     }

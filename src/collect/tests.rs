@@ -714,8 +714,8 @@ fn a_403_or_404_is_fundamental_exit_2() {
 }
 
 #[test]
-fn a_400_a_500_or_another_status_is_unexpected_exit_70() {
-    for status in [400, 500, 418] {
+fn a_400_a_408_a_500_or_another_status_is_unexpected_exit_70() {
+    for status in [400, 408, 500, 418] {
         let w = World::at(&format!("unexp-{status}"), AT_1135);
         w.stub.token_ok(5);
         w.stub.snapshot_answer(ResponseTemplate::new(status), 5);

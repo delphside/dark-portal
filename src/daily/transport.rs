@@ -27,7 +27,7 @@ pub(crate) trait Transport {
     /// Puts `file` in the bucket as `object`, a name with `/` between its
     /// parts, replacing any object of that name. One attempt: a failure the
     /// caller may try again after a wait (a timeout, the bucket unreachable,
-    /// a 408, 429, 502, 503 or 504) is a [`Failure::Retry`], carrying the
+    /// a 429, 502, 503 or 504) is a [`Failure::Retry`], carrying the
     /// bucket's `Retry-After` where it gave one. Otherwise a failure's type
     /// says what to do: *fundamental* is the access ([`ACCESS_REFUSED`]) or
     /// the file, and the rest, a 500 included, is *unexpected*.
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn a_busy_or_down_bucket_is_a_blip_and_any_other_status_is_unexpected() {
-        for status in [408, 429, 502, 503, 504] {
+        for status in [429, 502, 503, 504] {
             let stub = Stub::new();
             stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
             let report = refused(
@@ -273,7 +273,7 @@ mod tests {
             );
         }
         // A 500 is not a blip: the 1.10 type table makes it unexpected.
-        for status in [418, 500] {
+        for status in [408, 418, 500] {
             let stub = Stub::new();
             stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
             let report = refused(par(&stub).put("a.parquet", &file("odd", b"x")).unwrap_err());
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn a_blip_status_is_asked_again_after_the_retry_after_and_the_others_are_not() {
-        for status in [408, 429, 502, 503, 504] {
+        for status in [429, 502, 503, 504] {
             let stub = Stub::new();
             stub.mount(
                 Mock::given(method("PUT"))
@@ -304,7 +304,7 @@ mod tests {
             .put("a.parquet", &file("no-retry-after", b"x"))
             .unwrap_err();
         assert!(matches!(failure, Failure::Retry { after: None, .. }));
-        for status in [500, 418] {
+        for status in [408, 500, 418] {
             let stub = Stub::new();
             stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
             let failure = par(&stub)

@@ -174,6 +174,13 @@ pub(crate) fn close(
     let result = (|| {
         lake.begin()?;
         if !days.is_empty() {
+            // A day whose `meta.day_closed` row is missing may have its rows
+            // already (a lake rebuilt with `item_day` restored): replaced,
+            // never added to.
+            lake.execute(
+                "DELETE FROM gold.item_day WHERE day IN (SELECT day FROM closing_day);",
+                doing,
+            )?;
             lake.execute(CLOSE_SQL, doing)?;
             // Every day closed is recorded, one with no item row too.
             lake.execute(
