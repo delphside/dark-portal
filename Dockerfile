@@ -6,7 +6,7 @@
 # ARM64, with `docker buildx build --platform`.
 #
 # Base images are pinned by tag. Pin them by digest too once the release
-# process can read one: it is a seam of #11 (docs/5.1.3 *The image*).
+# process can read one: it is a seam of #11 (docs/5.1.3, the packaging row).
 
 # The builder's compiler is the one `rust-toolchain.toml` pins, so the image
 # and CI build with the same one. Debian 12 is the builder's and the runtime's

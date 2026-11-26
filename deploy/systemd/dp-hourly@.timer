@@ -1,8 +1,8 @@
 [Unit]
-Description=Dark Portal hourly run (%i), at :35 past each hour
+Description=Dark Portal hourly run (%i)
 
 [Timer]
-# 5.4.1: the hourly timer starts at :35, after Blizzard's refresh.
+# 5.4.1: the hourly timer start; a test reads this against the settings.
 OnCalendar=*-*-* *:35:00 UTC
 # A run missed while the host was down starts when it is back (5.1.1).
 Persistent=true

@@ -94,7 +94,7 @@ pub(crate) fn run_locked_with(
         return fatal(failure);
     }
     let started = clock.now();
-    let lake = match Lake::open(backend, &config.data_dir.join("state/duckdb-tmp"))
+    let lake = match Lake::open(backend, &crate::lake::scratch_dir(&config.data_dir))
         .and_then(|lake| lake.migrate(clock.now()).map(|_| lake))
     {
         Ok(lake) => lake,

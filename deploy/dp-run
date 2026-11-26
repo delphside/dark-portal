@@ -1,39 +1,83 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Runs one `dp` job in the release's image, as the systemd units do
 # (docs/5.1.3 *Scheduling*).
 #
-#   dp-run [--retry-until HH] SUBCOMMAND
+#   dp-run SUBCOMMAND [ARGUMENT...]
+#   dp-run --help
+#
+# SUBCOMMAND is one of dp's (hourly, collect, items, transform, export, daily);
+# the arguments after it go to `dp`, not to docker.
 #
 # The environment is the caller's: the unit loads the environment's `.env`
 # with `EnvironmentFile=`, and this script passes the same file to the
 # container. It reads DP_IMAGE (the release's image, name and tag), DP_ENV_FILE
-# (that `.env`), DP_RUN_USER (`uid:gid`, the environment's user),
-# DP_CONTAINER_MEMORY, DP_DATA_DIR, DP_LOCK_FILE, DP_BLIZZARD_CLIENT_SECRET_FILE
-# and, where DP_BUCKET is set, DP_BUCKET_ACCESS_FILE (docs/5.4.1).
+# (that `.env`, named `<env>.env`: the container is named `dp-SUBCOMMAND-<env>`),
+# DP_RUN_USER (`uid:gid`, the environment's user), DP_CONTAINER_MEMORY,
+# DP_DATA_DIR, DP_LOCK_FILE, DP_BLIZZARD_CLIENT_SECRET_FILE and, where DP_BUCKET
+# is set, DP_BUCKET_ACCESS_FILE (docs/5.4.1). Run it as the unit does, with a
+# clean environment. It creates nothing: the lock file must exist already
+# (docs/5.3.2).
 #
-# It exits with what `dp` exits with (programme docs/1.10 *What a script's exit
-# status means*), except under --retry-until: a `75` at or after HH:00 UTC
-# becomes `2`, because the scheduler restarts a job on `75` alone and the
-# retries have ended. Run it as the unit does, with a clean environment.
+# Exits (programme docs/1.10 *What a script's exit status means*), where `dp`'s
+# own statuses pass through unchanged:
+#   0   completed
+#   1   stopped on a business error (dp's)
+#   2   stopped on a fundamental error: a setting this script needs missing, the
+#       lock file missing, docker unable to run the container (its 125 to 127)
+#   3   completed with errors, which the next run repeats (dp's)
+#   64  usage error
+#   70  unexpected error: dp's, or an exit status docker passes on that is none
+#       of the above, such as a kill's 137
+#   75  temporary failure: dp's, or the docker daemon is unreachable; retry
 #
-# Exits: 0 completed; 1, 2, 3, 64, 70, 75 as `dp`'s; 2 also where a setting
-# this script needs is missing; docker's own 125 to 127 where it cannot run.
+# There is no pivot of its own: the job in the container has it
+# (docs/5.1.1 *Restarts and recovery*), and this script changes nothing.
 
-set -eu
+set -euo pipefail
 
-retry_until=
-if [ "${1:-}" = "--retry-until" ]; then
-    retry_until=${2:?"--retry-until needs an hour, 0 to 23"}
-    shift 2
-fi
-subcommand=${1:?"dp-run needs a subcommand: hourly or daily"}
+usage() {
+    sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'
+}
+
+short_usage() {
+    echo "usage: dp-run SUBCOMMAND [ARGUMENT...]; dp-run --help lists the statuses" >&2
+}
+
+die() {
+    local status=$1
+    shift
+    echo "dp-run: $*" >&2
+    exit "$status"
+}
+
+case "${1:-}" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    "")
+        echo "dp-run: a subcommand is needed" >&2
+        short_usage
+        exit 64
+        ;;
+    -*)
+        echo "dp-run: unknown option $1" >&2
+        short_usage
+        exit 64
+        ;;
+    hourly | collect | items | transform | export | daily) ;;
+    *)
+        echo "dp-run: unknown subcommand $1" >&2
+        short_usage
+        exit 64
+        ;;
+esac
+subcommand=$1
 shift
 
 need() {
-    eval "value=\${$1:-}"
-    if [ -z "$value" ]; then
-        echo "dp-run: $1 is not set" >&2
-        exit 2
+    if [[ -z "${!1:-}" ]]; then
+        die 2 "$1 is not set"
     fi
 }
 for variable in DP_IMAGE DP_ENV_FILE DP_RUN_USER DP_CONTAINER_MEMORY \
@@ -41,33 +85,49 @@ for variable in DP_IMAGE DP_ENV_FILE DP_RUN_USER DP_CONTAINER_MEMORY \
     need "$variable"
 done
 
-# The lock is a file the container opens, so it must exist to be mounted.
-if [ ! -e "$DP_LOCK_FILE" ]; then
-    touch "$DP_LOCK_FILE"
+env_name=$(basename "$DP_ENV_FILE" .env)
+if [[ ! "$env_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    die 2 "DP_ENV_FILE is not <environment>.env: $DP_ENV_FILE"
 fi
 
-set -- --rm \
-    --user "$DP_RUN_USER" \
-    --memory "$DP_CONTAINER_MEMORY" --memory-swap "$DP_CONTAINER_MEMORY" \
-    --read-only --tmpfs /tmp --cap-drop ALL \
-    --security-opt no-new-privileges \
-    --env-file "$DP_ENV_FILE" \
-    --volume "$DP_DATA_DIR:$DP_DATA_DIR" \
-    --volume "$DP_LOCK_FILE:$DP_LOCK_FILE" \
-    --volume "$DP_BLIZZARD_CLIENT_SECRET_FILE:$DP_BLIZZARD_CLIENT_SECRET_FILE:ro" \
-    "$@"
+# The lock is a file the container opens, so it must exist to be mounted. A
+# missing one is the install's to make, not a job's to make as root.
+if [[ ! -f "$DP_LOCK_FILE" ]]; then
+    die 2 "the lock file $DP_LOCK_FILE does not exist; make it as docs/5.3.2 says"
+fi
+
+docker_args=(
+    --rm --init
+    --name "dp-${subcommand}-${env_name}"
+    --user "$DP_RUN_USER"
+    --memory "$DP_CONTAINER_MEMORY" --memory-swap "$DP_CONTAINER_MEMORY"
+    --read-only --tmpfs /tmp --cap-drop ALL
+    --security-opt no-new-privileges
+    --env-file "$DP_ENV_FILE"
+    --volume "$DP_DATA_DIR:$DP_DATA_DIR"
+    --volume "$DP_LOCK_FILE:$DP_LOCK_FILE"
+    --volume "$DP_BLIZZARD_CLIENT_SECRET_FILE:$DP_BLIZZARD_CLIENT_SECRET_FILE:ro"
+)
 # `dp` reads the bucket's secret only where a bucket is set.
-if [ -n "${DP_BUCKET:-}" ]; then
+if [[ -n "${DP_BUCKET:-}" ]]; then
     need DP_BUCKET_ACCESS_FILE
-    set -- --volume "$DP_BUCKET_ACCESS_FILE:$DP_BUCKET_ACCESS_FILE:ro" "$@"
+    docker_args+=(--volume "$DP_BUCKET_ACCESS_FILE:$DP_BUCKET_ACCESS_FILE:ro")
+fi
+
+# Docker's own 125 cannot say an unreachable daemon from a run that failed, so
+# ask first: the daemon being down is a blip, which the next run may find up.
+if ! docker info > /dev/null 2>&1; then
+    die 75 "the docker daemon is unreachable"
 fi
 
 status=0
-docker run "$@" "$DP_IMAGE" "$subcommand" || status=$?
+docker run "${docker_args[@]}" "$DP_IMAGE" "$subcommand" "$@" || status=$?
 
-if [ "$status" -eq 75 ] && [ -n "$retry_until" ] \
-    && [ "$(date -u +%H)" -ge "$retry_until" ]; then
-    echo "dp-run: exited 75 after $retry_until:00 UTC, when retries end" >&2
-    exit 2
-fi
-exit "$status"
+case "$status" in
+    # dp's own statuses.
+    0 | 1 | 2 | 3 | 64 | 70 | 75) exit "$status" ;;
+    # docker could not run the container (125), or its command (126, 127).
+    125 | 126 | 127) die 2 "docker could not run the container (status $status)" ;;
+    # A kill (137, 143) or anything else is unexpected.
+    *) die 70 "the container ended with status $status" ;;
+esac

@@ -32,6 +32,11 @@
 //! starts, and what is left is one error saying what, which the next run
 //! repeats. The close is timed against [`DAY_CLOSE_BOUND`], and a close over it
 //! is a warning, never aborted.
+//!
+//! **A run that exits `75` is run again by [`run`] itself** ([`retrying`]):
+//! with the lock released, after [`DAILY_RETRY_INTERVAL`], while the next
+//! attempt would start before the retries end ([`DAILY_RETRIES_END_HOUR_UTC`]).
+//! The status is the last attempt's, honest: `75` where the retries ran out.
 
 mod close;
 mod expiry;
@@ -41,35 +46,73 @@ mod temporary;
 mod tests;
 pub(crate) mod transport;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
 
 use crate::collect::failure::Failure;
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
 use crate::config::Config;
-use crate::error::{ErrorType, Report, Severity, worst_type};
+use crate::error::{ErrorType, ExitStatus, Report, Severity, exit_status, worst_type};
 use crate::export::{self, Writer};
 use crate::items::fetch_end;
 use crate::lake::{Backend, Lake};
-use crate::settings::scheduling::{DAY_CLOSE_BOUND, LOCK_WAIT};
+use crate::settings::scheduling::{
+    DAILY_RETRIES_END_HOUR_UTC, DAILY_RETRY_INTERVAL, DAY_CLOSE_BOUND, LOCK_WAIT,
+};
 use crate::settings::storage::BRONZE_KEEP_HOST_SNAPSHOTS;
 use crate::transform::fatal;
 use close::Closing;
 use expiry::Keeps;
 use transport::Transport;
 
-/// Runs `dp daily` on the production lake, Blizzard and bucket.
+/// Runs `dp daily` on the production lake, Blizzard and bucket, again while
+/// it exits `75` and the retries have not ended ([`retrying`]).
 pub fn run(config: &Config, clock: &dyn Clock, endpoints: Endpoints) -> Report {
     let transport = transport::from_config(config);
-    run_with(
-        config,
-        clock,
-        endpoints,
-        &Backend::DuckLake {
-            data_dir: config.data_dir.clone(),
-        },
-        transport.as_deref(),
-    )
+    retrying(clock, &mut || {
+        run_with(
+            config,
+            clock,
+            endpoints.clone(),
+            &Backend::DuckLake {
+                data_dir: config.data_dir.clone(),
+            },
+            transport.as_deref(),
+        )
+    })
+}
+
+/// When the retries end for a run that started at `start`: 03:00 UTC (the
+/// daily retries end) on the day it started. A start after that, such as a
+/// persistent timer's catch-up at 04:00, has no retries.
+fn retries_end(start: DateTime<Utc>) -> DateTime<Utc> {
+    let end = NaiveTime::from_hms_opt(DAILY_RETRIES_END_HOUR_UTC, 0, 0).expect("an hour of a day");
+    start.date_naive().and_time(end).and_utc()
+}
+
+/// Makes the attempt, and makes it again, after the daily retry interval and
+/// with the lock released (each attempt takes and drops its own), for as long
+/// as the last one exited `75` and the next would start before the retries
+/// end. The report is the last attempt's, so `75` where the retries ran out.
+pub(crate) fn retrying(clock: &dyn Clock, attempt: &mut dyn FnMut() -> Report) -> Report {
+    let end = retries_end(clock.now());
+    loop {
+        let report = attempt();
+        if exit_status(&report) != ExitStatus::Blip {
+            return report;
+        }
+        let next = clock.now()
+            + ChronoDuration::from_std(DAILY_RETRY_INTERVAL).expect("an interval in range");
+        if next >= end {
+            return report;
+        }
+        tracing::warn!(
+            reason = %report.reason,
+            retry_at = %next,
+            "dp daily exited 75; it runs again after the daily retry interval"
+        );
+        clock.sleep(DAILY_RETRY_INTERVAL);
+    }
 }
 
 /// As [`run`], with the lake's backend and the bucket's transport given: a
@@ -155,7 +198,7 @@ impl Steps<'_> {
         let config = self.config;
         let now = self.clock.now();
         let deadline = deadline(now);
-        let lake = Lake::open(self.backend, &config.data_dir.join("state/duckdb-tmp"))
+        let lake = Lake::open(self.backend, &crate::lake::scratch_dir(&config.data_dir))
             .and_then(|lake| lake.migrate(now).map(|_| lake))
             .and_then(|lake| lake.load_profiles().map(|()| lake))
             .map_err(|failure| Box::new(fatal(failure)))?;

@@ -194,7 +194,7 @@ fn fetch(
         Err(failure) => return stopped(failure),
     };
     let temporary = dir.join(temporary_name(&file_name, std::process::id(), &suffix));
-    let mut responses = match Responses::new() {
+    let mut responses = match Responses::new(&crate::lake::scratch_dir(&config.data_dir)) {
         Ok(responses) => responses,
         Err(failure) => return stopped(failure),
     };

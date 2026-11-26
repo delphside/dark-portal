@@ -27,6 +27,26 @@ pub use migrations::{MIGRATIONS, Migration};
 pub(crate) use profiles::HOURS_PER_DAY;
 pub use profiles::{PROFILES_SQL, settings_sql};
 
+/// Where a job's DuckDB connections spill what does not fit the memory limit:
+/// under the data folder, which is on disk, so that no connection depends on
+/// the working directory or on the memory-backed `/tmp` of the image.
+pub fn scratch_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("state/duckdb-tmp")
+}
+
+/// The statements that set every connection of a job the same way: extensions
+/// are loaded but never installed, `memory_limit` and `threads` are the job's
+/// (5.4.1), and `temp_directory` is `scratch`, which is made here.
+pub(crate) fn job_limits(scratch: &Path) -> Result<String, Failure> {
+    std::fs::create_dir_all(scratch).map_err(|e| io_failure(&e, "creating the scratch folder"))?;
+    Ok(format!(
+        "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
+         SET memory_limit='{JOB_MEMORY_LIMIT}'; SET threads={JOB_THREADS}; \
+         SET temp_directory={};",
+        crate::collect::snapshot::quoted(&scratch.to_string_lossy())
+    ))
+}
+
 /// The name the lake is attached under, and so the catalog every statement's
 /// `meta.`, `silver.`, `gold.` and `reference.` resolves in.
 pub const CATALOG: &str = "lake";
@@ -145,8 +165,7 @@ impl Lake {
     /// image installs them at build; autoinstall stays off) or the folder
     /// cannot be used.
     pub fn open(backend: &Backend, scratch: &Path) -> Result<Lake, Failure> {
-        std::fs::create_dir_all(scratch)
-            .map_err(|e| io_failure(&e, "creating the scratch folder"))?;
+        let limits = job_limits(scratch)?;
         let connection = Connection::open_in_memory()
             .map_err(|e| lake_failure(&e.to_string(), "opening DuckDB"))?;
         let batch = |sql: &str, doing: &str| {
@@ -154,15 +173,7 @@ impl Lake {
                 .execute_batch(sql)
                 .map_err(|e| lake_failure(&e.to_string(), doing))
         };
-        batch(
-            &format!(
-                "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
-                 SET memory_limit='{JOB_MEMORY_LIMIT}'; SET threads={JOB_THREADS}; \
-                 SET temp_directory={};",
-                crate::collect::snapshot::quoted(&scratch.to_string_lossy())
-            ),
-            "setting the job limits",
-        )?;
+        batch(&limits, "setting the job limits")?;
         if let Backend::DuckLake { data_dir } = backend {
             std::fs::create_dir_all(lake_data_dir(data_dir))
                 .map_err(|e| io_failure(&e, "creating the lake folder"))?;
@@ -213,6 +224,29 @@ impl Lake {
 mod tests {
     use super::*;
     use crate::error::{ExitStatus, exit_status};
+
+    #[test]
+    fn a_job_connection_spills_to_the_scratch_folder_not_the_working_directory() {
+        // The image's working directory is read-only: DuckDB's default spill
+        // folder, `.tmp` beside it, would not be writable.
+        let scratch = std::env::temp_dir().join(format!("dp-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&job_limits(&scratch).unwrap())
+            .unwrap();
+        let set: String = connection
+            .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(set, scratch.to_string_lossy());
+        assert!(scratch.is_dir());
+        assert_eq!(
+            scratch_dir(Path::new("/srv/dp/x")),
+            Path::new("/srv/dp/x/state/duckdb-tmp")
+        );
+    }
 
     #[test]
     fn production_attaches_a_ducklake_catalog_with_its_data_beside_it() {

@@ -13,8 +13,8 @@ use duckdb::{Connection, params};
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::snapshot::{duckdb_failure, quoted, sync_file, timestamp};
 use crate::error::{ErrorType, Report};
+use crate::lake::{job_limits, scratch_dir};
 use crate::settings::collection::REGION;
-use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
 use crate::types::ItemId;
 
 /// The folder the item files go in.
@@ -50,13 +50,11 @@ fn read_failure(message: &str) -> Failure {
     ))
 }
 
-fn open() -> Result<Connection, Failure> {
+fn open(scratch: &Path) -> Result<Connection, Failure> {
+    let limits = job_limits(scratch)?;
     let connection = Connection::open_in_memory().map_err(|e| duckdb_failure(&e.to_string()))?;
     connection
-        .execute_batch(&format!(
-            "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
-             SET memory_limit='{JOB_MEMORY_LIMIT}'; SET threads={JOB_THREADS};"
-        ))
+        .execute_batch(&limits)
         .map_err(|e| duckdb_failure(&e.to_string()))?;
     Ok(connection)
 }
@@ -82,7 +80,7 @@ pub fn ids_to_fetch(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
     }
     sql.push_str(" ORDER BY item");
 
-    let connection = open()?;
+    let connection = open(&scratch_dir(data_dir))?;
     let mut statement = connection
         .prepare(&sql)
         .map_err(|e| read_failure(&e.to_string()))?;
@@ -104,7 +102,7 @@ pub fn ids_not_found(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
     if !has_parquet(&items)? {
         return Ok(Vec::new());
     }
-    let connection = open()?;
+    let connection = open(&scratch_dir(data_dir))?;
     let mut statement = connection
         .prepare(&format!(
             "SELECT item FROM (SELECT item, status, row_number() OVER (PARTITION BY item \
@@ -131,8 +129,8 @@ pub struct Responses {
 
 impl Responses {
     /// An empty set.
-    pub fn new() -> Result<Responses, Failure> {
-        let connection = open()?;
+    pub fn new(scratch: &Path) -> Result<Responses, Failure> {
+        let connection = open(scratch)?;
         connection
             .execute_batch(
                 "CREATE TABLE response(item UINTEGER, fetched_at TIMESTAMPTZ, \

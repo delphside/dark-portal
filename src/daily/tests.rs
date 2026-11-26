@@ -26,7 +26,7 @@ use crate::collect::window::window_end;
 use crate::config::Secret;
 use crate::error::{Severity, exit_status};
 use crate::settings::collection::HTTP_TIMEOUT_SNAPSHOT;
-use crate::settings::scheduling::{DAY_CLOSE_BOUND, TEMPORARY_FILE_MARGIN};
+use crate::settings::scheduling::{DAILY_RETRY_INTERVAL, DAY_CLOSE_BOUND, TEMPORARY_FILE_MARGIN};
 use crate::test_support::logging;
 use crate::transform::MARKET;
 use crate::transform::test_support::{World, h, item_file, l};
@@ -2063,4 +2063,162 @@ fn daily_pushes_through_the_bucket_transport_and_never_names_the_access() {
     let report = go_at(&w, "2026-11-21T01:05:00Z", Some(par.as_ref()));
     assert_eq!(code(&report), 3, "{report:?}");
     assert!(!format!("{report:?}").contains("par-secret"));
+}
+
+// ------------------------------------------------------------ the retries
+
+/// A report exiting `75`, as a lock held past the wait does.
+fn blip() -> Report {
+    Report::fatal(ErrorType::TechnicalBlip, "LOCK_WAIT_EXPIRED", "Held.")
+}
+
+/// Runs `retrying` from `start`, each attempt taking `lasting` of the clock and
+/// answering with the next of `answers`; returns the report, the clock times
+/// the attempts started at and the waits.
+fn retried(
+    start: &str,
+    lasting: Duration,
+    answers: Vec<Report>,
+) -> (Report, Vec<String>, Vec<Duration>) {
+    let clock = FakeClock::at(start);
+    let mut answers = answers.into_iter();
+    let mut starts = Vec::new();
+    let report = retrying(&clock, &mut || {
+        starts.push(clock.now().format("%H:%M").to_string());
+        clock.sleep(lasting);
+        answers
+            .next()
+            .expect("an attempt more than the test expected")
+    });
+    // The attempts' own time is not a retry wait.
+    let waits = clock
+        .slept()
+        .into_iter()
+        .filter(|d| *d != lasting)
+        .collect();
+    (report, starts, waits)
+}
+
+#[test]
+fn daily_retries_after_75_while_the_next_attempt_starts_before_the_end() {
+    // The attempt at 00:50 ends at 01:00 (10 minutes of lock wait), so the next
+    // starts at 01:15, and so on every 25 minutes.
+    let answers = (0..4).map(|_| blip()).chain([Report::ok()]).collect();
+    let (report, starts, waits) = retried("2026-11-21T00:50:00Z", LOCK_WAIT, answers);
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(starts, ["00:50", "01:15", "01:40", "02:05", "02:30"]);
+    assert_eq!(waits, vec![DAILY_RETRY_INTERVAL; 4]);
+}
+
+#[test]
+fn the_last_attempt_is_the_one_after_which_the_next_would_start_at_the_end() {
+    // Attempts take no time here, so they start every 15 minutes: 02:50 is the
+    // last, because the next would start at 03:05.
+    let answers = (0..20).map(|_| blip()).collect();
+    let (report, starts, _) = retried("2026-11-21T00:50:00Z", Duration::ZERO, answers);
+    assert_eq!(starts.last().map(String::as_str), Some("02:50"));
+    // Where the next would start at 03:00 exactly, that is the end: not before.
+    let (_, starts, _) = retried(
+        "2026-11-21T00:45:00Z",
+        Duration::ZERO,
+        (0..20).map(|_| blip()).collect(),
+    );
+    assert_eq!(starts.last().map(String::as_str), Some("02:45"));
+    assert_eq!(
+        code(&report),
+        75,
+        "the honest status at the end: {report:?}"
+    );
+}
+
+#[test]
+fn a_75_then_a_completed_run_exits_0() {
+    let (report, starts, waits) = retried(
+        "2026-11-21T00:50:00Z",
+        Duration::ZERO,
+        vec![blip(), Report::ok()],
+    );
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(starts, ["00:50", "01:05"]);
+    assert_eq!(waits, [DAILY_RETRY_INTERVAL]);
+}
+
+#[test]
+fn only_75_is_retried() {
+    for report in [
+        Report::fatal(ErrorType::TechnicalFundamental, "DISK_FULL", "Full."),
+        Report::fatal(ErrorType::Unexpected, "BOOM", "Boom."),
+        Report::error(ErrorType::TechnicalBlip, "PUSH_FAILED", "Push."),
+    ] {
+        let want = code(&report);
+        let (got, starts, waits) = retried("2026-11-21T00:50:00Z", Duration::ZERO, vec![report]);
+        assert_eq!(code(&got), want);
+        assert_eq!(starts.len(), 1);
+        assert!(waits.is_empty());
+    }
+}
+
+#[test]
+fn a_start_after_the_end_makes_one_attempt_and_exits_75() {
+    // A persistent timer's catch-up at 04:00.
+    let (report, starts, waits) = retried("2026-11-21T04:00:00Z", Duration::ZERO, vec![blip()]);
+    assert_eq!(code(&report), 75, "{report:?}");
+    assert_eq!(starts, ["04:00"]);
+    assert!(waits.is_empty());
+}
+
+/// A clock that, at each retry wait, tries the lock and notes whether it was
+/// free.
+struct ChecksTheLock<'a> {
+    inner: FakeClock,
+    lock_file: &'a Path,
+    free: RefCell<Vec<bool>>,
+}
+
+impl Clock for ChecksTheLock<'_> {
+    fn now(&self) -> DateTime<Utc> {
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        if duration == DAILY_RETRY_INTERVAL {
+            let free = lock::acquire(self.lock_file, Duration::ZERO, &self.inner).is_ok();
+            self.free.borrow_mut().push(free);
+        }
+        self.inner.sleep(duration);
+    }
+}
+
+#[test]
+fn the_lock_is_free_while_daily_waits_to_retry() {
+    // 23:00 is not processed, so every attempt exits 75 (DAY_NOT_CLOSABLE) after
+    // taking the lock; between attempts nobody holds it.
+    let w = world("daily-retry-lock");
+    let lake = w.open();
+    lake.execute(
+        &format!(
+            "DELETE FROM meta.processed WHERE hour = {0}; DELETE FROM gold.item_hour WHERE hour = {0};",
+            at(23)
+        ),
+        "taking 23:00 away",
+    )
+    .unwrap();
+    drop(lake);
+    let clock = ChecksTheLock {
+        inner: FakeClock::at(NOW),
+        lock_file: &w.config.lock_file,
+        free: RefCell::new(Vec::new()),
+    };
+    let report = run_retrying(&w, &clock);
+    assert_eq!(code(&report), 75, "{report:?}");
+    assert_eq!(report.reason, "DAY_NOT_CLOSABLE");
+    let free = clock.free.borrow();
+    assert!(free.len() > 1, "{free:?}");
+    assert!(free.iter().all(|free| *free), "{free:?}");
+}
+
+fn run_retrying(w: &World, clock: &dyn Clock) -> Report {
+    retrying(clock, &mut || {
+        run_with(&w.config, clock, nowhere(), &w.backend(), None)
+    })
 }

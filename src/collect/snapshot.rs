@@ -19,7 +19,7 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 
 use super::failure::{Failure, io_failure, says_disk_full};
 use crate::error::{ErrorType, Report};
-use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
+use crate::lake::job_limits;
 use crate::types::{AuctionId, Copper, ItemId, Listing, TimeLeft};
 
 /// Why a body could not be turned into listings.
@@ -280,6 +280,7 @@ pub fn write_parquet<R: Read>(
     body: R,
     meta: &SnapshotMeta,
     temporary: &Path,
+    scratch: &Path,
 ) -> Result<ParseSummary, Failure> {
     // The name is the run's own, so a file already there is a clash, which is
     // refused and not shared.
@@ -288,7 +289,7 @@ pub fn write_parquet<R: Read>(
         .create_new(true)
         .open(temporary)
         .map_err(|e| io_failure(&e, "reserving the temporary file"))?;
-    let result = write_into(body, meta, temporary);
+    let result = write_into(body, meta, temporary, scratch);
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
@@ -299,13 +300,13 @@ fn write_into<R: Read>(
     body: R,
     meta: &SnapshotMeta,
     temporary: &Path,
+    scratch: &Path,
 ) -> Result<ParseSummary, Failure> {
+    let limits = job_limits(scratch)?;
     let connection = Connection::open_in_memory().map_err(|e| duckdb_failure(&e.to_string()))?;
     connection
         .execute_batch(&format!(
-            "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
-             SET memory_limit='{JOB_MEMORY_LIMIT}'; SET threads={JOB_THREADS}; \
-             CREATE TABLE listing(id UBIGINT, item UINTEGER, quantity UINTEGER, \
+            "{limits} CREATE TABLE listing(id UBIGINT, item UINTEGER, quantity UINTEGER, \
              unit_price UBIGINT, time_left VARCHAR);"
         ))
         .map_err(|e| duckdb_failure(&e.to_string()))?;
@@ -535,7 +536,7 @@ mod tests {
     #[test]
     fn the_file_read_back_has_the_columns_types_and_rows() {
         let path = temp("readback");
-        write_parquet(TWO.as_bytes(), &meta(), &path).unwrap();
+        write_parquet(TWO.as_bytes(), &meta(), &path, path.parent().unwrap()).unwrap();
         let db = Connection::open_in_memory().unwrap();
         let file = quoted(&path.to_string_lossy());
 
@@ -624,7 +625,9 @@ mod tests {
     fn a_temporary_file_that_is_already_there_is_refused_not_shared() {
         let path = temp("clash");
         std::fs::write(&path, "another run's").unwrap();
-        let Err(Failure::Stop(report)) = write_parquet(TWO.as_bytes(), &meta(), &path) else {
+        let Err(Failure::Stop(report)) =
+            write_parquet(TWO.as_bytes(), &meta(), &path, path.parent().unwrap())
+        else {
             panic!("expected a stop");
         };
         assert_eq!(report.reason, "LOCAL_IO_FAILED");
@@ -642,7 +645,9 @@ mod tests {
     fn an_unusable_body_leaves_no_file() {
         let path = temp("unusable");
         let _ = std::fs::remove_file(&path);
-        let Err(Failure::Stop(report)) = write_parquet(&b"{nope"[..], &meta(), &path) else {
+        let Err(Failure::Stop(report)) =
+            write_parquet(&b"{nope"[..], &meta(), &path, path.parent().unwrap())
+        else {
             panic!("expected a stop");
         };
         assert_eq!(report.reason, "SNAPSHOT_BODY_UNUSABLE");
@@ -662,7 +667,12 @@ mod tests {
             }
         }
         let path = temp("cut");
-        let result = write_parquet(Cut(br#"{"auctions":[{"id":1,"#), &meta(), &path);
+        let result = write_parquet(
+            Cut(br#"{"auctions":[{"id":1,"#),
+            &meta(),
+            &path,
+            path.parent().unwrap(),
+        );
         assert!(matches!(result, Err(Failure::Retry { .. })));
     }
 }

@@ -148,7 +148,13 @@ fn collect(
     // hour first; the hour must then be in place once the lock is held.
     let mut written = true;
     loop {
-        let wait = match attempt(&mut session, hour, &temporary, clock) {
+        let wait = match attempt(
+            &mut session,
+            hour,
+            &temporary,
+            &crate::lake::scratch_dir(&config.data_dir),
+            clock,
+        ) {
             Ok(Attempt::Written) => break,
             Err(Failure::Gone) => {
                 written = false;
@@ -287,6 +293,7 @@ fn attempt(
     session: &mut Session<'_>,
     hour: Hour,
     temporary: &Path,
+    scratch: &Path,
     clock: &dyn Clock,
 ) -> Result<Attempt, Failure> {
     // Steps 2 and 3: the request, with a new token taken once where a cached
@@ -326,7 +333,7 @@ fn attempt(
         last_modified: response.last_modified,
         fetched_at,
     };
-    let summary = snapshot::write_parquet(response.body, &meta, temporary)?;
+    let summary = snapshot::write_parquet(response.body, &meta, temporary, scratch)?;
     tracing::info!(rows = summary.rows, "parsed the snapshot");
     Ok(Attempt::Written)
 }

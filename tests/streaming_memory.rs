@@ -167,7 +167,7 @@ fn parsing_300_000_listings_takes_no_more_memory_than_30_000() {
         last_modified: moment,
         fetched_at: moment,
     };
-    let summary = match write_parquet(Body::new(300_000), &meta, &file) {
+    let summary = match write_parquet(Body::new(300_000), &meta, &file, file.parent().unwrap()) {
         Ok(summary) => summary,
         Err(_) => panic!("the write failed"),
     };

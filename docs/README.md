@@ -20,7 +20,7 @@ programme-wide numbering
 | [5.2.2 Listing lifecycle and events](5.2.2-listing-lifecycle-and-events.md) | turning snapshots into events |
 | [5.2.3 Consumable profiles](5.2.3-consumable-profiles.md) | what a commodity's profile shows |
 
-## 5.3 Operating
+## 5.3 Development and operation
 
 | Document | Covers |
 | --- | --- |

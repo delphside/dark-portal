@@ -129,7 +129,7 @@ fn open_and_process(
 ) -> Result<Report, Box<Report>> {
     let started = clock.now();
     let lake =
-        Lake::open(backend, &config.data_dir.join("state/duckdb-tmp")).map_err(into_fatal)?;
+        Lake::open(backend, &crate::lake::scratch_dir(&config.data_dir)).map_err(into_fatal)?;
     lake.migrate(clock.now()).map_err(into_fatal)?;
     let outcome = process_hours(&lake, &config.data_dir, clock, hook, held);
     // The whole run counts against the bound: opening the lake, the

@@ -17,6 +17,7 @@ use crate::collect::snapshot::{SnapshotMeta, write_parquet};
 use crate::collect::test_support::{SECRET, Stub, TOKEN, cache_token};
 use crate::config::Secret;
 use crate::error::{ExitStatus, exit_status};
+use crate::lake::scratch_dir;
 use crate::test_support::logging;
 
 const START: &str = "2026-11-26T11:36:00Z";
@@ -142,14 +143,20 @@ impl World {
             last_modified: at("2026-11-26T10:31:40Z"),
             fetched_at: at("2026-11-26T10:35:00Z"),
         };
-        write_parquet(json.as_bytes(), &meta, &dir.join(format!("{hour}.parquet"))).unwrap();
+        write_parquet(
+            json.as_bytes(),
+            &meta,
+            &dir.join(format!("{hour}.parquet")),
+            &scratch_dir(&self.config.data_dir),
+        )
+        .unwrap();
     }
 
     /// An item file from an earlier run, holding these responses.
     fn earlier_items(&self, file: &str, rows: &[(u32, u16)]) {
         let dir = items_dir(&self.config.data_dir);
         fs::create_dir_all(&dir).unwrap();
-        let mut responses = Responses::new().unwrap();
+        let mut responses = Responses::new(&scratch_dir(&self.config.data_dir)).unwrap();
         for &(item, status) in rows {
             let body = (status == 200).then(|| body(item));
             responses
@@ -1054,7 +1061,7 @@ fn a_temporary_file_that_is_already_there_is_refused_not_shared() {
     fs::create_dir_all(&dir).unwrap();
     let temporary = dir.join("x.tmp");
     fs::write(&temporary, "another run's").unwrap();
-    let responses = Responses::new().unwrap();
+    let responses = Responses::new(&dir).unwrap();
 
     let Err(Failure::Stop(report)) = responses.write(&temporary) else {
         panic!("expected a stop");
@@ -1070,7 +1077,7 @@ fn an_empty_set_of_responses_is_a_file_with_no_rows_and_the_columns() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let file = dir.join("e.parquet");
-    Responses::new().unwrap().write(&file).unwrap();
+    Responses::new(&dir).unwrap().write(&file).unwrap();
     assert_eq!(columns(&file).len(), 4);
     assert!(read_rows(&file).is_empty());
 }
