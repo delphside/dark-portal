@@ -1,0 +1,73 @@
+#!/bin/sh
+# Runs one `dp` job in the release's image, as the systemd units do
+# (docs/5.1.3 *Scheduling*).
+#
+#   dp-run [--retry-until HH] SUBCOMMAND
+#
+# The environment is the caller's: the unit loads the environment's `.env`
+# with `EnvironmentFile=`, and this script passes the same file to the
+# container. It reads DP_IMAGE (the release's image, name and tag), DP_ENV_FILE
+# (that `.env`), DP_RUN_USER (`uid:gid`, the environment's user),
+# DP_CONTAINER_MEMORY, DP_DATA_DIR, DP_LOCK_FILE, DP_BLIZZARD_CLIENT_SECRET_FILE
+# and, where DP_BUCKET is set, DP_BUCKET_ACCESS_FILE (docs/5.4.1).
+#
+# It exits with what `dp` exits with (programme docs/1.10 *What a script's exit
+# status means*), except under --retry-until: a `75` at or after HH:00 UTC
+# becomes `2`, because the scheduler restarts a job on `75` alone and the
+# retries have ended. Run it as the unit does, with a clean environment.
+#
+# Exits: 0 completed; 1, 2, 3, 64, 70, 75 as `dp`'s; 2 also where a setting
+# this script needs is missing; docker's own 125 to 127 where it cannot run.
+
+set -eu
+
+retry_until=
+if [ "${1:-}" = "--retry-until" ]; then
+    retry_until=${2:?"--retry-until needs an hour, 0 to 23"}
+    shift 2
+fi
+subcommand=${1:?"dp-run needs a subcommand: hourly or daily"}
+shift
+
+need() {
+    eval "value=\${$1:-}"
+    if [ -z "$value" ]; then
+        echo "dp-run: $1 is not set" >&2
+        exit 2
+    fi
+}
+for variable in DP_IMAGE DP_ENV_FILE DP_RUN_USER DP_CONTAINER_MEMORY \
+    DP_DATA_DIR DP_LOCK_FILE DP_BLIZZARD_CLIENT_SECRET_FILE; do
+    need "$variable"
+done
+
+# The lock is a file the container opens, so it must exist to be mounted.
+if [ ! -e "$DP_LOCK_FILE" ]; then
+    touch "$DP_LOCK_FILE"
+fi
+
+set -- --rm \
+    --user "$DP_RUN_USER" \
+    --memory "$DP_CONTAINER_MEMORY" --memory-swap "$DP_CONTAINER_MEMORY" \
+    --read-only --tmpfs /tmp --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --env-file "$DP_ENV_FILE" \
+    --volume "$DP_DATA_DIR:$DP_DATA_DIR" \
+    --volume "$DP_LOCK_FILE:$DP_LOCK_FILE" \
+    --volume "$DP_BLIZZARD_CLIENT_SECRET_FILE:$DP_BLIZZARD_CLIENT_SECRET_FILE:ro" \
+    "$@"
+# `dp` reads the bucket's secret only where a bucket is set.
+if [ -n "${DP_BUCKET:-}" ]; then
+    need DP_BUCKET_ACCESS_FILE
+    set -- --volume "$DP_BUCKET_ACCESS_FILE:$DP_BUCKET_ACCESS_FILE:ro" "$@"
+fi
+
+status=0
+docker run "$@" "$DP_IMAGE" "$subcommand" || status=$?
+
+if [ "$status" -eq 75 ] && [ -n "$retry_until" ] \
+    && [ "$(date -u +%H)" -ge "$retry_until" ]; then
+    echo "dp-run: exited 75 after $retry_until:00 UTC, when retries end" >&2
+    exit 2
+fi
+exit "$status"

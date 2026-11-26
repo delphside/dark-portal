@@ -20,6 +20,12 @@ programme-wide numbering
 | [5.2.2 Listing lifecycle and events](5.2.2-listing-lifecycle-and-events.md) | turning snapshots into events |
 | [5.2.3 Consumable profiles](5.2.3-consumable-profiles.md) | what a commodity's profile shows |
 
+## 5.3 Operating
+
+| Document | Covers |
+| --- | --- |
+| [5.3.2 Operating](5.3.2-operating.md) | installing the units, the `.env`, the secrets and the bucket's access |
+
 ## 5.4 Reference
 
 | Document | Covers |

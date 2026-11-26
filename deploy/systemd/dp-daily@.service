@@ -1,0 +1,24 @@
+[Unit]
+Description=Dark Portal daily run (%i)
+Documentation=https://github.com/delphside/dark-portal/blob/main/docs/5.1.1-architecture.md
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+# Fifteen minutes between starts is far over the default start limit's burst;
+# off, so a limit cannot stop the retries.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/dp/%i.env
+Environment=DP_ENV_FILE=/etc/dp/%i.env
+# 5.4.1: the daily retries end at 03:00 UTC. systemd cannot stop by the clock,
+# so `dp-run` turns a `75` at or after that hour into `2`, which is not
+# restarted.
+ExecStart=/usr/local/libexec/dp/dp-run --retry-until 3 daily
+# 5.1.1: restarted on exit 75 and on nothing else, after the daily retry
+# interval (5.4.1). `Restart=no` leaves every other status, a `3` included,
+# to the next timer start; RestartForceExitStatus restarts on 75 alone.
+Restart=no
+RestartForceExitStatus=75
+RestartSec=15min
+TimeoutStartSec=infinity

@@ -1,0 +1,12 @@
+[Unit]
+Description=Dark Portal daily run (%i), at 00:50 UTC
+
+[Timer]
+# 5.4.1: the daily timer starts at 00:50 UTC, between hourly runs.
+OnCalendar=*-*-* 00:50:00 UTC
+# A day missed while the host was down is closed when it is back (5.1.1).
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -11,7 +11,6 @@ use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use duckdb::Connection;
@@ -28,6 +27,7 @@ use crate::config::Secret;
 use crate::error::{Severity, exit_status};
 use crate::settings::collection::HTTP_TIMEOUT_SNAPSHOT;
 use crate::settings::scheduling::{DAY_CLOSE_BOUND, TEMPORARY_FILE_MARGIN};
+use crate::test_support::logging;
 use crate::transform::MARKET;
 use crate::transform::test_support::{World, h, item_file, l};
 use crate::types::Hour;
@@ -1345,31 +1345,12 @@ fn a_run_past_its_deadline_starts_no_optional_step_and_says_what_it_left() {
     );
 }
 
-#[derive(Clone)]
-struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl io::Write for Logged {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[test]
 fn the_close_warnings_are_logged_before_the_steps_after_the_pivot() {
     // A run killed after the pivot has logged what the close raised.
     let w = world("daily-close-warnings-logged");
     let clock = FakeClock::at(NOW);
-    let log = Logged(Arc::default());
-    let writer = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-    let report = tracing::subscriber::with_default(subscriber, || {
+    let (report, text) = logging(|| {
         run_hooked(
             &w.config,
             &clock,
@@ -1387,7 +1368,6 @@ fn the_close_warnings_are_logged_before_the_steps_after_the_pivot() {
         )
     });
     assert_eq!(report.reason, "DAY_CLOSE_OVER_BOUND", "{report:?}");
-    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
     let warned = text.find("DAY_CLOSE_OVER_BOUND").expect(&text);
     let after = text.find("AFTER_THE_PIVOT").expect(&text);
     assert!(warned < after, "{text}");

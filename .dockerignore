@@ -1,0 +1,9 @@
+# The build context is what the image's build needs and no more: the source,
+# the SQL it embeds and the lockfile. Nothing local, large or secret.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!src
+!sql
+!examples

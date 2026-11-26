@@ -1,0 +1,13 @@
+[Unit]
+Description=Dark Portal hourly run (%i), at :35 past each hour
+
+[Timer]
+# 5.4.1: the hourly timer starts at :35, after Blizzard's refresh.
+OnCalendar=*-*-* *:35:00 UTC
+# A run missed while the host was down starts when it is back (5.1.1).
+Persistent=true
+# Exact: `dp collect` takes the current hour by the clock, so no spread.
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

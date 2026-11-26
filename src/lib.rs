@@ -17,5 +17,7 @@ pub mod hourly;
 pub mod items;
 pub mod lake;
 pub mod settings;
+#[cfg(test)]
+mod test_support;
 pub mod transform;
 pub mod types;
