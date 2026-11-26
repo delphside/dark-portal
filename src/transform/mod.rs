@@ -50,6 +50,7 @@ mod vocabulary;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::bound::{self, HourTimes};
 use crate::collect::failure::Failure;
 use crate::collect::lock::Lock;
 use crate::collect::{Clock, lock};
@@ -57,9 +58,9 @@ use crate::config::Config;
 use crate::error::{ErrorType, Report, Severity};
 use crate::lake::{Backend, Lake, lake_failure};
 use crate::settings::scheduling::LOCK_WAIT;
-use crate::settings::transform::HOURLY_PROCESSING_BOUND;
 use crate::types::Hour;
 
+pub(crate) use hour::Hook;
 pub use hour::{HourSummary, MARKET, Step};
 pub use vocabulary::HourWarning;
 
@@ -91,20 +92,24 @@ pub(crate) fn run_hooked(
         Ok(lock) => lock,
         Err(failure) => return fatal(failure),
     };
-    run_locked(config, clock, backend, hook, &held)
+    let times = HourTimes::default();
+    let report = run_locked(config, clock, backend, hook, &held, &times);
+    bound::finish(&times, report)
 }
 
 /// As [`run_with`], for a caller that holds the VM-wide lock already (`dp
 /// hourly`): it opens the lake, applies the migrations and processes the hours
-/// without taking the lock again.
+/// without taking the lock again. The time each hour took is added to
+/// `times`; the caller judges the hourly processing bound on it.
 pub(crate) fn run_locked(
     config: &Config,
     clock: &dyn Clock,
     backend: &Backend,
     hook: hour::Hook,
     held: &Lock,
+    times: &HourTimes,
 ) -> Report {
-    match open_and_process(config, clock, backend, hook, held) {
+    match open_and_process(config, clock, backend, hook, held, times) {
         Ok(report) => report,
         Err(report) => *report,
     }
@@ -116,11 +121,15 @@ fn open_and_process(
     backend: &Backend,
     hook: hour::Hook,
     held: &Lock,
+    times: &HourTimes,
 ) -> Result<Report, Box<Report>> {
     let lake =
         Lake::open(backend, &config.data_dir.join("state/duckdb-tmp")).map_err(into_fatal)?;
     lake.migrate(clock.now()).map_err(into_fatal)?;
     let outcome = process_hours(&lake, &config.data_dir, clock, hook, held);
+    for (hour, took) in &outcome.took {
+        times.add(*hour, *took);
+    }
     for (warning, id) in &outcome.warnings {
         Report::warning(warning.code(), warning.message())
             .with_metadata("id", id.to_string())
@@ -158,9 +167,9 @@ pub struct Outcome {
     pub hours: Vec<HourSummary>,
     /// Each listing warned of, across the hours.
     pub warnings: Vec<(HourWarning, u64)>,
-    /// Each hour that took longer than the hourly processing bound, with its
-    /// time. Each was logged as a warning when it finished.
-    pub over_bound: Vec<(Hour, Duration)>,
+    /// The time each hour took, in order. The hourly processing bound is
+    /// judged on it with the export's ([`crate::bound`]).
+    pub took: Vec<(Hour, Duration)>,
     /// What the rebuild of the reference table found; `None` where it did not
     /// run or failed.
     pub reference: Option<reference::Summary>,
@@ -206,7 +215,7 @@ pub fn process_hours(
     let mut outcome = Outcome {
         hours: Vec::new(),
         warnings: Vec::new(),
-        over_bound: Vec::new(),
+        took: Vec::new(),
         reference: None,
         failure: None,
     };
@@ -220,7 +229,7 @@ pub fn process_hours(
             }
             let started = clock.now();
             let summary = hour::process(lake, data_dir, clock, hour, previous, hook)?;
-            let took = (clock.now() - started).to_std().unwrap_or_default();
+            let took = bound::since(clock, started);
             tracing::info!(
                 hour = %bronze::hour_name(hour),
                 events = summary.events,
@@ -229,20 +238,7 @@ pub fn process_hours(
                 seconds = took.as_secs_f64(),
                 "processed the hour"
             );
-            if took > HOURLY_PROCESSING_BOUND {
-                Report::warning(
-                    "HOUR_PROCESSING_OVER_BOUND",
-                    "An hour took longer to transform than the hourly processing bound.",
-                )
-                .with_metadata("hour", bronze::hour_name(hour))
-                .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
-                .with_metadata(
-                    "bound_seconds",
-                    HOURLY_PROCESSING_BOUND.as_secs().to_string(),
-                )
-                .log();
-                outcome.over_bound.push((hour, took));
-            }
+            outcome.took.push((hour, took));
             outcome.warnings.extend(summary.warnings.iter().copied());
             outcome.hours.push(summary);
             previous = Some(hour);
@@ -280,7 +276,6 @@ pub(crate) fn is_fundamental(failure: &Failure) -> bool {
 fn finished(outcome: &Outcome) -> Report {
     Report::ok()
         .with_metadata("hours", outcome.hours.len().to_string())
-        .with_metadata("hours_over_bound", outcome.over_bound.len().to_string())
         .with_metadata(
             "reference_items",
             outcome

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
+use crate::bound::{self, HourTimes};
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::lock::{self, Lock};
 use crate::collect::snapshot::{quoted, rename_into_place, sync_file, timestamp};
@@ -23,7 +24,6 @@ use crate::error::{ErrorType, Report, worst_type};
 use crate::lake::{Backend, Lake, PROFILES_SQL, lake_failure, settings_sql};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::settings::storage::HOURLY_KEEP;
-use crate::settings::transform::HOURLY_PROCESSING_BOUND;
 use crate::transform::bronze::{hour_name, hour_of};
 use crate::transform::{MARKET, fatal, is_fundamental};
 use crate::types::Hour;
@@ -32,12 +32,12 @@ use crate::types::Hour;
 const HOUR_TABLES: [&str; 2] = ["price_level_hour", "item_hour"];
 
 /// The folder the export is in.
-pub fn export_dir(data_dir: &Path) -> PathBuf {
+pub(crate) fn export_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("export")
 }
 
 /// An hour table's file for an hour.
-pub fn hour_file(data_dir: &Path, table: &str, hour: Hour) -> PathBuf {
+pub(crate) fn hour_file(data_dir: &Path, table: &str, hour: Hour) -> PathBuf {
     export_dir(data_dir)
         .join(table)
         .join(format!("{}.parquet", hour_name(hour)))
@@ -57,20 +57,38 @@ pub fn run(config: &Config, clock: &dyn Clock) -> Report {
 }
 
 /// As [`run`], on the given backend: a test's way to use a plain DuckDB file.
-pub fn run_with(config: &Config, clock: &dyn Clock, backend: &Backend) -> Report {
+pub(crate) fn run_with(config: &Config, clock: &dyn Clock, backend: &Backend) -> Report {
     match lock::acquire(&config.lock_file, LOCK_WAIT, clock) {
-        Ok(held) => run_locked(config, clock, backend, &held),
+        Ok(held) => {
+            let times = HourTimes::default();
+            let report = run_locked(config, clock, backend, &held, &times);
+            bound::finish(&times, report)
+        }
         Err(failure) => fatal(failure),
     }
 }
 
 /// As [`run_with`], for a caller that holds the VM-wide lock already (`dp
-/// hourly`).
+/// hourly`). The time each hour's files took is added to `times`; the caller
+/// judges the hourly processing bound on it.
 pub(crate) fn run_locked(
     config: &Config,
     clock: &dyn Clock,
     backend: &Backend,
     held: &Lock,
+    times: &HourTimes,
+) -> Report {
+    run_locked_with(config, clock, backend, held, times, &publish)
+}
+
+/// [`run_locked`], writing each hour file with `write`.
+pub(crate) fn run_locked_with(
+    config: &Config,
+    clock: &dyn Clock,
+    backend: &Backend,
+    held: &Lock,
+    times: &HourTimes,
+    write: Writer<'_>,
 ) -> Report {
     let lake = match Lake::open(backend, &config.data_dir.join("state/duckdb-tmp"))
         .and_then(|lake| lake.migrate(clock.now()).map(|_| lake))
@@ -78,17 +96,21 @@ pub(crate) fn run_locked(
         Ok(lake) => lake,
         Err(failure) => return fatal(failure),
     };
-    export(&lake, &config.data_dir, clock, held).into_report()
+    let outcome = export_with(&lake, &config.data_dir, clock, held, write);
+    for (hour, took) in &outcome.took {
+        times.add(*hour, *took);
+    }
+    outcome.into_report()
 }
 
 /// What [`export`] did.
 #[derive(Debug, Default)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     /// Each hour that got at least one file, in order.
     pub hours: Vec<Hour>,
-    /// Each hour whose files took longer than the hourly processing bound,
-    /// with its time. Each was logged as a warning.
-    pub over_bound: Vec<(Hour, Duration)>,
+    /// The time each hour's files took, in order. The hourly processing bound
+    /// is judged on it with the transform's ([`crate::bound`]).
+    pub took: Vec<(Hour, Duration)>,
     /// Each of `item_day.parquet`, `item.parquet` and `profiles.sql` that was
     /// rewritten.
     pub rewritten: Vec<&'static str>,
@@ -101,7 +123,6 @@ impl Outcome {
         let counts = |report: Report| {
             report
                 .with_metadata("hours", self.hours.len().to_string())
-                .with_metadata("hours_over_bound", self.over_bound.len().to_string())
                 .with_metadata("rewritten", self.rewritten.join(","))
         };
         if self.errors.is_empty() {
@@ -134,35 +155,34 @@ fn carried(failure: Failure, doing: &str) -> Report {
 
 /// Whether an hour is older than the hourly keep at `now`: by the hour the
 /// file is for, and strictly older, so an hour exactly the keep ago is kept.
-pub fn past_keep(hour: Hour, now: DateTime<Utc>) -> bool {
+pub(crate) fn past_keep(hour: Hour, now: DateTime<Utc>) -> bool {
     let (Some(keep), Some(start)) = (HOURLY_KEEP, hour.start()) else {
         return false;
     };
     chrono::Duration::from_std(keep).is_ok_and(|keep| start + keep < now)
 }
 
-/// The warning for an hour whose files took `took` to write: none unless it is
-/// longer than the hourly processing bound.
-fn over_bound_warning(hour: Hour, took: Duration) -> Option<Report> {
-    (took > HOURLY_PROCESSING_BOUND).then(|| {
-        Report::warning(
-            "HOUR_EXPORT_OVER_BOUND",
-            "An hour took longer to export than the hourly processing bound.",
-        )
-        .with_metadata("hour", hour_name(hour))
-        .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
-        .with_metadata(
-            "bound_seconds",
-            HOURLY_PROCESSING_BOUND.as_secs().to_string(),
-        )
-    })
-}
-
 /// Writes what the export lacks or has stale. The lake is open and migrated
 /// and `_held` is the caller's proof that it holds the lock.
-pub fn export(lake: &Lake, data_dir: &Path, clock: &dyn Clock, _held: &Lock) -> Outcome {
+#[cfg(test)]
+pub(crate) fn export(lake: &Lake, data_dir: &Path, clock: &dyn Clock, held: &Lock) -> Outcome {
+    export_with(lake, data_dir, clock, held, &publish)
+}
+
+/// Writes one hour file: `publish`, or a test's stand-in for a write that
+/// fails.
+pub(crate) type Writer<'a> = &'a dyn Fn(&Lake, &Path, &str) -> Result<(), Failure>;
+
+/// [`export`], writing each hour file with `write`.
+fn export_with(
+    lake: &Lake,
+    data_dir: &Path,
+    clock: &dyn Clock,
+    _held: &Lock,
+    write: Writer<'_>,
+) -> Outcome {
     let mut outcome = Outcome::default();
-    if let Err(report) = write_all(lake, data_dir, clock, &mut outcome) {
+    if let Err(report) = write_all(lake, data_dir, clock, write, &mut outcome) {
         outcome.errors.push(*report);
     }
     outcome
@@ -173,6 +193,7 @@ fn write_all(
     lake: &Lake,
     data_dir: &Path,
     clock: &dyn Clock,
+    write: Writer<'_>,
     outcome: &mut Outcome,
 ) -> Result<(), Box<Report>> {
     let dir = export_dir(data_dir);
@@ -209,7 +230,7 @@ fn write_all(
                 "SELECT * FROM gold.{table} WHERE hour = {} ORDER BY ALL",
                 timestamp(hour.start().expect("an hour in range"))
             );
-            match publish(lake, &file, &select) {
+            match write(lake, &file, &select) {
                 Ok(()) => wrote = true,
                 Err(failure) => {
                     stopped |= is_fundamental(&failure);
@@ -222,12 +243,9 @@ fn write_all(
         }
         if wrote {
             outcome.hours.push(hour);
-            let took = (clock.now() - started).to_std().unwrap_or_default();
+            let took = bound::since(clock, started);
             tracing::info!(hour = %hour_name(hour), seconds = took.as_secs_f64(), "exported the hour");
-            if let Some(warning) = over_bound_warning(hour, took) {
-                warning.log();
-                outcome.over_bound.push((hour, took));
-            }
+            outcome.took.push((hour, took));
         }
     }
 
@@ -316,7 +334,7 @@ fn place(file: &Path, write: impl FnOnce(&Path) -> Result<(), Failure>) -> Resul
 }
 
 /// Writes a query's rows as Parquet to `file`, whole.
-fn publish(lake: &Lake, file: &Path, select: &str) -> Result<(), Failure> {
+pub(crate) fn publish(lake: &Lake, file: &Path, select: &str) -> Result<(), Failure> {
     place(file, |temporary| {
         lake.execute(
             &format!(
@@ -377,7 +395,7 @@ fn rewrite_table(lake: &Lake, file: &Path, table: &str) -> Result<bool, Failure>
 /// The files are found under the variable `export_dir`, which a client sets
 /// to the export's folder before it loads this; unset, it is the working
 /// folder.
-pub fn profiles_text() -> String {
+pub(crate) fn profiles_text() -> String {
     let view = |schema: &str, name: &str, path: &str| {
         format!(
             "CREATE OR REPLACE VIEW {schema}.{name} AS \
@@ -418,7 +436,11 @@ fn rewrite_profiles(file: &Path) -> Result<bool, Failure> {
 
 /// The export's hour files older than the hourly keep at `now`: what `dp
 /// daily` deletes. A name that is not an hour's file is not one of them.
-pub fn expired_hour_files(data_dir: &Path, now: DateTime<Utc>) -> Result<Vec<PathBuf>, Failure> {
+#[cfg_attr(not(test), expect(dead_code, reason = "`dp daily` calls it, next"))]
+pub(crate) fn expired_hour_files(
+    data_dir: &Path,
+    now: DateTime<Utc>,
+) -> Result<Vec<PathBuf>, Failure> {
     let mut expired = Vec::new();
     for table in HOUR_TABLES {
         let folder = export_dir(data_dir).join(table);

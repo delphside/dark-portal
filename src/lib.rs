@@ -6,6 +6,7 @@
 //! [`transform`] is `dp transform`, over the [`lake`]; [`export`] is `dp export`
 //! and [`hourly`] is `dp hourly`, which runs them all.
 
+mod bound;
 pub mod cli;
 pub mod collect;
 pub mod config;

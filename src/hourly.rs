@@ -6,6 +6,7 @@
 //! `collect` hands over the lock it took for its rename and the later steps are
 //! lent it ([`Lock`]), so it is held from the rename to the end of `export`.
 
+use crate::bound::{self, HourTimes};
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
 use crate::config::Config;
@@ -15,7 +16,7 @@ use crate::settings::scheduling::LOCK_WAIT;
 use crate::{collect, export, items, transform};
 
 /// The four steps. Each later step is lent the lock `dp hourly` holds.
-pub struct Steps<'a> {
+pub(crate) struct Steps<'a> {
     /// `dp collect`, with the lock it took for its rename, still held.
     pub collect: &'a dyn Fn() -> (Report, Option<Lock>),
     /// `dp items`.
@@ -40,17 +41,44 @@ pub fn run(config: &Config, clock: &dyn Clock) -> Report {
 
 /// As [`run`], with the endpoints and the lake's backend given: a test's way
 /// to use a stubbed Blizzard and a plain DuckDB file.
-pub fn run_with(
+pub(crate) fn run_with(
     config: &Config,
     clock: &dyn Clock,
     endpoints: impl Fn() -> Endpoints,
     backend: &Backend,
 ) -> Report {
+    run_hooked(
+        config,
+        clock,
+        endpoints,
+        backend,
+        &|_, _| Ok(()),
+        &export::publish,
+        &HourTimes::default(),
+    )
+}
+
+/// [`run_with`], with a hook in the transform and the export's way to write an
+/// hour file given: a test's way to make a step slow.
+pub(crate) fn run_hooked(
+    config: &Config,
+    clock: &dyn Clock,
+    endpoints: impl Fn() -> Endpoints,
+    backend: &Backend,
+    hook: transform::Hook,
+    write: export::Writer,
+    times: &HourTimes,
+) -> Report {
+    // One bound on an hour's `transform` and `export` together: each adds the
+    // time it spent on each hour to `times`, and the last judges the sum.
     let steps = Steps {
         collect: &|| collect::run_keeping(config, clock, endpoints()),
         items: &|held| items::run_holding(config, clock, endpoints(), lock::Holding::Held(held)),
-        transform: &|held| transform::run_locked(config, clock, backend, &|_, _| Ok(()), held),
-        export: &|held| export::run_locked(config, clock, backend, held),
+        transform: &|held| transform::run_locked(config, clock, backend, hook, held, times),
+        export: &|held| {
+            let report = export::run_locked_with(config, clock, backend, held, times, write);
+            bound::finish(times, report)
+        },
     };
     run_steps(config, clock, &steps)
 }
@@ -63,7 +91,7 @@ fn failed(report: &Report) -> bool {
 
 /// Runs the steps in order. The report is the run's result, and its exit
 /// status is `dp hourly`'s.
-pub fn run_steps(config: &Config, clock: &dyn Clock, steps: &Steps<'_>) -> Report {
+pub(crate) fn run_steps(config: &Config, clock: &dyn Clock, steps: &Steps<'_>) -> Report {
     let (collected, kept) = (steps.collect)();
     let mut results: Vec<(&str, Report)> = vec![("collect", collected)];
 

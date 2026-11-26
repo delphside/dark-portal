@@ -499,14 +499,97 @@ fn exported_profiles_sql_gives_the_same_profile_as_the_lake() {
 // ------------------------------------------------------------------- bound
 
 #[test]
-fn an_hour_is_warned_of_only_when_it_took_longer_than_the_bound() {
-    // D30.1 to D30.3.
-    let bound = HOURLY_PROCESSING_BOUND;
-    assert!(over_bound_warning(h(10), bound - Duration::from_secs(1)).is_none());
-    assert!(over_bound_warning(h(10), bound).is_none());
-    let warning = over_bound_warning(h(10), bound + Duration::from_secs(1)).unwrap();
-    assert_eq!(warning.outcome, Severity::Warning);
-    assert_eq!(warning.reason, "HOUR_EXPORT_OVER_BOUND");
-    assert_eq!(warning.metadata["hour"], "2026-11-20T10");
-    assert_eq!(exit_status(&warning), ExitStatus::Completed);
+fn the_time_each_hour_took_is_kept_for_the_bound_to_judge() {
+    // D30.1 to D30.3: the bound is judged on the transform's and the export's
+    // time together (`bound`), so the export keeps its own per hour.
+    let w = world("export-took");
+    let lake = w.open();
+    let held = w.lock();
+    let outcome = export(&lake, &w.config.data_dir, &w.clock, &held);
+    let hours: Vec<Hour> = outcome.took.iter().map(|(hour, _)| *hour).collect();
+    assert_eq!(hours, [h(10), h(11), h(12)]);
+}
+
+// ----------------------------------------------------------- the hour loop
+
+/// A write that fails the way a full disk does, for the files of `hour`, and
+/// otherwise writes. Each file asked for is recorded, in order.
+fn failing_for(
+    hour: Hour,
+    asked: &std::cell::RefCell<Vec<PathBuf>>,
+) -> impl Fn(&Lake, &Path, &str) -> Result<(), Failure> {
+    move |lake, file, select| {
+        asked.borrow_mut().push(file.to_owned());
+        if file.ends_with(format!("{}.parquet", hour_name(hour))) {
+            return Err(io_failure(
+                &std::io::Error::from(std::io::ErrorKind::StorageFull),
+                "writing an hour",
+            ));
+        }
+        publish(lake, file, select)
+    }
+}
+
+#[test]
+fn hours_are_written_oldest_first() {
+    // 5.4.2: the hours are written in order, so a run that stops leaves the
+    // later hours for the next.
+    let w = world("export-order");
+    let lake = w.open();
+    let held = w.lock();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let outcome = export_with(&lake, &w.config.data_dir, &w.clock, &held, &|l, f, s| {
+        asked.borrow_mut().push(f.to_owned());
+        publish(l, f, s)
+    });
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    let order: Vec<String> = asked
+        .borrow()
+        .iter()
+        .filter(|f| f.starts_with(export_folder(&w).join("item_hour")))
+        .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "2026-11-20T10.parquet",
+            "2026-11-20T11.parquet",
+            "2026-11-20T12.parquet"
+        ]
+    );
+}
+
+#[test]
+fn a_fundamental_failure_writing_an_hour_stops_the_later_hours() {
+    // D15.2: the write would meet the same failure again, so the hours after
+    // it, and the files after the hours, are not tried.
+    let w = world("export-hour-stop");
+    let lake = w.open();
+    let held = w.lock();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let outcome = export_with(
+        &lake,
+        &w.config.data_dir,
+        &w.clock,
+        &held,
+        &failing_for(h(11), &asked),
+    );
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert_eq!(
+        outcome.errors[0].error_type,
+        Some(ErrorType::TechnicalFundamental)
+    );
+    assert_eq!(outcome.errors[0].metadata["hour"], "2026-11-20T11");
+    let hours: Vec<Hour> = outcome.hours.clone();
+    assert_eq!(hours, [h(10)]);
+    assert!(
+        !asked
+            .borrow()
+            .iter()
+            .any(|f| f.ends_with("2026-11-20T12.parquet")),
+        "{:?}",
+        asked.borrow()
+    );
+    assert!(outcome.rewritten.is_empty(), "{:?}", outcome.rewritten);
+    assert!(!hour_file(&w.config.data_dir, "item_hour", h(12)).exists());
 }

@@ -1479,7 +1479,11 @@ fn over_bound_after(seconds: u64, name: &str) -> Vec<(Hour, StdDuration)> {
         &held,
     );
     assert!(outcome.failure.is_none());
-    outcome.over_bound
+    let times = crate::bound::HourTimes::default();
+    for (hour, took) in outcome.took {
+        times.add(hour, took);
+    }
+    times.over_bound()
 }
 
 #[test]

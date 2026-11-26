@@ -457,6 +457,54 @@ fn the_real_steps_take_the_lock_once_and_run_one_hour_through() {
 }
 
 #[test]
+fn the_bound_is_judged_on_transform_and_export_together() {
+    // H10, TT3: each step is inside the bound for the hour, the two are not.
+    let w = World::new("hourly-bound-sum");
+    w.snapshot(10, &[l(1, 100, 5)]);
+    item_file(
+        &w,
+        "2026-11-20T093500",
+        &[(
+            1,
+            "2026-11-20 09:35:00+00",
+            200,
+            Some(r#"{"name":"Flask","sell_price":5}"#),
+        )],
+    );
+    let clock = FakeClock::at("2026-11-20T10:40:00Z");
+    let transform_takes = Duration::from_secs(200);
+    let export_file_takes = Duration::from_secs(100); // two files: 200 s
+    assert!(transform_takes < crate::settings::transform::HOURLY_PROCESSING_BOUND);
+    assert!(2 * export_file_takes < crate::settings::transform::HOURLY_PROCESSING_BOUND);
+    let times = crate::bound::HourTimes::default();
+    let report = run_hooked(
+        &w.config,
+        &clock,
+        Endpoints::blizzard,
+        &w.backend(),
+        &|_, at| {
+            if at == crate::transform::Step::Apply {
+                clock.sleep(transform_takes);
+            }
+            Ok(())
+        },
+        &|lake, file, select| {
+            clock.sleep(export_file_takes);
+            crate::export::publish(lake, file, select)
+        },
+        &times,
+    );
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["step_export"], "OK");
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    assert_eq!(
+        times.over_bound(),
+        [(h(10), Duration::from_secs(400))],
+        "the sum is over the bound"
+    );
+}
+
+#[test]
 fn a_rerun_of_the_real_steps_does_nothing_and_exits_0() {
     let w = World::new("hourly-real-rerun");
     w.snapshot(10, &[l(1, 100, 5)]);
