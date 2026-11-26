@@ -1,7 +1,7 @@
 //! How `dp daily` puts a file in the bucket: the one place that knows the
 //! mechanism (5.1.3 *bucket transport*, `docs/5.1.3-technology-decisions.md`).
 //!
-//! **Provisional.** The owner is choosing the mechanism. For now a file is put
+//! The mechanism is the owner's decision of 2026-11-26. A file is put
 //! with one HTTPS `PUT` to an Object Storage *pre-authenticated request* URL:
 //! the secret in `DP_BUCKET_ACCESS_FILE` is the URL of the bucket's folder (the
 //! one `dp` is to write below), and an object's name follows it. The URL carries

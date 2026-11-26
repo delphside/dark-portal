@@ -3,7 +3,8 @@
 //!
 //! **A day is closable** once each of its hours is processed or recorded as a
 //! gap. The hours before the first snapshot collected are not the day's, so the
-//! first day closes on the hours it has. A gap is recorded in the transaction of
+//! first day closes on the hours it has. A gap is recorded in the transaction
+//! of
 //! the hour after it, so a day whose last hour is not yet processed is not
 //! closable.
 //!
@@ -11,7 +12,8 @@
 //! the transaction that closes it for every day closed, one in which no item
 //! had a row included, or where `gold.item_day` already has rows of it (a lake
 //! rebuilt with `item_day` restored). The rows of such a day are never
-//! recomputed: the close only records it, in the transaction of the others. A closable day not closed is closed, every one in one
+//! recomputed: the close only records it, in the transaction of the others. A
+//! closable day not closed is closed, every one in one
 //! transaction, which is the run's pivot. The day before today (UTC) must be
 //! closable or the run does nothing and ends `75` ([`Closing::NotYet`]): a day
 //! that cannot yet be closed is no reason to close an older one, and the next
