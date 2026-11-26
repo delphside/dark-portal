@@ -358,18 +358,36 @@ fn write_into<R: Read>(
         ))
         .map_err(|e| duckdb_failure(&e.to_string()))?;
     // The file is on disk before the rename that makes it the hour's.
-    sync_file(temporary)?;
+    sync_file(temporary, "the snapshot file")?;
     Ok(summary)
 }
 
-/// Syncs a file. One that is not there was cleared by a run that collected the
-/// hour first: [`Failure::Gone`].
-pub fn sync_file(path: &Path) -> Result<(), Failure> {
+/// Syncs a file, `what` being its description for a failure's report. One that
+/// is not there was removed by another run: [`Failure::Gone`].
+pub fn sync_file(path: &Path, what: &str) -> Result<(), Failure> {
     match std::fs::File::open(path).and_then(|file| file.sync_all()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Failure::Gone),
-        Err(e) => Err(io_failure(&e, "syncing the snapshot file")),
+        Err(e) => Err(io_failure(&e, &format!("syncing {what}"))),
     }
+}
+
+/// Renames a written, synced `temporary` to `file` and syncs `file`'s folder,
+/// the one way every whole-file write ends: the rename is durable only once its
+/// folder is. `what` is the file's description for a failure's report. A
+/// temporary file that is not there is [`Failure::Gone`].
+pub fn rename_into_place(temporary: &Path, file: &Path, what: &str) -> Result<(), Failure> {
+    std::fs::rename(temporary, file).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            Failure::Gone
+        } else {
+            io_failure(&e, &format!("renaming {what} into place"))
+        }
+    })?;
+    let folder = file.parent().expect("a file in a folder");
+    std::fs::File::open(folder)
+        .and_then(|folder| folder.sync_all())
+        .map_err(|e| io_failure(&e, &format!("syncing the folder of {what}")))
 }
 
 #[cfg(test)]
@@ -617,7 +635,7 @@ mod tests {
     fn a_file_cleared_by_another_run_is_gone_not_an_error_by_itself() {
         let path = temp("gone");
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(sync_file(&path), Err(Failure::Gone)));
+        assert!(matches!(sync_file(&path, "a file"), Err(Failure::Gone)));
     }
 
     #[test]

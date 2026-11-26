@@ -8,7 +8,7 @@ use duckdb::Connection;
 
 use super::*;
 use crate::collect::clock::FakeClock;
-use crate::error::{ExitStatus, Severity, exit_status};
+use crate::error::{ErrorType, ExitStatus, Severity, exit_status};
 use crate::transform::test_support::{World, h, item_file, l};
 
 /// Three hours of two items, run through the transform.
@@ -304,6 +304,29 @@ fn a_file_that_cannot_be_written_is_an_error_and_the_hours_are_still_written() {
     assert_eq!(repaired.outcome, Severity::Ok, "{repaired:?}");
     assert_eq!(repaired.metadata["hours"], "0");
     assert!(names(&w).contains(&"item_day.parquet".to_owned()));
+    assert!(names(&w).contains(&"profiles.sql".to_owned()));
+}
+
+#[test]
+fn a_fundamental_failure_ends_the_run_early_and_the_next_run_writes_the_rest() {
+    // D15.2: a write that fails for the disk or the folder would meet the same
+    // failure again, so the files after it are not tried.
+    let w = world("export-fundamental");
+    std::fs::create_dir_all(export_folder(&w).join("item_day.parquet")).unwrap();
+    let report = export_it(&w);
+    assert_eq!(report.errors.len(), 1, "{report:?}");
+    assert_eq!(
+        report.errors[0].error_type,
+        Some(ErrorType::TechnicalFundamental)
+    );
+    assert_eq!(report.metadata["hours"], "3");
+    assert!(!names(&w).contains(&"item.parquet".to_owned()));
+    assert!(!names(&w).contains(&"profiles.sql".to_owned()));
+
+    std::fs::remove_dir(export_folder(&w).join("item_day.parquet")).unwrap();
+    let repaired = export_it(&w);
+    assert_eq!(repaired.outcome, Severity::Ok, "{repaired:?}");
+    assert!(names(&w).contains(&"item.parquet".to_owned()));
     assert!(names(&w).contains(&"profiles.sql".to_owned()));
 }
 

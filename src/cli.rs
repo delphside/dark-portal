@@ -40,7 +40,7 @@ pub enum Command {
     Items,
     /// Process every bronze hour after the high-water mark.
     Transform,
-    /// Write the export: every committed hour it lacks.
+    /// Write the export: every committed hour within the hourly keep that it lacks.
     Export,
     /// Close the day, push to the bucket, delete what is past its keep and
     /// retry items that answered 404.

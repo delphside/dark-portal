@@ -40,7 +40,6 @@ pub use store::items_dir;
 mod tests;
 
 use std::collections::VecDeque;
-use std::fs::File;
 use std::path::Path;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -50,6 +49,7 @@ use crate::collect::blizzard::{Blizzard, ItemAnswer};
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::lock::Holding;
 use crate::collect::session::{Session, Stage, Staged};
+use crate::collect::snapshot::rename_into_place;
 use crate::collect::{Clock, Endpoints, random_suffix, temporary_name};
 use crate::config::Config;
 use crate::error::{ErrorType, Report, Severity, worst_type};
@@ -351,11 +351,7 @@ fn place(
             "Another run wrote an item file with this name; the items are fetched again.",
         ));
     }
-    std::fs::rename(temporary, file).map_err(|e| io_failure(&e, "renaming the item file"))?;
-    let dir = file.parent().expect("a file in a folder");
-    File::open(dir)
-        .and_then(|folder| folder.sync_all())
-        .map_err(|e| io_failure(&e, "syncing the items folder"))?;
+    rename_into_place(temporary, file, "the item file")?;
     tracing::info!(file = %file.display(), "wrote the item responses");
     Ok(())
 }

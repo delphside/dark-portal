@@ -169,6 +169,6 @@ impl Responses {
             ))
             .map_err(|e| duckdb_failure(&e.to_string()))?;
         // The file is on disk before the rename that makes it the run's.
-        sync_file(temporary)
+        sync_file(temporary, "the item file")
     }
 }

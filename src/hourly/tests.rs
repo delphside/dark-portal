@@ -2,11 +2,18 @@
 //! real steps once, over one constructed hour.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use wiremock::matchers::{header, method, path, query_param};
+use wiremock::{Mock, ResponseTemplate};
 
 use super::*;
 use crate::collect::clock::FakeClock;
 use crate::collect::failure::Failure;
+use crate::collect::test_support::{SECRET, Stub, TOKEN, http_date};
+use crate::config::Secret;
 use crate::error::ErrorType;
 use crate::transform::test_support::{World, h, item_file, l};
 
@@ -91,7 +98,7 @@ fn run_stubs(w: &World, collect: Report, later: &[Report; 3]) -> (Vec<&'static s
     let steps = Steps {
         collect: &|| {
             order.borrow_mut().push("collect");
-            collect.clone()
+            (collect.clone(), None)
         },
         items: &|_| {
             order.borrow_mut().push("items");
@@ -220,9 +227,10 @@ fn refused(w: &World) -> bool {
 }
 
 #[test]
-fn a_second_taker_is_refused_through_every_later_step_but_not_collect() {
-    // O59, D16.7: collect holds no lock of its own across its work; the lock
-    // is taken after it and held through items, transform and export.
+fn where_collect_took_no_lock_a_second_taker_is_refused_through_every_later_step() {
+    // O59, D16.7, X-c7: collect holds no lock across its work; where it took
+    // none (step 1, or a failure first), hourly takes it for items and holds it
+    // through transform and export.
     let w = World::new("hourly-held");
     let free_in_collect = Cell::new(false);
     let refused_in = RefCell::new(Vec::new());
@@ -230,7 +238,7 @@ fn a_second_taker_is_refused_through_every_later_step_but_not_collect() {
         collect: &|| {
             free_in_collect
                 .set(lock::acquire(&w.config.lock_file, Duration::ZERO, &w.clock).is_ok());
-            Report::ok()
+            (Report::ok(), None)
         },
         items: &|_| {
             refused_in.borrow_mut().push(refused(&w));
@@ -251,6 +259,124 @@ fn a_second_taker_is_refused_through_every_later_step_but_not_collect() {
     assert_eq!(*refused_in.borrow(), [true, true, true]);
     // Released at the end.
     assert!(lock::acquire(&w.config.lock_file, Duration::ZERO, &w.clock).is_ok());
+}
+
+/// A clock that, each time it is asked for the time or a wait once the hour's
+/// file is in bronze, tries the lock from a second handle: whether it was
+/// free is a gap in the run's hold.
+struct ProbingClock {
+    inner: FakeClock,
+    lock_file: PathBuf,
+    bronze_file: PathBuf,
+    probes: Cell<u32>,
+    free: Cell<u32>,
+}
+
+impl ProbingClock {
+    fn probe(&self) {
+        if !self.bronze_file.exists() {
+            return;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock_file)
+            .unwrap();
+        self.probes.set(self.probes.get() + 1);
+        if file.try_lock().is_ok() {
+            self.free.set(self.free.get() + 1);
+        }
+    }
+}
+
+impl Clock for ProbingClock {
+    fn now(&self) -> DateTime<Utc> {
+        self.probe();
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.probe();
+        self.inner.sleep(duration);
+    }
+}
+
+/// A world whose Blizzard is stubbed: it serves hour 11's snapshot, of one
+/// listing of item 10, and item 10's data; the clock is at 11:40.
+fn blizzard_world(name: &str) -> (World, Stub) {
+    let mut w = World::new(name);
+    w.config.blizzard_client_secret = Secret::new(SECRET);
+    let stub = Stub::new();
+    stub.token_ok(5);
+    let bearer = format!("Bearer {TOKEN}");
+    stub.mount(
+        Mock::given(method("GET"))
+            .and(path("/data/wow/auctions/commodities"))
+            .and(query_param("namespace", "dynamic-eu"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("last-modified", http_date("2026-11-26T11:31:40Z").as_str())
+                    .set_body_string(
+                        r#"{"auctions":[{"id":1,"item":{"id":10},"quantity":5,
+                        "unit_price":123,"time_left":"SHORT"}]}"#,
+                    ),
+            ),
+    );
+    stub.mount(
+        Mock::given(method("GET"))
+            .and(path("/data/wow/item/10"))
+            .and(query_param("namespace", "static-eu"))
+            .and(header("authorization", bearer.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"id":10,"name":"Flask","sell_price":5}"#),
+            ),
+    );
+    (w, stub)
+}
+
+#[test]
+fn hourly_holds_the_lock_from_the_rename_through_export() {
+    // O59, D16.7, X-c7: the real collect, so the gap between its rename and the
+    // later steps is the real one. The clock tries the lock at every time and
+    // wait asked for once the hour is in bronze: none may find it free.
+    let (w, stub) = blizzard_world("hourly-gap");
+    let clock = ProbingClock {
+        inner: FakeClock::at("2026-11-26T11:40:00Z"),
+        lock_file: w.config.lock_file.clone(),
+        bronze_file: crate::collect::bronze_dir(&w.config.data_dir).join("2026-11-26T11.parquet"),
+        probes: Cell::new(0),
+        free: Cell::new(0),
+    };
+    let report = run_with(&w.config, &clock, || stub.endpoints(), &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["step_export"], "OK");
+    assert!(
+        clock.probes.get() > 0,
+        "the probe saw the run after the rename"
+    );
+    assert_eq!(clock.free.get(), 0, "the lock was free after the rename");
+    // Released when the run ends.
+    assert!(lock::acquire(&w.config.lock_file, Duration::ZERO, &clock).is_ok());
+}
+
+#[test]
+fn items_is_lent_the_lock_and_takes_none_of_its_own_for_a_new_item() {
+    // A new item makes items rename a file into place, which it may do only
+    // under the lock hourly holds: taking another would wait out the lock wait
+    // and fail.
+    let (w, stub) = blizzard_world("hourly-items-lent");
+    let report = run_with(&w.config, &w.clock, || stub.endpoints(), &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["step_items"], "OK");
+    assert!(crate::items::has_parquet(&crate::items::items_dir(&w.config.data_dir)).unwrap());
+    assert!(
+        !w.clock.slept().contains(&Duration::from_secs(1)),
+        "no wait for the lock: {:?}",
+        w.clock.slept()
+    );
 }
 
 #[test]

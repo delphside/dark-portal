@@ -1,26 +1,10 @@
-//! `dp hourly`: `collect`, `items`, `transform` and `export`, in that order
-//! (5.1.1 *The hourly run*, `docs/5.1.1-architecture.md`; the exit rules are in
-//! 5.2.1 *When it fails*, `docs/5.2.1-collection.md`).
+//! `dp hourly`: `collect`, `items`, `transform` and `export`, in that order,
+//! every later step run whatever `collect` returned. The order and the lock are
+//! 5.1.1 *The hourly run* (`docs/5.1.1-architecture.md`); the exit is 5.2.1
+//! *When it fails* (`docs/5.2.1-collection.md`).
 //!
-//! **The lock.** `collect` takes it itself, only to rename its file into
-//! place. `dp hourly` takes it once, after that rename, and holds it for
-//! `items`, `transform` and `export`, which are lent it ([`Lock`]) and take
-//! nothing of their own. It is released when the run ends.
-//!
-//! **The steps run whatever `collect` returned**, so a pending hour is caught
-//! up even when this hour's snapshot is late. A later step that failed does not
-//! stop the ones after it.
-//!
-//! **The exit** is `collect`'s where that is not `0`; otherwise `3` where a
-//! later step failed, whatever the failure's type; otherwise `0`. The failed
-//! steps' reports are the run's `errors`, so each is logged with its own type.
-//! A step that did not fail is logged as it finishes, and the run's report names
-//! every step's result in its metadata.
-//!
-//! **No lock.** Where the lock is held past the lock wait the later steps do
-//! not run: with `collect` at `0` the run is a *blip*, exit `75`, which the
-//! scheduler retries; with `collect` failed it exits with `collect`'s status
-//! and carries the lock's failure as an error.
+//! `collect` hands over the lock it took for its rename and the later steps are
+//! lent it ([`Lock`]), so it is held from the rename to the end of `export`.
 
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
@@ -32,8 +16,8 @@ use crate::{collect, export, items, transform};
 
 /// The four steps. Each later step is lent the lock `dp hourly` holds.
 pub struct Steps<'a> {
-    /// `dp collect`.
-    pub collect: &'a dyn Fn() -> Report,
+    /// `dp collect`, with the lock it took for its rename, still held.
+    pub collect: &'a dyn Fn() -> (Report, Option<Lock>),
     /// `dp items`.
     pub items: &'a dyn Fn(&Lock) -> Report,
     /// `dp transform`.
@@ -63,7 +47,7 @@ pub fn run_with(
     backend: &Backend,
 ) -> Report {
     let steps = Steps {
-        collect: &|| collect::run(config, clock, endpoints()),
+        collect: &|| collect::run_keeping(config, clock, endpoints()),
         items: &|held| items::run_holding(config, clock, endpoints(), lock::Holding::Held(held)),
         transform: &|held| transform::run_locked(config, clock, backend, &|_, _| Ok(()), held),
         export: &|held| export::run_locked(config, clock, backend, held),
@@ -80,9 +64,16 @@ fn failed(report: &Report) -> bool {
 /// Runs the steps in order. The report is the run's result, and its exit
 /// status is `dp hourly`'s.
 pub fn run_steps(config: &Config, clock: &dyn Clock, steps: &Steps<'_>) -> Report {
-    let mut results: Vec<(&str, Report)> = vec![("collect", (steps.collect)())];
+    let (collected, kept) = (steps.collect)();
+    let mut results: Vec<(&str, Report)> = vec![("collect", collected)];
 
-    match lock::acquire(&config.lock_file, LOCK_WAIT, clock) {
+    // Where `collect` took no lock (the hour was collected already, or it
+    // failed first) the later steps still run, so the lock is taken here.
+    let held = match kept {
+        Some(lock) => Ok(lock),
+        None => lock::acquire(&config.lock_file, LOCK_WAIT, clock),
+    };
+    match held {
         Ok(held) => {
             results.push(("items", (steps.items)(&held)));
             results.push(("transform", (steps.transform)(&held)));

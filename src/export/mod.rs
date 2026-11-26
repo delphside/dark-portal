@@ -1,37 +1,10 @@
 //! `dp export`: the export a client reads with only DuckDB and rsync, as
-//! 5.4.2 *The export*, `docs/5.4.2-storage-schema.md` sets it out.
+//! 5.4.2 *The export* (`docs/5.4.2-storage-schema.md`) sets it out: which files,
+//! when each is written, and that each is written whole. The exit is 5.2.1
+//! *When it fails* (`docs/5.2.1-collection.md`).
 //!
-//! **What it writes.** Plain Parquet of gold and reference, and
-//! `profiles.sql`: the views over those files, the settings macros, then
-//! `sql/profiles.sql` unchanged, so a client computes no measure of its own.
-//!
-//! **What it writes when.** Every committed hour (`meta.processed`) within the
-//! hourly keep whose two files the export lacks, oldest first; then
-//! `item_day.parquet`, `item.parquet` and `profiles.sql`, each only where it
-//! would change. A committed hour's gold never changes, so an hour's files are
-//! written once; a run with nothing new writes nothing. An hour past the keep
-//! is not written: `dp daily` would delete its files, and
-//! [`expired_hour_files`] names them so it can.
-//!
-//! **Whole files only.** Every file is written under a name only this run
-//! uses, synced, then renamed into place, so a reader pulling by rsync never
-//! sees a partial file. The folder holds `*.tmp` files only while a run is
-//! writing or after one was killed; the next run, which holds the lock,
-//! removes them, and a client leaves them out (`*.parquet` and `profiles.sql`
-//! are the export).
-//!
-//! **The lock.** [`run`] takes the VM-wide lock; `dp hourly` holds it and
-//! calls [`run_locked`], and [`export`] takes the held [`Lock`] as proof.
-//!
-//! **Errors.** After the pivot a failure is an *error* the run carries on past
-//! (one per file), and the step exits `3`; a failure to take the lock or open
-//! the lake stops it. A *fundamental* failure (a full disk) ends the run
-//! early: more writes would meet it again. Whatever was written is whole, and
-//! the next run writes what is missing.
-//!
-//! **Time.** An hour's files taking longer than the hourly processing bound is
-//! logged as a warning, as the transform's hour is: the bound is read of each
-//! step alone (see 5.4.1).
+//! The lock is the caller's: [`run`] takes it, `dp hourly` holds it and calls
+//! [`run_locked`], and [`export`] takes the held [`Lock`] as proof.
 
 #[cfg(test)]
 mod tests;
@@ -43,7 +16,7 @@ use chrono::{DateTime, Utc};
 
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::lock::{self, Lock};
-use crate::collect::snapshot::{quoted, sync_file, timestamp};
+use crate::collect::snapshot::{quoted, rename_into_place, sync_file, timestamp};
 use crate::collect::{Clock, random_suffix, temporary_name};
 use crate::config::Config;
 use crate::error::{ErrorType, Report, worst_type};
@@ -332,17 +305,10 @@ fn temporary_for(file: &Path) -> Result<PathBuf, Failure> {
 /// outlive a failure.
 fn place(file: &Path, write: impl FnOnce(&Path) -> Result<(), Failure>) -> Result<(), Failure> {
     let temporary = temporary_for(file)?;
+    let what = "an export file";
     let result = write(&temporary)
-        .and_then(|()| sync_file(&temporary))
-        .and_then(|()| {
-            std::fs::rename(&temporary, file).map_err(|e| io_failure(&e, "renaming into place"))
-        })
-        .and_then(|()| {
-            let folder = file.parent().expect("a file in a folder");
-            std::fs::File::open(folder)
-                .and_then(|folder| folder.sync_all())
-                .map_err(|e| io_failure(&e, "syncing the export folder"))
-        });
+        .and_then(|()| sync_file(&temporary, what))
+        .and_then(|()| rename_into_place(&temporary, file, what));
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }

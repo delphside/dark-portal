@@ -39,27 +39,54 @@ use crate::error::{ErrorType, Report};
 use crate::settings::collection::{POLL_INTERVAL, REGION};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::Hour;
+use lock::Lock;
 
 /// Runs `dp collect`. The report is the run's result: `Ok` where the hour is
 /// collected, now or before, and a fatal otherwise, which
 /// [`exit_status`](crate::error::exit_status) turns into the exit.
 pub fn run(config: &Config, clock: &dyn Clock, endpoints: Endpoints) -> Report {
-    run_with(config, clock, Blizzard::new(endpoints))
+    run_keeping(config, clock, endpoints).0
 }
 
+/// As [`run`], handing back the VM-wide lock where the run took it for its
+/// rename, still held: `dp hourly` keeps it through the steps after. A run
+/// that took none (the hour was collected already, or it failed before the
+/// rename) hands back `None`.
+pub fn run_keeping(
+    config: &Config,
+    clock: &dyn Clock,
+    endpoints: Endpoints,
+) -> (Report, Option<Lock>) {
+    let mut kept = None;
+    let report = run_hooked_keeping(config, clock, Blizzard::new(endpoints), &|| {}, &mut kept);
+    (report, kept)
+}
+
+#[cfg(test)]
 fn run_with(config: &Config, clock: &dyn Clock, blizzard: Blizzard) -> Report {
     run_hooked(config, clock, blizzard, &|| {})
 }
 
 /// As [`run_with`], calling `before_lock` once the snapshot is written and
 /// before the lock is taken: a test's place to play another run.
+#[cfg(test)]
 fn run_hooked(
     config: &Config,
     clock: &dyn Clock,
     blizzard: Blizzard,
     before_lock: &dyn Fn(),
 ) -> Report {
-    match collect(config, clock, &blizzard, before_lock) {
+    run_hooked_keeping(config, clock, blizzard, before_lock, &mut None)
+}
+
+fn run_hooked_keeping(
+    config: &Config,
+    clock: &dyn Clock,
+    blizzard: Blizzard,
+    before_lock: &dyn Fn(),
+    kept: &mut Option<Lock>,
+) -> Report {
+    match collect(config, clock, &blizzard, before_lock, kept) {
         Ok(report) => report,
         Err(report) => *report,
     }
@@ -83,6 +110,7 @@ fn collect(
     clock: &dyn Clock,
     blizzard: &Blizzard,
     before_lock: &dyn Fn(),
+    kept: &mut Option<Lock>,
 ) -> Result<Report, Box<Report>> {
     let hour = window::current_hour(clock.now());
     let window_end = window::window_end(hour);
@@ -155,8 +183,9 @@ fn collect(
     }
 
     before_lock();
-    // The pivot: the lock is held for the rename only.
-    let _lock = lock::acquire(&config.lock_file, LOCK_WAIT, clock).map_err(unwrap_stop)?;
+    // The pivot: the lock is held from the rename, and released where the run
+    // ends, or kept by the caller.
+    *kept = Some(lock::acquire(&config.lock_file, LOCK_WAIT, clock).map_err(unwrap_stop)?);
     if file.exists() {
         let _ = std::fs::remove_file(&temporary);
         return Ok(done("already collected"));
@@ -164,17 +193,7 @@ fn collect(
     if !written {
         return Err(Box::new(temporary_gone()));
     }
-    std::fs::rename(&temporary, &file).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Box::new(temporary_gone())
-        } else {
-            unwrap_stop(io_failure(&e, "renaming the snapshot into place"))
-        }
-    })?;
-    // The rename is durable only once its folder is.
-    File::open(&dir)
-        .and_then(|folder| folder.sync_all())
-        .map_err(|e| unwrap_stop(io_failure(&e, "syncing the bronze folder")))?;
+    snapshot::rename_into_place(&temporary, &file, "the snapshot file").map_err(unwrap_stop)?;
     // The hour is collected, so a temporary file of this hour that is not
     // this run's is left by a run that was killed, or lost the race.
     clear_stale(&dir, &hour_label, &temporary);
