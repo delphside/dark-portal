@@ -15,7 +15,7 @@ use crate::collect::failure::{Failure, io_failure};
 use crate::collect::snapshot::timestamp;
 use crate::export::{expired_hour_files, past};
 use crate::lake::{Backend, Lake, lake_failure};
-use crate::settings::storage::{DAILY_KEEP, HOURLY_KEEP, SILVER_KEEP};
+use crate::settings::storage::{DAILY_KEEP, HOURLY_KEEP, LAKE_SNAPSHOT_KEEP, SILVER_KEEP};
 use crate::transform::bronze::{hour_of, relative};
 
 /// The keeps the lake's tables are deleted by.
@@ -101,11 +101,25 @@ pub(crate) fn delete_rows(
     }
 }
 
-/// Makes the lake's files follow its rows: under DuckLake, expires the snapshots
-/// before `now`, which are the ones that still hold the deleted rows, and
-/// cleans up the files that only they held. A plain file, which tests use,
-/// has no such files. It runs every time, so a clean-up that failed is done
-/// by the next run whether or not it deleted a row.
+/// The SQL that makes DuckLake's files follow its rows: expires the snapshots
+/// older than `keep` before `now`, then cleans up the files that no snapshot
+/// holds any more. A snapshot within the keep stays, with the rows it holds
+/// that were since deleted, so a past state of the lake is queryable for the
+/// keep.
+pub(crate) fn lake_expiry_sql(now: DateTime<Utc>, keep: Duration) -> String {
+    let oldest_kept = now - ChronoDuration::from_std(keep).unwrap_or(ChronoDuration::MAX);
+    format!(
+        "CALL ducklake_expire_snapshots('{catalog}', older_than => {}); \
+         CALL ducklake_cleanup_old_files('{catalog}', cleanup_all => true);",
+        timestamp(oldest_kept),
+        catalog = crate::lake::CATALOG,
+    )
+}
+
+/// Makes the lake's files follow its rows: under DuckLake, runs
+/// [`lake_expiry_sql`] with the lake snapshot keep. A plain file, which tests
+/// use, has no such files. It runs every time, so a clean-up that failed is
+/// done by the next run whether or not it deleted a row.
 pub(crate) fn clean_up_files(
     lake: &Lake,
     backend: &Backend,
@@ -113,13 +127,7 @@ pub(crate) fn clean_up_files(
 ) -> Result<(), Failure> {
     match backend {
         Backend::DuckLake { .. } => lake.execute(
-            &format!(
-                "CALL ducklake_expire_snapshots('{}', older_than => {}); \
-                 CALL ducklake_cleanup_old_files('{}', cleanup_all => true);",
-                crate::lake::CATALOG,
-                timestamp(now),
-                crate::lake::CATALOG,
-            ),
+            &lake_expiry_sql(now, LAKE_SNAPSHOT_KEEP),
             "expiring snapshots and cleaning up the lake's files",
         ),
         Backend::PlainFile(_) => Ok(()),
@@ -189,4 +197,36 @@ pub(crate) fn delete_host_snapshots(
         remove(&entry.path(), name, &mut deleted);
     }
     Ok((deleted, waiting))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_lake_expires_only_the_snapshots_older_than_its_keep_and_then_cleans_up() {
+        let now = DateTime::parse_from_rfc3339("2026-11-21T00:50:00Z")
+            .unwrap()
+            .to_utc();
+        let sql = lake_expiry_sql(now, Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(
+            sql,
+            format!(
+                "CALL ducklake_expire_snapshots('{c}', older_than => \
+                 CAST('2026-11-14 00:50:00.000000+00' AS TIMESTAMPTZ)); \
+                 CALL ducklake_cleanup_old_files('{c}', cleanup_all => true);",
+                c = crate::lake::CATALOG
+            )
+        );
+    }
+
+    #[test]
+    fn the_setting_is_what_the_daily_expires_by() {
+        let now = DateTime::parse_from_rfc3339("2026-11-21T00:50:00Z")
+            .unwrap()
+            .to_utc();
+        assert!(
+            lake_expiry_sql(now, LAKE_SNAPSHOT_KEEP).contains("'2026-11-14 00:50:00.000000+00'")
+        );
+    }
 }

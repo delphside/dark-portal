@@ -11,17 +11,27 @@
 //! exits `3`: the next run repeats the step, since each is repeatable (a closed
 //! day is not closed again).
 //!
+//! **A day that cannot be closed stops the run** (`75`, before the pivot): a
+//! later step would work on a day the lake does not yet hold.
+//!
 //! **After the pivot**, in order, each under the lock held since the start:
 //!
 //! 1. the export, so that `item_day` in it and in the bucket holds the closed
 //!    days ([`crate::export`]);
-//! 2. the items whose latest response is a 404 asked again
-//!    ([`crate::items::fetch_ids`]); one that answers 404 again is not an error;
-//! 3. the push to the bucket, where the environment has one ([`push`]);
-//! 4. the deletions ([`expiry`]): lake rows past their keep, then the lake's
+//! 2. the push to the bucket, where the environment has one ([`push`]);
+//! 3. the deletions ([`expiry`]): lake rows past their keep, then the lake's
 //!    files, host bronze snapshots past their keep (once the bucket holds them,
 //!    where there is a bucket) and export hour files past the hourly keep;
-//! 5. the stale temporary files of bronze ([`temporary`]).
+//! 4. the stale temporary files of bronze ([`temporary`]);
+//! 5. the items whose latest response is a 404 asked again
+//!    ([`crate::items::fetch_ids`]); one that answers 404 again is not an error.
+//!
+//! **The run is bounded** so that the next hourly run's wait for the lock does
+//! not run out: [`deadline`] is the lock wait before that run starts, as the
+//! item fetch's end is. After it no push, no lake deletion and no asking again
+//! starts, and what is left is one error saying what, which the next run
+//! repeats. The close is timed against [`DAY_CLOSE_BOUND`], and a close over it
+//! is a warning, never aborted.
 
 mod close;
 mod expiry;
@@ -39,8 +49,9 @@ use crate::collect::{Clock, Endpoints};
 use crate::config::Config;
 use crate::error::{ErrorType, Report, Severity, worst_type};
 use crate::export::{self, Writer};
+use crate::items::fetch_end;
 use crate::lake::{Backend, Lake};
-use crate::settings::scheduling::LOCK_WAIT;
+use crate::settings::scheduling::{DAY_CLOSE_BOUND, LOCK_WAIT};
 use crate::settings::storage::BRONZE_KEEP_HOST_SNAPSHOTS;
 use crate::transform::fatal;
 use close::Closing;
@@ -143,16 +154,19 @@ impl Steps<'_> {
     fn run(&self) -> Result<Report, Box<Report>> {
         let config = self.config;
         let now = self.clock.now();
+        let deadline = deadline(now);
         let lake = Lake::open(self.backend, &config.data_dir.join("state/duckdb-tmp"))
             .and_then(|lake| lake.migrate(now).map(|_| lake))
             .and_then(|lake| lake.load_profiles().map(|()| lake))
             .map_err(|failure| Box::new(fatal(failure)))?;
 
-        let closed = match close::close(&lake, now, self.before_commit) {
-            Ok(Closing::Closed(days)) => days,
+        let closing = self.clock.now();
+        let (closed, expired) = match close::close(&lake, now, self.before_commit) {
+            Ok(Closing::Closed { days, expired }) => (days, expired),
             Ok(Closing::NotYet(day)) => return Err(Box::new(not_yet(day))),
             Err(failure) => return Err(Box::new(fatal(failure))),
         };
+        let close_took = crate::bound::since(self.clock, closing);
 
         // The pivot is passed: from here a failure is the step's, and the next
         // run repeats it.
@@ -166,20 +180,43 @@ impl Steps<'_> {
                 .join(","),
         );
 
+        report = report
+            .with_metadata("close_seconds", format!("{:.1}", close_took.as_secs_f64()))
+            .with_metadata(
+                "close_over_bound",
+                (close_took > DAY_CLOSE_BOUND).to_string(),
+            );
+        if close_took > DAY_CLOSE_BOUND {
+            close_over_bound(close_took).log();
+        }
+        for day in &expired {
+            day_expired(*day).log();
+        }
+        if !expired.is_empty() {
+            report = report.with_metadata(
+                "days_expired_unclosed",
+                expired
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+
         errors.extend(
             export::export_with(&lake, &config.data_dir, self.clock, self.held, self.write).errors,
         );
-        let not_found = self.ask_again(&mut errors);
-        report = report.with_metadata("items_asked_again", not_found.to_string());
-        let pushed = self.push(&mut errors);
+        let pushed = self.push(deadline, &mut errors);
         report = report.with_metadata("objects_pushed", pushed.to_string());
-        self.expire(&lake, now, &mut errors, &mut report);
+        self.expire(&lake, now, deadline, &mut errors, &mut report);
         match temporary::clear_stale(&config.data_dir, now) {
             Ok(removed) => {
                 report = report.with_metadata("temporary_files_removed", removed.to_string());
             }
             Err(failure) => errors.push(carried(failure, "clearing temporary files")),
         }
+        let not_found = self.ask_again(deadline, &mut errors);
+        report = report.with_metadata("items_asked_again", not_found.to_string());
 
         if errors.is_empty() {
             return Ok(report);
@@ -194,8 +231,13 @@ impl Steps<'_> {
         Ok(failed)
     }
 
+    /// Whether the deadline has passed.
+    fn out_of_time(&self, deadline: DateTime<Utc>) -> bool {
+        self.clock.now() >= deadline
+    }
+
     /// Asks again for each item whose latest response is a 404; how many.
-    fn ask_again(&self, errors: &mut Vec<Report>) -> usize {
+    fn ask_again(&self, deadline: DateTime<Utc>, errors: &mut Vec<Report>) -> usize {
         let ids = match crate::items::ids_not_found(&self.config.data_dir) {
             Ok(ids) => ids,
             Err(failure) => {
@@ -204,6 +246,10 @@ impl Steps<'_> {
             }
         };
         if ids.is_empty() {
+            return 0;
+        }
+        if self.out_of_time(deadline) {
+            errors.push(left_for_next_run("asking again for the items", ids.len()));
             return 0;
         }
         let mut report = crate::items::fetch_ids(
@@ -222,11 +268,16 @@ impl Steps<'_> {
     }
 
     /// Pushes to the bucket where there is one; how many objects were put.
-    fn push(&self, errors: &mut Vec<Report>) -> usize {
-        let Some(transport) = self.transport else {
+    fn push(&self, deadline: DateTime<Utc>, errors: &mut Vec<Report>) -> usize {
+        let (Some(transport), Some(bucket)) = (self.transport, self.config.bucket.as_deref())
+        else {
             return 0;
         };
-        let pushing = push::push(&self.config.data_dir, transport, self.held);
+        let within = push::Within {
+            clock: self.clock,
+            deadline,
+        };
+        let pushing = push::push(&self.config.data_dir, bucket, transport, &within, self.held);
         errors.extend(pushing.errors);
         pushing.objects
     }
@@ -236,20 +287,27 @@ impl Steps<'_> {
         &self,
         lake: &Lake,
         now: DateTime<Utc>,
+        deadline: DateTime<Utc>,
         errors: &mut Vec<Report>,
         report: &mut Report,
     ) {
         let data_dir = &self.config.data_dir;
-        match expiry::delete_rows(lake, now, &Keeps::SETTINGS) {
-            Ok(rows) => {
-                report
-                    .metadata
-                    .insert("rows_deleted".to_owned(), rows.to_string());
+        if self.out_of_time(deadline) {
+            errors.push(left_for_next_run("deleting the lake's rows and files", 1));
+        } else {
+            match expiry::delete_rows(lake, now, &Keeps::SETTINGS) {
+                Ok(rows) => {
+                    report
+                        .metadata
+                        .insert("rows_deleted".to_owned(), rows.to_string());
+                }
+                Err(failure) => {
+                    errors.push(carried(failure, "deleting the rows past their keep"));
+                }
             }
-            Err(failure) => errors.push(carried(failure, "deleting the rows past their keep")),
-        }
-        if let Err(failure) = expiry::clean_up_files(lake, self.backend, now) {
-            errors.push(carried(failure, "cleaning up the lake's files"));
+            if let Err(failure) = expiry::clean_up_files(lake, self.backend, now) {
+                errors.push(carried(failure, "cleaning up the lake's files"));
+            }
         }
 
         let mut files = 0;
@@ -264,8 +322,8 @@ impl Steps<'_> {
         }
 
         // Where there is a bucket, a snapshot is deleted once it holds it.
-        let held = if self.config.bucket.is_some() {
-            match push::pushed(data_dir) {
+        let held = if let Some(bucket) = self.config.bucket.as_deref() {
+            match push::pushed(data_dir, bucket) {
                 Ok(held) => Some(held),
                 Err(failure) => {
                     errors.push(carried(failure, "reading the record of what was pushed"));
@@ -302,6 +360,45 @@ impl Steps<'_> {
             .metadata
             .insert("files_deleted".to_owned(), files.to_string());
     }
+}
+
+/// The moment after which `dp daily`, started at `started`, starts no optional
+/// step: where the item fetch started then would end
+/// ([`fetch_end`](crate::items::fetch_end)), so the next hourly run's longest
+/// wait for the lock fits before it starts.
+pub(crate) fn deadline(started: DateTime<Utc>) -> DateTime<Utc> {
+    fetch_end(started)
+}
+
+/// What the deadline left for the next run: `count` units of `step`.
+pub(crate) fn left_for_next_run(step: &str, count: usize) -> Report {
+    Report::error(
+        ErrorType::TechnicalBlip,
+        "DAILY_LEFT_FOR_NEXT_RUN",
+        "The daily deadline came before this was done; the next run does it.",
+    )
+    .with_metadata("doing", step)
+    .with_metadata("left", count.to_string())
+    .with_metadata("why", "the daily deadline")
+}
+
+/// The close took longer than the day close bound.
+fn close_over_bound(took: std::time::Duration) -> Report {
+    Report::warning(
+        "DAY_CLOSE_OVER_BOUND",
+        "Closing the days took longer than the day close bound.",
+    )
+    .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
+    .with_metadata("bound_seconds", DAY_CLOSE_BOUND.as_secs().to_string())
+}
+
+/// A day that could be closed has no hour left to close it on.
+fn day_expired(day: chrono::NaiveDate) -> Report {
+    Report::warning(
+        "DAY_EXPIRED_UNCLOSED",
+        "A day was never closed and every hour of it is past the hourly keep; it cannot be closed.",
+    )
+    .with_metadata("day", day.to_string())
 }
 
 /// The failures of a deletion of files, as errors.

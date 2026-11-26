@@ -23,11 +23,18 @@ use crate::settings::storage::BUCKET_PUSH_TIMEOUT;
 /// Puts files in the bucket.
 pub(crate) trait Transport {
     /// Puts `file` in the bucket as `object`, a name with `/` between its
-    /// parts, replacing any object of that name. A failure's type says what
+    /// parts, replacing any object of that name. One attempt: a failure the
+    /// caller may try again after a wait (a timeout, the bucket unreachable,
+    /// a 429 or 503) is a [`Failure::Retry`], carrying the bucket's
+    /// `Retry-After` where it gave one. Otherwise a failure's type says what
     /// to do: a *blip* is the bucket or the network, *fundamental* is the
-    /// access or the file, and the rest is *unexpected*.
+    /// access ([`ACCESS_REFUSED`]) or the file, and the rest is *unexpected*.
     fn put(&self, object: &str, file: &Path) -> Result<(), Failure>;
 }
+
+/// The reason of a failure that the access is not valid, which every later
+/// object would meet.
+pub(crate) const ACCESS_REFUSED: &str = "BUCKET_ACCESS_REFUSED";
 
 /// The transport for the configured bucket: `None` where the environment has
 /// none.
@@ -94,22 +101,25 @@ impl Transport for Par {
         if (200..300).contains(&status) {
             return Ok(());
         }
-        Err(refusal(status))
+        Err(refusal(
+            status,
+            crate::collect::blizzard::retry_after(&response),
+        ))
     }
 }
 
 fn transport(error: &ureq::Error) -> Failure {
     match error {
-        ureq::Error::Timeout(_) => Failure::stop(
-            ErrorType::TechnicalBlip,
+        ureq::Error::Timeout(_) => Failure::blip(
             "BUCKET_TIMEOUT",
-            "The bucket did not answer in time; the next run pushes the file.",
+            "The bucket did not answer in time; the push tries again, and then the next run does.",
+            None,
         ),
         ureq::Error::Io(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => {
-            Failure::stop(
-                ErrorType::TechnicalBlip,
+            Failure::blip(
                 "BUCKET_UNREACHABLE",
-                "The bucket could not be reached; the next run pushes the file.",
+                "The bucket could not be reached; the push tries again, and then the next run does.",
+                None,
             )
         }
         _ => Failure::unexpected(
@@ -119,16 +129,23 @@ fn transport(error: &ureq::Error) -> Failure {
     }
 }
 
-/// Sorts an HTTP status that is not a success.
-fn refusal(status: u16) -> Failure {
+/// Sorts an HTTP status that is not a success; `after` is the `Retry-After`
+/// the bucket gave.
+fn refusal(status: u16, after: Option<Duration>) -> Failure {
     let failure = match status {
         // The access is not valid: expired, revoked or for another bucket.
         401 | 403 | 404 => Failure::stop(
             ErrorType::TechnicalFundamental,
-            "BUCKET_ACCESS_REFUSED",
+            ACCESS_REFUSED,
             "The bucket refused the push; check the bucket access in DP_BUCKET_ACCESS_FILE.",
         ),
-        408 | 429 | 500 | 502 | 503 | 504 => Failure::stop(
+        // Busy: the push asks again after the wait.
+        429 | 503 => Failure::blip(
+            "BUCKET_BUSY",
+            "The bucket answered that it is busy for now; the push tries again, and then the next run does.",
+            after,
+        ),
+        408 | 500 | 502 | 504 => Failure::stop(
             ErrorType::TechnicalBlip,
             "BUCKET_BUSY",
             "The bucket answered that it is busy or down for now; the next run pushes the file.",
@@ -168,10 +185,10 @@ mod tests {
     }
 
     fn refused(failure: Failure) -> crate::error::Report {
-        let Failure::Stop(report) = failure else {
-            panic!("expected a stop");
-        };
-        *report
+        match failure {
+            Failure::Stop(report) | Failure::Retry { report, .. } => *report,
+            other => panic!("expected a stop or a retry, got {other:?}"),
+        }
     }
 
     #[test]
@@ -204,7 +221,7 @@ mod tests {
                     .put("a/b.parquet", &file("refused", b"x"))
                     .unwrap_err(),
             );
-            assert_eq!(report.reason, "BUCKET_ACCESS_REFUSED", "{status}");
+            assert_eq!(report.reason, ACCESS_REFUSED, "{status}");
             assert_eq!(exit_status(&report), ExitStatus::Fundamental);
             assert_eq!(report.metadata["http_status"], status.to_string());
             assert!(!format!("{report:?}").contains(TOKEN));
@@ -231,6 +248,64 @@ mod tests {
         stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(418)));
         let report = refused(par(&stub).put("a.parquet", &file("odd", b"x")).unwrap_err());
         assert_eq!(report.error_type, Some(ErrorType::Unexpected));
+    }
+
+    #[test]
+    fn a_429_or_503_is_asked_again_after_the_retry_after_and_the_others_are_not() {
+        for status in [429, 503] {
+            let stub = Stub::new();
+            stub.mount(
+                Mock::given(method("PUT"))
+                    .respond_with(ResponseTemplate::new(status).insert_header("Retry-After", "7")),
+            );
+            let failure = par(&stub)
+                .put("a.parquet", &file("retry-after", b"x"))
+                .unwrap_err();
+            let Failure::Retry { report, after } = failure else {
+                panic!("{status}: expected a retry");
+            };
+            assert_eq!(after, Some(Duration::from_secs(7)), "{status}");
+            assert_eq!(report.error_type, Some(ErrorType::TechnicalBlip));
+        }
+        let stub = Stub::new();
+        stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(429)));
+        let failure = par(&stub)
+            .put("a.parquet", &file("no-retry-after", b"x"))
+            .unwrap_err();
+        assert!(matches!(failure, Failure::Retry { after: None, .. }));
+        for status in [408, 500, 502, 504] {
+            let stub = Stub::new();
+            stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(status)));
+            let failure = par(&stub)
+                .put("a.parquet", &file("no-retry", b"x"))
+                .unwrap_err();
+            assert!(matches!(failure, Failure::Stop(_)), "{status}");
+        }
+    }
+
+    #[test]
+    fn a_timeout_and_an_unreachable_bucket_are_asked_again() {
+        let nobody = Par::new(
+            Secret::new(format!("http://127.0.0.1:1/p/{TOKEN}/o/")),
+            Duration::from_secs(5),
+        );
+        let failure = nobody
+            .put("a.parquet", &file("retry-down", b"x"))
+            .unwrap_err();
+        assert!(matches!(failure, Failure::Retry { .. }), "{failure:?}");
+        let stub = Stub::new();
+        stub.mount(
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3))),
+        );
+        let slow = Par::new(
+            Secret::new(format!("{}/p/{TOKEN}/o/", stub.server.uri())),
+            Duration::from_millis(300),
+        );
+        let failure = slow
+            .put("a.parquet", &file("retry-slow", b"x"))
+            .unwrap_err();
+        assert!(matches!(failure, Failure::Retry { .. }), "{failure:?}");
     }
 
     #[test]

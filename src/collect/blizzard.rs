@@ -94,7 +94,7 @@ struct TokenResponse {
 }
 
 /// The wait a `Retry-After` of whole seconds gives.
-fn retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+pub(crate) fn retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
     let seconds = response
         .headers()
         .get("retry-after")?

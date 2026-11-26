@@ -22,10 +22,15 @@ use crate::collect::clock::FakeClock;
 use crate::collect::failure::io_failure;
 use crate::collect::snapshot::{quoted, timestamp};
 use crate::collect::test_support::{SECRET, Stub, TOKEN};
+use crate::collect::window::window_end;
 use crate::config::Secret;
 use crate::error::exit_status;
+use crate::settings::collection::{HTTP_TIMEOUT_SNAPSHOT, POLL_INTERVAL};
+use crate::settings::scheduling::DAY_CLOSE_BOUND;
 use crate::transform::MARKET;
 use crate::transform::test_support::{World, h, item_file, l};
+use crate::types::Hour;
+use chrono::Duration as ChronoDuration;
 
 /// The first `dp daily` after 2026-11-20.
 const NOW: &str = "2026-11-21T00:50:00Z";
@@ -146,14 +151,12 @@ fn nowhere() -> Endpoints {
     }
 }
 
+fn go_clock(w: &World, clock: &FakeClock, transport: Option<&dyn Transport>) -> Report {
+    run_with(&w.config, clock, nowhere(), &w.backend(), transport)
+}
+
 fn go_at(w: &World, now: &str, transport: Option<&dyn Transport>) -> Report {
-    run_with(
-        &w.config,
-        &FakeClock::at(now),
-        nowhere(),
-        &w.backend(),
-        transport,
-    )
+    go_clock(w, &FakeClock::at(now), transport)
 }
 
 fn go(w: &World) -> Report {
@@ -228,11 +231,21 @@ fn count(w: &World, sql: &str) -> i64 {
 
 // ------------------------------------------------------------ a stub bucket
 
+/// How a bucket refuses an object.
+type Refusal = Box<dyn Fn() -> Failure>;
+
 /// A bucket that keeps what is put in it, and refuses what it is told to.
 #[derive(Default)]
 struct Bucket {
     held: RefCell<Vec<(String, Vec<u8>)>>,
-    refuse: RefCell<Vec<(&'static str, ErrorType)>>,
+    refuse: RefCell<Vec<(&'static str, Refusal)>>,
+    /// Objects (by part of the name) answered with a blip that is asked again,
+    /// how many more times, and the `Retry-After` given.
+    busy: RefCell<Vec<(&'static str, u32, Option<Duration>)>>,
+    /// Every attempt, by object.
+    attempts: RefCell<Vec<String>>,
+    /// The clock each attempt moves on, and by how much.
+    takes: RefCell<Option<(std::rc::Rc<FakeClock>, Duration)>>,
 }
 
 impl Bucket {
@@ -241,28 +254,53 @@ impl Bucket {
     }
 
     fn refusing(&self, object: &'static str, error_type: ErrorType) {
-        self.refuse.borrow_mut().push((object, error_type));
+        self.refusing_with(object, move || {
+            Failure::stop(error_type, "BUCKET_REFUSED", "Refused.")
+        });
+    }
+
+    fn refusing_with(&self, object: &'static str, failure: impl Fn() -> Failure + 'static) {
+        self.refuse.borrow_mut().push((object, Box::new(failure)));
+    }
+
+    fn busy(&self, object: &'static str, times: u32, after: Option<Duration>) {
+        self.busy.borrow_mut().push((object, times, after));
+    }
+
+    fn taking(&self, clock: &std::rc::Rc<FakeClock>, each: Duration) {
+        *self.takes.borrow_mut() = Some((clock.clone(), each));
     }
 
     fn accepting(&self) {
         self.refuse.borrow_mut().clear();
+        self.busy.borrow_mut().clear();
     }
 
     fn forget(&self) {
         self.held.borrow_mut().clear();
+        self.attempts.borrow_mut().clear();
     }
 }
 
 impl Transport for Bucket {
     fn put(&self, object: &str, file: &Path) -> Result<(), Failure> {
-        let refused = self
+        self.attempts.borrow_mut().push(object.to_owned());
+        if let Some((clock, each)) = &*self.takes.borrow() {
+            clock.sleep(*each);
+        }
+        if let Some((_, failure)) = self
             .refuse
             .borrow()
             .iter()
             .find(|(part, _)| object.contains(part))
-            .map(|(_, error_type)| *error_type);
-        if let Some(error_type) = refused {
-            return Err(Failure::stop(error_type, "BUCKET_REFUSED", "Refused."));
+        {
+            return Err(failure());
+        }
+        for (part, times, after) in self.busy.borrow_mut().iter_mut() {
+            if object.contains(*part) && *times > 0 {
+                *times -= 1;
+                return Err(Failure::blip("BUCKET_BUSY", "Busy.", *after));
+            }
         }
         self.held
             .borrow_mut()
@@ -637,16 +675,19 @@ fn daily_closes_every_closable_day_not_yet_closed() {
 }
 
 #[test]
-fn a_day_older_than_the_hourly_keep_is_not_closed() {
-    // Its hours are deleted by the keep, so no row could be made of them. At
-    // 2026-12-30 the days to 2026-12-02 are past the keep, 2026-11-20 among
-    // them; 2026-12-29 is not.
+fn a_day_with_hours_left_in_the_lake_is_closed_and_one_with_none_is_warned_of() {
+    // At 2026-12-30 00:50 the oldest hour kept is 2026-12-02 00:50. The day
+    // 2026-12-02 has its 00:00 past the keep and its other hours in the lake:
+    // it is closed (expiry runs after the close). 2026-12-01 has none left: it
+    // is closable, is not closed, and is named in a warning, as is every older
+    // day. 2026-12-29 is closed as ever.
     let w = World::new("daily-too-old");
     {
         let lake = w.open();
         flat(&lake, 0..24, true);
         let market = quoted(MARKET.as_str());
         let gaps: Vec<String> = (24..24 * 39)
+            .filter(|n| !(24 * 11..24 * 13).contains(n))
             .map(|n| format!("({market}, {0}, {0})", at(n)))
             .collect();
         lake.execute(
@@ -654,14 +695,20 @@ fn a_day_older_than_the_hourly_keep_is_not_closed() {
             "seeding gaps",
         )
         .unwrap();
+        flat(&lake, 24 * 11..24 * 13, false);
         flat(&lake, 24 * 39..24 * 40, false);
     }
     let report = go_at(&w, "2026-12-30T00:50:00Z", None);
     assert_eq!(code(&report), 0, "{report:?}");
     let rows = day_rows(&w);
     assert!(only_day(rows.clone(), "2026-11-20").is_empty());
-    assert!(only_day(rows.clone(), "2026-12-02").is_empty());
+    assert!(only_day(rows.clone(), "2026-12-01").is_empty());
+    assert_eq!(only_day(rows.clone(), "2026-12-02").len(), 1);
     assert_eq!(only_day(rows, "2026-12-29").len(), 1);
+    let expired = &report.metadata["days_expired_unclosed"];
+    assert!(expired.starts_with("2026-11-20,2026-11-21,"), "{expired}");
+    assert!(expired.ends_with(",2026-12-01"), "{expired}");
+    assert!(!expired.contains("2026-12-02"), "{expired}");
 }
 
 #[test]
@@ -918,6 +965,300 @@ fn a_push_ends_where_the_bucket_cannot_be_reached_and_says_how_many_were_left() 
     // four bronze files after it are left.
     assert_eq!(report.errors[0].metadata["left"], "4");
     assert_eq!(bucket.objects(), ["daily/item_day.parquet"]);
+}
+
+fn bronze_hours(w: &World, hours: std::ops::Range<u32>) {
+    for n in hours {
+        host_file(
+            w,
+            &format!("bronze/commodities/eu/2026-11-20T{n}.parquet"),
+            b"x",
+        );
+    }
+}
+
+fn reasons(report: &Report) -> Vec<&str> {
+    report.errors.iter().map(|e| e.reason.as_str()).collect()
+}
+
+fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
+#[test]
+fn a_busy_bucket_is_asked_again_after_the_backoff_and_then_pushed() {
+    // 5.1.1 *Restarts and recovery*, 1.10 limits: the backoff doubles from
+    // its first wait, and a success resets it.
+    let mut w = world("daily-push-busy");
+    with_bucket(&mut w);
+    let bucket = Bucket::default();
+    bucket.busy("daily/item.parquet", 2, None);
+    let clock = FakeClock::at(NOW);
+    let report = go_clock(&w, &clock, Some(&bucket));
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(
+        bucket.objects(),
+        ["daily/item_day.parquet", "daily/item.parquet"]
+    );
+    assert_eq!(clock.slept(), [secs(30), secs(60)]);
+    assert_eq!(
+        bucket
+            .attempts
+            .borrow()
+            .iter()
+            .filter(|o| o.ends_with("item.parquet"))
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn a_retry_after_is_the_wait_before_the_push_asks_again() {
+    let mut w = world("daily-push-retry-after");
+    with_bucket(&mut w);
+    let bucket = Bucket::default();
+    bucket.busy("daily/item_day.parquet", 1, Some(secs(7)));
+    let clock = FakeClock::at(NOW);
+    let report = go_clock(&w, &clock, Some(&bucket));
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(clock.slept(), [secs(7)]);
+}
+
+#[test]
+fn a_bucket_still_busy_after_its_attempts_ends_the_push_and_says_how_many_were_left() {
+    // BUCKET_PUSH_ATTEMPTS attempts, then what every later object would meet.
+    let mut w = world("daily-push-busy-always");
+    with_bucket(&mut w);
+    bronze_hours(&w, 10..12);
+    let bucket = Bucket::default();
+    bucket.busy("daily/item.parquet", 99, None);
+    let report = go_clock(&w, &FakeClock::at(NOW), Some(&bucket));
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].metadata["attempts"], "3");
+    assert_eq!(report.errors[0].metadata["left"], "2");
+    assert_eq!(bucket.objects(), ["daily/item_day.parquet"]);
+    assert_eq!(bucket.attempts.borrow().len(), 4);
+}
+
+#[test]
+fn a_wait_that_would_pass_the_deadline_is_not_taken() {
+    // Started at 01:20 the deadline is 01:25: a wait of 2 minutes and then an
+    // attempt of up to 5 would end after it.
+    let mut w = world("daily-push-busy-deadline");
+    with_bucket(&mut w);
+    let bucket = Bucket::default();
+    bucket.busy("daily/item.parquet", 99, Some(secs(120)));
+    let clock = FakeClock::at("2026-11-21T01:20:00Z");
+    let report = go_clock(&w, &clock, Some(&bucket));
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert!(clock.slept().is_empty());
+    assert_eq!(report.errors[0].metadata["attempts"], "1");
+}
+
+#[test]
+fn no_object_is_started_that_cannot_end_before_the_deadline() {
+    // Started at 00:50 the deadline is 01:25 and an attempt may take 5 minutes:
+    // with each taking 15, the third starts at 01:20 and the fourth does not.
+    let mut w = world("daily-push-deadline");
+    with_bucket(&mut w);
+    bronze_hours(&w, 10..14);
+    let bucket = Bucket::default();
+    let clock = std::rc::Rc::new(FakeClock::at(NOW));
+    bucket.taking(&clock, Duration::from_secs(15 * 60));
+    let report = go_clock(&w, &clock, Some(&bucket));
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert_eq!(
+        bucket.objects(),
+        [
+            "daily/item_day.parquet",
+            "daily/item.parquet",
+            "bronze/commodities/eu/2026-11-20T10.parquet"
+        ]
+    );
+    let left: Vec<_> = report
+        .errors
+        .iter()
+        .filter(|e| e.reason == "DAILY_LEFT_FOR_NEXT_RUN")
+        .collect();
+    assert_eq!(left[0].metadata["doing"], "pushing to the bucket");
+    assert_eq!(left[0].metadata["left"], "3");
+    // The lake's deletions, started after it, are left too.
+    assert!(
+        left.iter()
+            .any(|e| e.metadata["doing"] == "deleting the lake's rows and files")
+    );
+
+    // The next run pushes the rest, and the day stays closed.
+    *bucket.takes.borrow_mut() = None;
+    bucket.forget();
+    let report = go_at(&w, "2026-11-21T01:05:00Z", Some(&bucket));
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(bucket.objects().len(), 2 + 3);
+    assert_eq!(day_rows(&w).len(), 1);
+}
+
+#[test]
+fn a_file_that_cannot_be_read_is_skipped_and_the_others_are_pushed() {
+    // 1.10: a local failure is the file's. The run still exits 3 and the next
+    // one asks for the file again.
+    let mut w = world("daily-push-local");
+    with_bucket(&mut w);
+    bronze_hours(&w, 10..14);
+    let bucket = Bucket::default();
+    bucket.refusing_with("T11.parquet", || {
+        io_failure(
+            &io::Error::from(io::ErrorKind::PermissionDenied),
+            "opening a file",
+        )
+    });
+    let report = go_at(&w, NOW, Some(&bucket));
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert_eq!(reasons(&report), ["LOCAL_IO_FAILED"]);
+    assert!(!report.errors[0].metadata.contains_key("left"));
+    let pushed = bucket.objects();
+    for n in [10, 12, 13] {
+        assert!(pushed.contains(&format!("bronze/commodities/eu/2026-11-20T{n}.parquet")));
+    }
+    assert!(!pushed.iter().any(|o| o.contains("T11")));
+
+    bucket.accepting();
+    bucket.forget();
+    let report = go_at(&w, "2026-11-21T01:05:00Z", Some(&bucket));
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert!(bucket.objects().iter().any(|o| o.contains("T11")));
+}
+
+#[test]
+fn a_refused_access_ends_the_push() {
+    let mut w = world("daily-push-access");
+    with_bucket(&mut w);
+    bronze_hours(&w, 10..14);
+    let bucket = Bucket::default();
+    bucket.refusing_with("T11.parquet", || {
+        Failure::stop(
+            ErrorType::TechnicalFundamental,
+            transport::ACCESS_REFUSED,
+            "Refused.",
+        )
+    });
+    let report = go_at(&w, NOW, Some(&bucket));
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].metadata["left"], "2");
+}
+
+#[test]
+fn what_another_bucket_was_sent_is_not_trusted_to_be_in_this_one() {
+    // The record names its bucket: one of another is read as empty, so a host
+    // snapshot is pushed to this bucket and not deleted until it is there.
+    let record = |header: &str| format!("{header}\n{OLD_SNAPSHOT}\n");
+    let mut w = world("daily-push-record");
+    with_bucket(&mut w);
+    host_file(&w, OLD_SNAPSHOT, b"old");
+    host_file(
+        &w,
+        "state/bucket-pushed.txt",
+        record("bucket: other").as_bytes(),
+    );
+    let bucket = Bucket::default();
+    bucket.refusing("2026-11-13T23", ErrorType::Unexpected);
+    let report = go_at(&w, NOW, Some(&bucket));
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert!(w.config.data_dir.join(OLD_SNAPSHOT).exists());
+    assert_eq!(report.metadata["snapshots_waiting_for_the_bucket"], "1");
+
+    // Its own record is trusted: the snapshot is not pushed again and goes.
+    let w = {
+        let mut w = world("daily-push-record-own");
+        with_bucket(&mut w);
+        host_file(&w, OLD_SNAPSHOT, b"old");
+        host_file(
+            &w,
+            "state/bucket-pushed.txt",
+            record("bucket: bucket").as_bytes(),
+        );
+        w
+    };
+    let bucket = Bucket::default();
+    let report = go_at(&w, NOW, Some(&bucket));
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert!(!bucket.objects().contains(&OLD_SNAPSHOT.to_owned()));
+    assert!(!w.config.data_dir.join(OLD_SNAPSHOT).exists());
+}
+
+#[test]
+fn a_run_past_its_deadline_starts_no_optional_step_and_says_what_it_left() {
+    // Started at 01:26 the deadline (the lock wait before the 01:35 hourly run)
+    // has passed: the day is closed and exported, and the lake's deletions
+    // and the items asked again are left for the next run.
+    let mut w = world_with_secret("daily-deadline");
+    with_bucket(&mut w);
+    items_that_answered_404(&w);
+    let past = FOUR_WEEKS_BEFORE_MIDNIGHT;
+    old_gold(&w, past - 1);
+    let stub = blizzard(&[
+        (7, ResponseTemplate::new(404)),
+        (8, ResponseTemplate::new(404)),
+    ]);
+    let bucket = Bucket::default();
+    let report = run_with(
+        &w.config,
+        &FakeClock::at("2026-11-21T01:26:00Z"),
+        stub.endpoints(),
+        &w.backend(),
+        Some(&bucket),
+    );
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert_eq!(day_rows(&w).len(), 1);
+    assert!(bucket.objects().is_empty());
+    assert_eq!(
+        reasons(&report),
+        [
+            "DAILY_LEFT_FOR_NEXT_RUN",
+            "DAILY_LEFT_FOR_NEXT_RUN",
+            "DAILY_LEFT_FOR_NEXT_RUN"
+        ]
+    );
+    assert!(item_requests(&stub).is_empty());
+    assert_eq!(
+        count(
+            &w,
+            &format!(
+                "SELECT count(*) FROM gold.item_hour WHERE hour_number(hour) < {}",
+                h(0).0
+            )
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_close_over_the_day_close_bound_is_a_warning_and_not_aborted() {
+    // The hook runs inside the close: it makes the close take longer.
+    for (took, over) in [
+        (DAY_CLOSE_BOUND, "false"),
+        (DAY_CLOSE_BOUND + secs(1), "true"),
+    ] {
+        let w = world("daily-close-bound");
+        let clock = FakeClock::at(NOW);
+        let report = run_hooked(
+            &w.config,
+            &clock,
+            nowhere(),
+            &w.backend(),
+            None,
+            &|| {
+                clock.sleep(took);
+                Ok(())
+            },
+            &export::publish,
+        );
+        assert_eq!(code(&report), 0, "{report:?}");
+        assert_eq!(report.metadata["close_over_bound"], over);
+        assert_eq!(day_rows(&w).len(), 1);
+        drop(w);
+    }
 }
 
 // ------------------------------------------------------------------ expiry
@@ -1233,9 +1574,10 @@ fn daily_exits_3_when_a_deletion_fails_and_the_next_run_repeats_it() {
 #[test]
 fn daily_clears_stale_temporary_files_and_leaves_what_a_run_may_be_writing() {
     // At 00:50: a snapshot's temporary file is stale once its hour's retry
-    // window has closed (:25 past the next hour), and left until then; an item
-    // file's once the next hourly run (:35) has started. Files that are not
-    // temporary are never touched.
+    // window has closed (:25 past the next hour) and the HTTP timeout, the
+    // lock wait and the margin have passed; an item file's once its fetch's end
+    // and the lock wait and the margin have. Files that are not temporary are
+    // never touched.
     let w = world("daily-tmp");
     let stale = [
         "bronze/commodities/eu/2026-11-20T22.parquet.1-aa.tmp",
@@ -1270,15 +1612,37 @@ fn daily_clears_stale_temporary_files_and_leaves_what_a_run_may_be_writing() {
 }
 
 #[test]
-fn a_snapshot_temporary_file_is_left_while_its_retry_window_is_open() {
-    // At 00:10 the window of hour 23:00 is open until 00:25: a collect run may
-    // be polling, with no lock.
+fn a_snapshot_temporary_file_is_left_until_its_window_the_http_timeout_and_the_lock_wait_are_past()
+{
+    // The window of hour 23:00 closes at 00:25, where a collect run may have
+    // just written and not yet taken the lock: its request can time out at
+    // 00:26, the lock wait runs to 00:36, and the margin (the poll interval)
+    // to 00:38. The rule is the settings', not these minutes.
     let w = world("daily-tmp-window");
     let name = "bronze/commodities/eu/2026-11-20T23.parquet.1-bb.tmp";
     host_file(&w, name, b"x");
-    assert_eq!(code(&go_at(&w, "2026-11-21T00:10:00Z", None)), 0);
+    let stale_at = window_end(Hour(h(23).0))
+        + ChronoDuration::from_std(HTTP_TIMEOUT_SNAPSHOT + LOCK_WAIT + POLL_INTERVAL).unwrap();
+    assert_eq!(stale_at.to_rfc3339(), "2026-11-21T00:38:00+00:00");
+    for early in ["2026-11-21T00:10:00Z", "2026-11-21T00:37:59Z"] {
+        assert_eq!(code(&go_at(&w, early, None)), 0);
+        assert!(w.config.data_dir.join(name).exists(), "{early}");
+    }
+    assert_eq!(code(&go_at(&w, "2026-11-21T00:38:01Z", None)), 0);
+    assert!(!w.config.data_dir.join(name).exists());
+}
+
+#[test]
+fn an_item_temporary_file_is_left_until_the_next_hourly_run_and_the_margin_are_past() {
+    // A run started at 23:36 fetches until 00:25 (the lock wait before the
+    // 00:35 hourly run), may wait the lock wait for the lock, and writes: the
+    // margin (the poll interval) after 00:35 is 00:37.
+    let w = world("daily-tmp-items");
+    let name = "bronze/items/2026-11-20T233600.parquet.9-dd.tmp";
+    host_file(&w, name, b"x");
+    assert_eq!(code(&go_at(&w, "2026-11-21T00:36:59Z", None)), 0);
     assert!(w.config.data_dir.join(name).exists());
-    assert_eq!(code(&go_at(&w, "2026-11-21T00:25:01Z", None)), 0);
+    assert_eq!(code(&go_at(&w, "2026-11-21T00:37:01Z", None)), 0);
     assert!(!w.config.data_dir.join(name).exists());
 }
 

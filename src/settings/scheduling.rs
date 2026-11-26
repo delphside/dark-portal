@@ -17,3 +17,7 @@ pub const DAILY_TIMER_START_HOUR_UTC: u32 = 0;
 
 /// "daily timer start": the minute of 00:50 UTC.
 pub const DAILY_TIMER_START_MINUTE: u32 = 50;
+
+/// "day close bound": 15 minutes for the close of the days in one run; a close
+/// over it is logged as a warning and is not aborted.
+pub const DAY_CLOSE_BOUND: Duration = Duration::from_secs(15 * 60);

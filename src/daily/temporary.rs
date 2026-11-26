@@ -2,34 +2,52 @@
 //!
 //! A snapshot or an item file is written under a temporary name and renamed into
 //! place, the snapshot's before the lock is taken, so a run still writing one
-//! holds no lock that this run could see. It is told by the name's time instead:
-//! a snapshot's temporary file is for an hour, and a run for it can write until
-//! the hour's retry window closes; an item run's is for the time it started, and
-//! a run can write until the next hourly run starts. Any other `*.tmp` is left
-//! by a run that is gone.
+//! holds no lock that this run could see. It is told by the name's time instead,
+//! by [`stale_after`]: a run writes until its work ends, then may wait the lock
+//! wait for the lock, then writes. A snapshot's work ends with its hour's retry
+//! window and the last request that can start in it; an item run's, with its
+//! fetch's end ([`fetch_end`]). Any other `*.tmp` is left by a run that is gone.
 
 use std::path::Path;
+use std::time::Duration;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 
 use crate::collect::bronze_dir;
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::window::window_end;
-use crate::items::{items_dir, next_hourly_start};
+use crate::items::{fetch_end, items_dir};
+use crate::settings::collection::{HTTP_TIMEOUT_SNAPSHOT, POLL_INTERVAL};
+use crate::settings::scheduling::LOCK_WAIT;
 use crate::transform::bronze::hour_of;
 
-/// The moment after which no run can still be writing the temporary file
-/// `name` in the snapshot folder, or `None` where its name says nothing.
-fn snapshot_writable_until(name: &str) -> Option<DateTime<Utc>> {
-    let (file, _) = name.split_once(".parquet.")?;
-    hour_of(&format!("{file}.parquet")).map(window_end)
+fn chrono_of(duration: Duration) -> ChronoDuration {
+    ChronoDuration::from_std(duration).unwrap_or_default()
 }
 
-/// As [`snapshot_writable_until`], for the item folder.
+/// The moment after which no run can still be writing a temporary file whose
+/// run's work ends at `work_ends`: the lock wait later, when the run has the
+/// lock at last, and the poll interval more for its write and for the clocks
+/// of two jobs. The one place the rule is.
+fn stale_after(work_ends: DateTime<Utc>) -> DateTime<Utc> {
+    work_ends + chrono_of(LOCK_WAIT) + chrono_of(POLL_INTERVAL)
+}
+
+/// The moment after which no run can still be writing the temporary file
+/// `name` in the snapshot folder, or `None` where its name says nothing: its
+/// hour's retry window closes, and a request started in it times out.
+fn snapshot_writable_until(name: &str) -> Option<DateTime<Utc>> {
+    let (file, _) = name.split_once(".parquet.")?;
+    hour_of(&format!("{file}.parquet"))
+        .map(|hour| stale_after(window_end(hour) + chrono_of(HTTP_TIMEOUT_SNAPSHOT)))
+}
+
+/// As [`snapshot_writable_until`], for the item folder: the name is the time
+/// the run started, and its fetch ends at [`fetch_end`].
 fn items_writable_until(name: &str) -> Option<DateTime<Utc>> {
     let (file, _) = name.split_once(".parquet.")?;
     let started = NaiveDateTime::parse_from_str(file, "%Y-%m-%dT%H%M%S").ok()?;
-    Some(next_hourly_start(started.and_utc()))
+    Some(stale_after(fetch_end(started.and_utc())))
 }
 
 fn clear_in(

@@ -27,3 +27,12 @@ pub const DAILY_HISTORY_BUCKET_KEEP: Option<Duration> = None;
 
 /// "bucket push timeout": 5 minutes for one object, upload included.
 pub const BUCKET_PUSH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// "bucket push attempts": 3 for one object in a run, a blip waiting between
+/// them.
+pub const BUCKET_PUSH_ATTEMPTS: u32 = 3;
+
+/// "lake snapshot keep": 7 days. `dp daily` expires the lake's DuckLake
+/// snapshots older than this, so the states of the lake within it stay
+/// queryable.
+pub const LAKE_SNAPSHOT_KEEP: Duration = Duration::from_secs(7 * DAY_SECS);

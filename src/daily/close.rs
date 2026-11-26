@@ -14,8 +14,10 @@
 //! close an older one, and the next run decides all of them again. Where the
 //! lake holds nothing that is the day's (a day with no listing in any hour) it
 //! has no row to show it closed, and each run closes it again to no rows. A day
-//! whose first hour is past the hourly keep is not closed, since its hours are
-//! gone.
+//! whose 00:00 is past the hourly keep but whose later hours are not is closed,
+//! since expiry runs after the close. A closable day whose every hour is past
+//! the hourly keep is not closed, since its hours are gone: it is reported in
+//! [`Closing::Closed`]'s `expired`.
 
 use std::collections::BTreeSet;
 
@@ -37,11 +39,24 @@ type Day = i64;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Closing {
     /// The days now closed, oldest first: none where every closable day was
-    /// closed already.
-    Closed(Vec<NaiveDate>),
+    /// closed already; and the closable days not closed because every hour of
+    /// them is past the hourly keep, oldest first.
+    Closed {
+        days: Vec<NaiveDate>,
+        expired: Vec<NaiveDate>,
+    },
     /// The day before today cannot yet be closed: this day. Nothing was
     /// changed.
     NotYet(NaiveDate),
+}
+
+impl Closing {
+    fn nothing() -> Closing {
+        Closing::Closed {
+            days: Vec::new(),
+            expired: Vec::new(),
+        }
+    }
 }
 
 fn hours_per_day() -> i64 {
@@ -86,7 +101,7 @@ pub(crate) fn close(
         "reading the processed hours",
     )?;
     let Some(&first) = processed.first() else {
-        return Ok(Closing::Closed(Vec::new()));
+        return Ok(Closing::nothing());
     };
     let gaps = numbers(
         lake,
@@ -105,15 +120,26 @@ pub(crate) fn close(
     let closable =
         |day: Day| (first.max(first_hour_of(day))..first_hour_of(day + 1)).all(accounted);
 
-    let open: Vec<Day> = (first.div_euclid(hours_per_day())..today)
-        .filter(|day| !closed.contains(day) && !past_keep(Hour(first_hour_of(*day)), now))
+    // A day has hours left unless its last is past the keep too.
+    let gone = |day: Day| past_keep(Hour(first_hour_of(day + 1) - 1), now);
+    let not_closed: Vec<Day> = (first.div_euclid(hours_per_day())..today)
+        .filter(|day| !closed.contains(day))
         .collect();
+    let (gone_days, open): (Vec<Day>, Vec<Day>) = not_closed.into_iter().partition(|d| gone(*d));
     if open.contains(&yesterday) && !closable(yesterday) {
         return Ok(Closing::NotYet(date_of(yesterday)));
     }
+    let expired: Vec<NaiveDate> = gone_days
+        .into_iter()
+        .filter(|day| closable(*day))
+        .map(date_of)
+        .collect();
     let days: Vec<Day> = open.into_iter().filter(|day| closable(*day)).collect();
     if days.is_empty() {
-        return Ok(Closing::Closed(Vec::new()));
+        return Ok(Closing::Closed {
+            days: Vec::new(),
+            expired,
+        });
     }
 
     let doing = "closing the days";
@@ -149,5 +175,8 @@ pub(crate) fn close(
         lake.rollback();
         return Err(failure);
     }
-    Ok(Closing::Closed(days.into_iter().map(date_of).collect()))
+    Ok(Closing::Closed {
+        days: days.into_iter().map(date_of).collect(),
+        expired,
+    })
 }
