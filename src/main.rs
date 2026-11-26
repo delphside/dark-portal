@@ -15,6 +15,9 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .without_time()
+        // Fixed at INFO, not read from the environment: `ureq` at TRACE logs
+        // the wire, the Authorization header with the access token in it.
+        .with_max_level(tracing::Level::INFO)
         .init();
 
     let cli = match Cli::try_parse() {

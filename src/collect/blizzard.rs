@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use ureq::Agent;
 
-use super::failure::Failure;
+use super::failure::{Failure, client_secret_refused};
 use super::token::Token;
 use crate::config::Secret;
 use crate::error::ErrorType;
@@ -96,6 +96,12 @@ fn retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> 
 
 /// A transport failure: a timeout or a broken connection is a blip.
 fn transport(error: &ureq::Error) -> Failure {
+    // Blizzard's answer kept: the transport error's own text, which names no
+    // header and no body.
+    transport_kind(error).with_metadata("transport_error", error.to_string())
+}
+
+fn transport_kind(error: &ureq::Error) -> Failure {
     match error {
         ureq::Error::Timeout(_) => {
             Failure::blip("BLIZZARD_TIMEOUT", "Blizzard did not answer in time.", None)
@@ -116,6 +122,11 @@ fn transport(error: &ureq::Error) -> Failure {
 
 /// Sorts an HTTP status that is not a success.
 fn status_failure(status: u16, after: Option<Duration>, what: &str) -> Failure {
+    // Blizzard's answer kept: its status, never a header or a body.
+    status_kind(status, after, what).with_metadata("http_status", status.to_string())
+}
+
+fn status_kind(status: u16, after: Option<Duration>, what: &str) -> Failure {
     match status {
         429 | 502 | 503 | 504 => Failure::blip(
             "BLIZZARD_BUSY",
@@ -167,11 +178,7 @@ impl Blizzard {
             .map_err(|e| transport(&e))?;
         let status = response.status().as_u16();
         if status == 401 {
-            return Err(Failure::stop(
-                ErrorType::TechnicalFundamental,
-                "CLIENT_SECRET_REFUSED",
-                "Blizzard refused the client's credentials; the client secret is wrong.",
-            ));
+            return Err(client_secret_refused().with_metadata("http_status", "401"));
         }
         if status != 200 {
             return Err(status_failure(status, retry_after(&response), "token"));

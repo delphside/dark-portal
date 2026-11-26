@@ -2,6 +2,10 @@
 //! 5.2.1 *The snapshot*, `docs/5.2.1-collection.md` sets
 //! it out.
 //!
+//! The run's pivot is the rename of the hour's file into place, under the
+//! VM-wide lock: before it nothing is kept but a temporary file named for the
+//! run, and after it the hour is collected for good.
+//!
 //! The run is [`run`]; every wait and the time go through a [`Clock`], and
 //! Blizzard's base URLs through [`Endpoints`], so a test stubs both.
 
@@ -13,8 +17,8 @@ pub mod snapshot;
 mod token;
 pub mod window;
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
-
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,7 +27,7 @@ pub use blizzard::Endpoints;
 pub use clock::{Clock, SystemClock};
 
 use blizzard::Blizzard;
-use failure::{Failure, io_failure};
+use failure::{Failure, client_secret_refused, io_failure};
 use token::{Token, TokenCache};
 
 use crate::config::Config;
@@ -112,8 +116,9 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
     let window_end = window::window_end(hour);
     let dir = bronze_dir(&config.data_dir);
     let file = dir.join(window::file_name(hour));
-    let temporary = file.with_extension("parquet.tmp");
     let hour_label = window::file_name(hour);
+    // Named for the run, so two runs in one hour never share a file.
+    let temporary = dir.join(temporary_name(&hour_label, std::process::id()));
 
     let done = |what: &str| {
         Report::ok()
@@ -140,6 +145,7 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
     // 2 to 5, until the hour is written or the retry window closes.
     let mut backoff = RETRY_BACKOFF_INITIAL;
     let mut last: Option<Report>;
+    let mut retries: u32 = 0;
     loop {
         let wait = match attempt(&mut session, hour, &temporary, clock) {
             Ok(Attempt::Written) => break,
@@ -157,6 +163,7 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
             }
             Err(Failure::Retry { report, after }) => {
                 report.log();
+                retries += 1;
                 let wait = after.map_or(backoff, |a| a.max(MIN_RETRY_AFTER));
                 backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
                 last = Some(*report);
@@ -171,7 +178,7 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
         clock.sleep(wait);
     }
 
-    // The pivot of the file: the lock is held for the rename only.
+    // The pivot: the lock is held for the rename only.
     let _lock = lock::acquire(&config.lock_file, LOCK_WAIT, clock).map_err(unwrap_stop)?;
     if file.exists() {
         let _ = std::fs::remove_file(&temporary);
@@ -179,8 +186,48 @@ fn collect(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Re
     }
     std::fs::rename(&temporary, &file)
         .map_err(|e| unwrap_stop(io_failure(&e, "renaming the snapshot into place")))?;
+    // The rename is durable only once its folder is.
+    File::open(&dir)
+        .and_then(|folder| folder.sync_all())
+        .map_err(|e| unwrap_stop(io_failure(&e, "syncing the bronze folder")))?;
+    // The hour is collected, so a temporary file of this hour that is not
+    // this run's is left by a run that was killed, or lost the race.
+    clear_stale(&dir, &hour_label, &temporary);
     tracing::info!(hour = %hour_label, "collected the snapshot");
+    if retries > 0 {
+        // A retry that cleared the blip: nothing failed, but it is for a
+        // person to look at.
+        return Ok(Report::warning(
+            "COLLECTED_AFTER_RETRIES",
+            "The hour was collected after retrying Blizzard.",
+        )
+        .with_metadata("hour", hour_label.clone())
+        .with_metadata("retries", retries.to_string()));
+    }
     Ok(done("collected"))
+}
+
+/// The temporary name of an hour's file for the run `pid`.
+fn temporary_name(hour_file: &str, pid: u32) -> String {
+    format!("{hour_file}.{pid}.tmp")
+}
+
+/// Removes the temporary files of an hour other than `own`, which are left by
+/// a run that was killed or lost the race. Called under the lock, after the
+/// hour's file is in place, so a run still writing one finds the hour
+/// collected when it takes the lock.
+fn clear_stale(dir: &Path, hour_file: &str, own: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_temporary = name.starts_with(&format!("{hour_file}.")) && name.ends_with(".tmp");
+        if is_temporary && entry.path() != own {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The retry window closed before the hour was collected: a gap, exit `75`.
@@ -218,7 +265,7 @@ fn attempt(
     clock: &dyn Clock,
 ) -> Result<Attempt, Failure> {
     let response = match request(session) {
-        Err(Failure::Refused) => return Err(secret_refused()),
+        Err(Failure::Refused) => return Err(client_secret_refused()),
         other => other?,
     };
     let fetched_at: DateTime<Utc> = clock.now();
@@ -256,14 +303,6 @@ fn attempt(
     let summary = snapshot::write_parquet(response.body, &meta, temporary)?;
     tracing::info!(rows = summary.rows, "parsed the snapshot");
     Ok(Attempt::Written)
-}
-
-fn secret_refused() -> Failure {
-    Failure::stop(
-        ErrorType::TechnicalFundamental,
-        "CLIENT_SECRET_REFUSED",
-        "Blizzard refused a new token; the client secret is wrong.",
-    )
 }
 
 /// Steps 2 and 3: the request, with a new token taken once where a cached

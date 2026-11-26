@@ -171,6 +171,21 @@ impl World {
         bronze_dir(&self.config.data_dir).join(file)
     }
 
+    /// The temporary files in bronze's folder.
+    fn temporaries(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(bronze_dir(&self.config.data_dir))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
     fn token_cache(&self) -> PathBuf {
         self.config.data_dir.join("state/blizzard-token.json")
     }
@@ -223,8 +238,9 @@ fn the_hour_is_collected_into_its_file_and_exits_0() {
     assert_eq!(exit(&report), 0, "{report:?}");
     let file = w.bronze("2026-11-26T11.parquet");
     assert_eq!(rows(&file), 3);
-    assert!(!w.bronze("2026-11-26T11.parquet.tmp").exists());
+    assert!(w.temporaries().is_empty());
     assert!(w.clock.slept().is_empty());
+    assert_eq!(report.outcome, crate::error::Severity::Ok);
 }
 
 #[test]
@@ -258,16 +274,100 @@ fn a_run_in_a_collected_hour_exits_0_and_asks_blizzard_nothing() {
 }
 
 #[test]
-fn a_stale_temporary_file_from_a_killed_run_is_overwritten() {
+fn the_temporary_file_is_named_for_the_run() {
+    assert_eq!(
+        temporary_name("2026-11-26T11.parquet", 4242),
+        "2026-11-26T11.parquet.4242.tmp"
+    );
+}
+
+#[test]
+fn another_runs_half_written_file_is_never_renamed_into_place() {
+    // Run B is part-way through its own temporary file of the same hour when
+    // run A (this one) finishes: A must publish its own file, and clear B's
+    // once the hour is in place.
+    let w = World::at("interleave", AT_1135);
+    let other = format!("2026-11-26T11.parquet.{}.tmp", std::process::id() + 1);
+    fs::create_dir_all(bronze_dir(&w.config.data_dir)).unwrap();
+    fs::write(w.bronze(&other), "run B, half written").unwrap();
+    w.stub.token_ok(5);
+    w.stub.snapshot(TOKEN, LM_11, 5);
+
+    assert_eq!(exit(&w.go()), 0);
+
+    assert_eq!(rows(&w.bronze("2026-11-26T11.parquet")), 3);
+    assert!(w.temporaries().is_empty(), "{:?}", w.temporaries());
+}
+
+#[test]
+fn clearing_stale_files_touches_only_the_hours_other_temporaries() {
+    let w = World::at("clear", AT_1135);
+    let dir = bronze_dir(&w.config.data_dir);
+    fs::create_dir_all(&dir).unwrap();
+    for name in [
+        "2026-11-26T11.parquet.1.tmp",
+        "2026-11-26T11.parquet.2.tmp",
+        "2026-11-26T10.parquet.1.tmp",
+        "2026-11-26T11.parquet",
+        "2026-11-26T11.parquet.notes",
+    ] {
+        fs::write(dir.join(name), "x").unwrap();
+    }
+
+    clear_stale(
+        &dir,
+        "2026-11-26T11.parquet",
+        &dir.join("2026-11-26T11.parquet.2.tmp"),
+    );
+
+    assert_eq!(
+        w.temporaries(),
+        ["2026-11-26T10.parquet.1.tmp", "2026-11-26T11.parquet.2.tmp"]
+    );
+    assert!(dir.join("2026-11-26T11.parquet").exists());
+    assert!(dir.join("2026-11-26T11.parquet.notes").exists());
+}
+
+#[test]
+fn a_stale_temporary_file_from_a_killed_run_is_ignored_and_cleared() {
     let w = World::at("stale", AT_1135);
     fs::create_dir_all(bronze_dir(&w.config.data_dir)).unwrap();
-    fs::write(w.bronze("2026-11-26T11.parquet.tmp"), "half a file").unwrap();
+    fs::write(w.bronze("2026-11-26T11.parquet.1.tmp"), "half a file").unwrap();
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_11, 5);
 
     assert_eq!(exit(&w.go()), 0);
     assert_eq!(rows(&w.bronze("2026-11-26T11.parquet")), 3);
-    assert!(!w.bronze("2026-11-26T11.parquet.tmp").exists());
+    assert!(w.temporaries().is_empty());
+}
+
+#[test]
+fn a_run_that_finds_the_hour_collected_at_the_lock_drops_its_own_file_only() {
+    // Run A finished while this run was parsing: this run's file goes, the
+    // hour's stays, and another run's temporary file is left to its owner.
+    let w = World::at("raced", AT_1135);
+    let dir = bronze_dir(&w.config.data_dir);
+    fs::create_dir_all(&dir).unwrap();
+    w.stub.token_ok(5);
+    // The other run finishes while this one is being answered: the responder
+    // puts the hour's file in place before the body reaches this run.
+    let final_file = w.bronze("2026-11-26T11.parquet");
+    fs::write(w.bronze("2026-11-26T11.parquet.1.tmp"), "run B's").unwrap();
+    let published = final_file.clone();
+    w.stub.mount(
+        snapshot_mock(TOKEN)
+            .respond_with(move |_: &wiremock::Request| {
+                fs::write(&published, "run A's file").unwrap();
+                ok(LM_11, BODY)
+            })
+            .up_to_n_times(5),
+    );
+
+    let report = w.go();
+
+    assert_eq!(report.metadata["result"], "already collected");
+    assert_eq!(fs::read(&final_file).unwrap(), b"run A's file");
+    assert_eq!(w.temporaries(), ["2026-11-26T11.parquet.1.tmp"]);
 }
 
 // The token
@@ -330,6 +430,7 @@ fn a_new_token_that_is_refused_is_a_fundamental_exit_2() {
     let report = w.go();
 
     assert_eq!(report.reason, "CLIENT_SECRET_REFUSED");
+    assert_eq!(report.metadata["http_status"], "401");
     assert_eq!(exit_status(&report), ExitStatus::Fundamental);
     assert_eq!(w.stub.requests("GET"), 0);
 }
@@ -494,8 +595,14 @@ fn a_blip_is_retried_with_backoff_doubling_from_30_seconds() {
     w.stub.snapshot_answer(ResponseTemplate::new(503), 3);
     w.stub.snapshot(TOKEN, LM_11, 5);
 
-    assert_eq!(exit(&w.go()), 0);
+    let report = w.go();
+
+    assert_eq!(exit(&report), 0);
     assert_eq!(w.clock.slept(), [secs(30), secs(60), secs(120)]);
+    // A retry that cleared the blip is a warning, with its count.
+    assert_eq!(report.outcome, crate::error::Severity::Warning);
+    assert_eq!(report.reason, "COLLECTED_AFTER_RETRIES");
+    assert_eq!(report.metadata["retries"], "3");
 }
 
 #[test]
@@ -566,7 +673,9 @@ fn each_blip_status_that_never_clears_ends_at_75_when_the_window_closes() {
         let report = w.go();
 
         assert_eq!(report.reason, "RETRY_WINDOW_CLOSED", "{status}");
-        assert_eq!(report.cause.as_ref().unwrap().reason, "BLIZZARD_BUSY");
+        let cause = report.cause.as_ref().unwrap();
+        assert_eq!(cause.reason, "BLIZZARD_BUSY");
+        assert_eq!(cause.metadata["http_status"], status.to_string());
         assert_eq!(exit_status(&report), ExitStatus::Blip, "{status}");
     }
 }
@@ -661,6 +770,7 @@ fn a_403_or_404_is_fundamental_exit_2() {
         let report = w.go();
 
         assert_eq!(report.reason, "BLIZZARD_REFUSED", "{status}");
+        assert_eq!(report.metadata["http_status"], status.to_string());
         assert_eq!(exit_status(&report), ExitStatus::Fundamental, "{status}");
         assert_eq!(w.stub.requests("GET"), 1, "not retried");
     }
@@ -676,6 +786,7 @@ fn a_400_a_500_or_another_status_is_unexpected_exit_70() {
         let report = w.go();
 
         assert_eq!(report.reason, "BLIZZARD_UNEXPECTED_STATUS", "{status}");
+        assert_eq!(report.metadata["http_status"], status.to_string());
         assert_eq!(exit_status(&report), ExitStatus::Unexpected, "{status}");
     }
 }

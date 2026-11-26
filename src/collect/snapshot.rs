@@ -17,7 +17,7 @@ use duckdb::{Connection, params};
 use serde::Deserializer as _;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
-use super::failure::{Failure, io_failure};
+use super::failure::{Failure, io_failure, says_disk_full};
 use crate::error::{ErrorType, Report};
 use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
 use crate::types::{AuctionId, Copper, ItemId, Listing, TimeLeft};
@@ -245,7 +245,7 @@ pub struct SnapshotMeta {
 }
 
 fn duckdb_failure(message: &str) -> Failure {
-    if message.contains("No space left") {
+    if says_disk_full(message) {
         io_failure(
             &io::Error::from(io::ErrorKind::StorageFull),
             "writing bronze",
@@ -343,6 +343,10 @@ pub fn write_parquet<R: Read>(
             quoted(&temporary.to_string_lossy()),
         ))
         .map_err(|e| duckdb_failure(&e.to_string()))?;
+    // The file is on disk before the rename that makes it the hour's.
+    std::fs::File::open(temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| io_failure(&e, "syncing the snapshot file"))?;
     Ok(summary)
 }
 
