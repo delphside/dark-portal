@@ -1465,12 +1465,19 @@ fn over_bound_after(seconds: u64, name: &str) -> Vec<(Hour, StdDuration)> {
     let w = World::new(name);
     w.snapshot(10, &[l(1, 100, 1)]);
     let lake = w.open();
-    let outcome = process_hours(&lake, &w.config.data_dir, &w.clock, &|_, at| {
-        if at == Step::Apply {
-            w.clock.sleep(StdDuration::from_secs(seconds));
-        }
-        Ok(())
-    });
+    let held = w.lock();
+    let outcome = process_hours(
+        &lake,
+        &w.config.data_dir,
+        &w.clock,
+        &|_, at| {
+            if at == Step::Apply {
+                w.clock.sleep(StdDuration::from_secs(seconds));
+            }
+            Ok(())
+        },
+        &held,
+    );
     assert!(outcome.failure.is_none());
     outcome.over_bound
 }

@@ -10,6 +10,10 @@
 //! exits `3` where there is one. An item Blizzard has no data for (404) is
 //! recorded: data, not an error.
 //!
+//! **The lock.** Run alone, the step takes it only to rename its file into place.
+//! `dp hourly` holds it already and lends it ([`run_holding`]), so the step takes
+//! none of its own.
+//!
 //! **A blip is Blizzard's state, not the item's.** A timeout, an unreachable
 //! host or a 429, 502, 503 or 504 pauses the whole fetch (the backoff, or
 //! `Retry-After`), and the item goes to the end of the queue. An item gets
@@ -44,10 +48,11 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::collect::backoff::Backoff;
 use crate::collect::blizzard::{Blizzard, ItemAnswer};
 use crate::collect::failure::{Failure, io_failure};
+use crate::collect::lock::Holding;
 use crate::collect::session::{Session, Stage, Staged};
-use crate::collect::{Clock, Endpoints, lock, random_suffix, temporary_name};
+use crate::collect::{Clock, Endpoints, random_suffix, temporary_name};
 use crate::config::Config;
-use crate::error::{ErrorType, Report, Severity};
+use crate::error::{ErrorType, Report, Severity, worst_type};
 use crate::settings::collection::{HOURLY_TIMER_START_MINUTE, HTTP_TIMEOUT_OTHER};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::{Hour, ItemId};
@@ -62,11 +67,23 @@ use crate::settings::collection::ITEM_ATTEMPTS;
 /// is left for the next run, or a fatal where bronze cannot be read or
 /// written at all.
 pub fn run(config: &Config, clock: &dyn Clock, endpoints: Endpoints) -> Report {
+    run_holding(config, clock, endpoints, Holding::Take)
+}
+
+/// As [`run`], for a caller that may hold the VM-wide lock already: `dp
+/// hourly` holds it across this step and lends it, so the step does not take
+/// it again. Standalone, the step takes it only to rename its file into place.
+pub fn run_holding(
+    config: &Config,
+    clock: &dyn Clock,
+    endpoints: Endpoints,
+    holding: Holding<'_>,
+) -> Report {
     let ids = match store::ids_to_fetch(&config.data_dir) {
         Ok(ids) => ids,
         Err(failure) => return stopped(failure),
     };
-    fetch(config, clock, &Blizzard::new(endpoints), &ids)
+    fetch(config, clock, &Blizzard::new(endpoints), &ids, holding)
 }
 
 /// The start of the next hourly run after `now`: the hourly timer start's
@@ -134,7 +151,13 @@ fn fetch_ended() -> Failure {
     )
 }
 
-fn fetch(config: &Config, clock: &dyn Clock, blizzard: &Blizzard, ids: &[ItemId]) -> Report {
+fn fetch(
+    config: &Config,
+    clock: &dyn Clock,
+    blizzard: &Blizzard,
+    ids: &[ItemId],
+    holding: Holding<'_>,
+) -> Report {
     let started = clock.now();
     if ids.is_empty() {
         return Report::ok().with_metadata("result", "no new items");
@@ -257,7 +280,7 @@ fn fetch(config: &Config, clock: &dyn Clock, blizzard: &Blizzard, ids: &[ItemId]
     let fetched = responses.rows();
     if fetched > 0 {
         let file = dir.join(&file_name);
-        if let Err(report) = publish(config, clock, &responses, &temporary, &file) {
+        if let Err(report) = publish(config, clock, &responses, &temporary, &file, holding) {
             errors.push(*report);
             errors.push(left(
                 usize::try_from(fetched).unwrap_or(usize::MAX),
@@ -281,21 +304,8 @@ fn summary(fetched: u64, not_found: u64, errors: Vec<Report>) -> Report {
             Report::ok()
         }
     } else {
-        let error_type = if errors
-            .iter()
-            .any(|e| e.error_type == Some(ErrorType::TechnicalFundamental))
-        {
-            ErrorType::TechnicalFundamental
-        } else if errors
-            .iter()
-            .any(|e| e.error_type == Some(ErrorType::Unexpected))
-        {
-            ErrorType::Unexpected
-        } else {
-            ErrorType::TechnicalBlip
-        };
         let mut report = Report::error(
-            error_type,
+            worst_type(&errors),
             "ITEMS_NOT_FETCHED",
             "Some items were not fetched; the next run fetches them.",
         );
@@ -316,8 +326,9 @@ fn publish(
     responses: &Responses,
     temporary: &Path,
     file: &Path,
+    holding: Holding<'_>,
 ) -> Result<(), Box<Report>> {
-    let result = place(config, clock, responses, temporary, file);
+    let result = place(config, clock, responses, temporary, file, holding);
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
@@ -330,9 +341,10 @@ fn place(
     responses: &Responses,
     temporary: &Path,
     file: &Path,
+    holding: Holding<'_>,
 ) -> Result<(), Failure> {
     responses.write(temporary)?;
-    let _lock = lock::acquire(&config.lock_file, LOCK_WAIT, clock)?;
+    let _lock = holding.proof(&config.lock_file, LOCK_WAIT, clock)?;
     if file.exists() {
         return Err(Failure::unexpected(
             "ITEM_FILE_EXISTS",

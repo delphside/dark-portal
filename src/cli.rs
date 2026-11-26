@@ -1,14 +1,13 @@
 //! The command line: one subcommand per job
-//! (`docs/5.1.1-architecture.md`). `collect`, `items` and `transform` are built; the others
-//! are stubs until their increments are.
+//! (`docs/5.1.1-architecture.md`). `hourly`, `collect`, `items`, `transform` and `export`
+//! are built; `daily` is a stub until its increment is.
 
 use clap::{Parser, Subcommand};
 
 use crate::collect::{self, Endpoints, SystemClock};
 use crate::config::Config;
 use crate::error::{ErrorType, Report};
-use crate::items;
-use crate::transform;
+use crate::{export, hourly, items, transform};
 
 /// The exit statuses, for `--help` (1.10, *What a script's exit status
 /// means*).
@@ -62,19 +61,19 @@ impl Command {
     }
 }
 
-/// Runs a command. `collect`, `items` and `transform` run; every other command is a stub for now: it
-/// logs that it is not built yet and stops with an *unexpected* fatal, exit
+/// Runs a command. Every command but `daily` runs; `daily` is a stub for now:
+/// it logs that it is not built yet and stops with an *unexpected* fatal, exit
 /// `70`.
 pub fn run(command: Command) -> Report {
-    if matches!(
-        command,
-        Command::Collect | Command::Items | Command::Transform
-    ) {
+    if command != Command::Daily {
         return match Config::from_env() {
             Ok(config) => match command {
+                Command::Hourly => hourly::run(&config, &SystemClock),
                 Command::Collect => collect::run(&config, &SystemClock, Endpoints::blizzard()),
                 Command::Items => items::run(&config, &SystemClock, Endpoints::blizzard()),
-                _ => transform::run(&config, &SystemClock),
+                Command::Transform => transform::run(&config, &SystemClock),
+                Command::Export => export::run(&config, &SystemClock),
+                Command::Daily => unreachable!("daily is a stub"),
             },
             Err(report) => *report,
         };
@@ -121,15 +120,28 @@ mod tests {
     }
 
     #[test]
-    fn transform_is_built_and_stops_on_a_missing_setting_as_fundamental() {
+    fn each_built_command_stops_on_a_missing_setting_as_fundamental() {
         // The test process has no DP_ settings, so the command stops at its
         // configuration, which only a built command reads.
         if std::env::var_os("DP_DATA_DIR").is_some() {
             return;
         }
-        let report = run(Command::Transform);
-        assert_ne!(report.reason, "NOT_BUILT");
-        assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+        for command in [
+            Command::Hourly,
+            Command::Collect,
+            Command::Items,
+            Command::Transform,
+            Command::Export,
+        ] {
+            let report = run(command);
+            assert_ne!(report.reason, "NOT_BUILT", "{}", command.name());
+            assert_eq!(
+                exit_status(&report),
+                ExitStatus::Fundamental,
+                "{}",
+                command.name()
+            );
+        }
     }
 
     #[test]

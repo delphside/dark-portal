@@ -144,11 +144,28 @@ impl World {
         run_with(&self.config, &self.clock, &self.backend())
     }
 
-    /// The hours alone, with no lock: what the run does between opening the
-    /// lake and reporting.
+    /// The hours alone, under a lock this takes: what the run does between
+    /// opening the lake and reporting.
     pub fn process(&self) -> Outcome {
         let lake = self.open();
-        process_hours(&lake, &self.config.data_dir, &self.clock, &|_, _| Ok(()))
+        let held = self.lock();
+        process_hours(
+            &lake,
+            &self.config.data_dir,
+            &self.clock,
+            &|_, _| Ok(()),
+            &held,
+        )
+    }
+
+    /// The VM-wide lock, taken, for a step that wants proof of it.
+    pub fn lock(&self) -> crate::collect::lock::Lock {
+        crate::collect::lock::acquire(
+            &self.config.lock_file,
+            std::time::Duration::ZERO,
+            &self.clock,
+        )
+        .unwrap()
     }
 
     /// Opens the lake and migrates it.

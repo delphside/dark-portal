@@ -17,8 +17,9 @@
 //! span is the hours since the previous held.
 //!
 //! **The lock.** The VM-wide lock is held from before the lake is opened to
-//! the end. `dp hourly` (#7) holds it across its steps and calls
-//! [`process_hours`] itself.
+//! the end. [`run`] takes it; `dp hourly` holds it across its steps and calls
+//! [`run_locked`], and [`process_hours`] takes the held [`Lock`] as proof that
+//! the caller has it, so no step takes a lock its caller holds.
 //!
 //! **Errors.** After the pivot an hour's failure is an error to `dp hourly`
 //! (exit `3`, from `dp hourly`'s own summary); `dp transform` run alone ends
@@ -35,13 +36,13 @@
 //! **The reference table** is [`reference::rebuild`]: its own step, once a run,
 //! after the hours.
 
-mod bronze;
+pub(crate) mod bronze;
 #[cfg(test)]
 mod gold_tests;
 mod hour;
 pub mod reference;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 mod vocabulary;
@@ -50,6 +51,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::collect::failure::Failure;
+use crate::collect::lock::Lock;
 use crate::collect::{Clock, lock};
 use crate::config::Config;
 use crate::error::{ErrorType, Report, Severity};
@@ -85,11 +87,24 @@ pub(crate) fn run_hooked(
     backend: &Backend,
     hook: hour::Hook,
 ) -> Report {
-    let _lock = match lock::acquire(&config.lock_file, LOCK_WAIT, clock) {
+    let held = match lock::acquire(&config.lock_file, LOCK_WAIT, clock) {
         Ok(lock) => lock,
         Err(failure) => return fatal(failure),
     };
-    match open_and_process(config, clock, backend, hook) {
+    run_locked(config, clock, backend, hook, &held)
+}
+
+/// As [`run_with`], for a caller that holds the VM-wide lock already (`dp
+/// hourly`): it opens the lake, applies the migrations and processes the hours
+/// without taking the lock again.
+pub(crate) fn run_locked(
+    config: &Config,
+    clock: &dyn Clock,
+    backend: &Backend,
+    hook: hour::Hook,
+    held: &Lock,
+) -> Report {
+    match open_and_process(config, clock, backend, hook, held) {
         Ok(report) => report,
         Err(report) => *report,
     }
@@ -100,11 +115,12 @@ fn open_and_process(
     clock: &dyn Clock,
     backend: &Backend,
     hook: hour::Hook,
+    held: &Lock,
 ) -> Result<Report, Box<Report>> {
     let lake =
         Lake::open(backend, &config.data_dir.join("state/duckdb-tmp")).map_err(into_fatal)?;
     lake.migrate(clock.now()).map_err(into_fatal)?;
-    let outcome = process_hours(&lake, &config.data_dir, clock, hook);
+    let outcome = process_hours(&lake, &config.data_dir, clock, hook, held);
     for (warning, id) in &outcome.warnings {
         Report::warning(warning.code(), warning.message())
             .with_metadata("id", id.to_string())
@@ -121,7 +137,7 @@ fn into_fatal(failure: Failure) -> Box<Report> {
 }
 
 /// A failure as the fatal that stops the run.
-fn fatal(failure: Failure) -> Report {
+pub(crate) fn fatal(failure: Failure) -> Report {
     let mut report = match failure {
         Failure::Stop(report) => *report,
         Failure::Retry { report, .. } => *report,
@@ -155,8 +171,8 @@ pub struct Outcome {
 
 /// [`process_hours`] with no hook: the lake is open, and the caller holds the
 /// lock.
-pub fn catch_up(lake: &Lake, data_dir: &Path, clock: &dyn Clock) -> Outcome {
-    process_hours(lake, data_dir, clock, &|_, _| Ok(()))
+pub fn catch_up(lake: &Lake, data_dir: &Path, clock: &dyn Clock, held: &Lock) -> Outcome {
+    process_hours(lake, data_dir, clock, &|_, _| Ok(()), held)
 }
 
 /// The high-water mark: the latest hour processed for the market. The
@@ -177,9 +193,16 @@ pub fn high_water_mark(lake: &Lake) -> Result<Option<Hour>, Failure> {
 }
 
 /// Processes every bronze hour after the high-water mark, in order, each as
-/// one transaction, stopping at the first that fails. The lake is open, its
-/// migrations are applied and the lock is held: all the caller's.
-pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour::Hook) -> Outcome {
+/// one transaction, stopping at the first that fails. The lake is open and its
+/// migrations are applied: the caller's. `_held` is the caller's proof that it
+/// holds the lock.
+pub fn process_hours(
+    lake: &Lake,
+    data_dir: &Path,
+    clock: &dyn Clock,
+    hook: hour::Hook,
+    _held: &Lock,
+) -> Outcome {
     let mut outcome = Outcome {
         hours: Vec::new(),
         warnings: Vec::new(),
@@ -247,7 +270,7 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
 
 /// Whether a failure is *technical, fundamental*: the operator's to fix, and
 /// so one that more work in the same run would meet again.
-fn is_fundamental(failure: &Failure) -> bool {
+pub(crate) fn is_fundamental(failure: &Failure) -> bool {
     matches!(failure, Failure::Stop(report)
         if report.error_type == Some(ErrorType::TechnicalFundamental))
 }

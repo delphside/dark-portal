@@ -118,7 +118,7 @@ impl World {
             },
         );
         let ids = ids_to_fetch(&self.config.data_dir).unwrap();
-        fetch(&self.config, &self.clock, &blizzard, &ids)
+        fetch(&self.config, &self.clock, &blizzard, &ids, Holding::Take)
     }
 
     /// A snapshot file with a listing of each item, written by the collector's

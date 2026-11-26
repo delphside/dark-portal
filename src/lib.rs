@@ -3,12 +3,15 @@
 //!
 //! The data types, the settings, the error scheme and the command line are the
 //! skeleton; [`collect`] is `dp collect`, [`items`] is `dp items`, and
-//! [`transform`] is `dp transform`, over the [`lake`].
+//! [`transform`] is `dp transform`, over the [`lake`]; [`export`] is `dp export`
+//! and [`hourly`] is `dp hourly`, which runs them all.
 
 pub mod cli;
 pub mod collect;
 pub mod config;
 pub mod error;
+pub mod export;
+pub mod hourly;
 pub mod items;
 pub mod lake;
 pub mod settings;

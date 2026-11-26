@@ -20,6 +20,43 @@ pub struct Lock {
     _file: File,
 }
 
+/// How a step that writes under the lock comes by it: it takes it itself, or
+/// its caller (`dp hourly`) holds it already and lends it. A second handle on
+/// the lock file blocks while the first is held, so a step never takes what
+/// its caller holds.
+#[derive(Debug, Clone, Copy)]
+pub enum Holding<'a> {
+    /// The step takes the lock when it writes, and releases it after.
+    Take,
+    /// The caller holds this lock for the whole step.
+    Held(&'a Lock),
+}
+
+/// The lock, as a step has it from [`Holding::proof`]: its own, released on
+/// drop, or its caller's.
+#[derive(Debug)]
+pub enum Proof<'a> {
+    /// Taken by the step.
+    Taken(Lock),
+    /// Lent by the caller.
+    Lent(&'a Lock),
+}
+
+impl<'a> Holding<'a> {
+    /// The lock, taken now (waiting up to `wait`) or the one lent.
+    pub fn proof(
+        self,
+        path: &Path,
+        wait: Duration,
+        clock: &dyn Clock,
+    ) -> Result<Proof<'a>, Failure> {
+        match self {
+            Holding::Take => acquire(path, wait, clock).map(Proof::Taken),
+            Holding::Held(lock) => Ok(Proof::Lent(lock)),
+        }
+    }
+}
+
 /// Takes the lock, waiting up to `wait`; a lock still held then is a
 /// *technical, blip*, exit `75`.
 pub fn acquire(path: &Path, wait: Duration, clock: &dyn Clock) -> Result<Lock, Failure> {
@@ -82,6 +119,31 @@ mod tests {
         assert_eq!(exit_status(&report), ExitStatus::Blip);
         let waited: Duration = clock.slept().iter().sum();
         assert_eq!(waited, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_lent_lock_is_not_taken_again_and_a_taken_one_is_released_on_drop() {
+        let path = temp("lent");
+        let clock = FakeClock::at("2026-11-26T11:40:00Z");
+        let held = acquire(&path, Duration::ZERO, &clock).unwrap();
+        // Lent: no second handle is opened, so nothing waits.
+        let lent = Holding::Held(&held)
+            .proof(&path, Duration::from_secs(600), &clock)
+            .unwrap();
+        assert!(matches!(lent, Proof::Lent(_)));
+        assert!(clock.slept().is_empty());
+        // Take, while the lock is held, waits out the wait.
+        assert!(
+            Holding::Take
+                .proof(&path, Duration::from_secs(3), &clock)
+                .is_err()
+        );
+        drop(held);
+        let taken = Holding::Take.proof(&path, Duration::ZERO, &clock).unwrap();
+        assert!(matches!(taken, Proof::Taken(_)));
+        assert!(acquire(&path, Duration::ZERO, &clock).is_err());
+        drop(taken);
+        assert!(acquire(&path, Duration::ZERO, &clock).is_ok());
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub(crate) mod backoff;
 pub mod blizzard;
 pub mod clock;
 pub(crate) mod failure;
-pub(crate) mod lock;
+pub mod lock;
 pub(crate) mod session;
 pub mod snapshot;
 #[cfg(test)]

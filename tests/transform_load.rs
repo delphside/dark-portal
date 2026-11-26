@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use chrono::DateTime;
 use dp::collect::SystemClock;
+use dp::collect::lock;
 use dp::collect::window::file_name;
 use dp::config::{Config, Secret};
 use dp::lake::{Backend, Lake};
@@ -99,11 +100,12 @@ fn one_hour_of_300_000_listings_against_a_populated_silver() {
     let lake = Lake::open(&backend, &dir.join("tmp")).unwrap();
     lake.migrate(chrono::Utc::now()).unwrap();
 
+    let held = lock::acquire(&config.lock_file, Duration::ZERO, &clock).unwrap();
     let primed = primed();
     for k in 0..primed {
         write_hour(&config, Hour(first.0 + k as i64), k);
         let started = Instant::now();
-        let outcome = catch_up(&lake, &config.data_dir, &clock);
+        let outcome = catch_up(&lake, &config.data_dir, &clock, &held);
         assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
         eprintln!(
             "priming hour {k}: {:.1} s; events {}, ended {}",
@@ -127,7 +129,7 @@ fn one_hour_of_300_000_listings_against_a_populated_silver() {
         })
     };
     let started = Instant::now();
-    let outcome = catch_up(&lake, &config.data_dir, &clock);
+    let outcome = catch_up(&lake, &config.data_dir, &clock, &held);
     let took = started.elapsed();
     done.store(true, Ordering::Relaxed);
     sampler.join().unwrap();

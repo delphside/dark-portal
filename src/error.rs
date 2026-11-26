@@ -254,6 +254,20 @@ impl std::error::Error for Report {
     }
 }
 
+/// The type a report that carries several failures takes: the one that most
+/// needs the operator, *fundamental* before *unexpected* before *blip*. Where
+/// none carries a type, it is a blip.
+pub fn worst_type(errors: &[Report]) -> ErrorType {
+    let has = |wanted| errors.iter().any(|e| e.error_type == Some(wanted));
+    if has(ErrorType::TechnicalFundamental) {
+        ErrorType::TechnicalFundamental
+    } else if has(ErrorType::Unexpected) {
+        ErrorType::Unexpected
+    } else {
+        ErrorType::TechnicalBlip
+    }
+}
+
 /// What a run exits with: 1.10's table of exit statuses, the ones `dp` uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExitStatus {
@@ -341,6 +355,27 @@ mod tests {
         assert_eq!(fatal(ErrorType::TechnicalFundamental), 2);
         assert_eq!(fatal(ErrorType::TechnicalBlip), 75);
         assert_eq!(fatal(ErrorType::Unexpected), 70);
+    }
+
+    #[test]
+    fn a_report_of_several_failures_takes_the_worst_type() {
+        let e = |t| Report::error(t, "X", "x");
+        let blip = e(ErrorType::TechnicalBlip);
+        let unexpected = e(ErrorType::Unexpected);
+        let fundamental = e(ErrorType::TechnicalFundamental);
+        assert_eq!(worst_type(&[]), ErrorType::TechnicalBlip);
+        assert_eq!(
+            worst_type(std::slice::from_ref(&blip)),
+            ErrorType::TechnicalBlip
+        );
+        assert_eq!(
+            worst_type(&[blip.clone(), unexpected.clone()]),
+            ErrorType::Unexpected
+        );
+        assert_eq!(
+            worst_type(&[unexpected, blip, fundamental]),
+            ErrorType::TechnicalFundamental
+        );
     }
 
     #[test]

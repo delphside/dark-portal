@@ -441,8 +441,9 @@ mod tests {
                     Err(Failure::unexpected("INJECTED", "x"))
                 }
             };
+            let held = w.lock();
             let outcome =
-                crate::transform::process_hours(&lake, &w.config.data_dir, &w.clock, &fail);
+                crate::transform::process_hours(&lake, &w.config.data_dir, &w.clock, &fail, &held);
             assert!(outcome.failure.is_some());
             assert_eq!(
                 !reference(&lake).is_empty(),
