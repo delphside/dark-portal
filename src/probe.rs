@@ -62,7 +62,7 @@ fn probe(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Repo
     let now = clock.now();
     let previous = Hour(Hour::containing(now).0 - 1);
     let file = bronze_dir(&config.data_dir).join(window::file_name(previous));
-    let hour_label = window::file_name(previous);
+    let hour_label = window::hour_text(previous);
     let report = Report::ok().with_metadata("hour", hour_label.clone());
 
     let connection = Connection::open_in_memory()
@@ -248,7 +248,7 @@ mod tests {
             warning.metadata["latest_last_modified"],
             "2026-11-20T12:01:10+00:00"
         );
-        assert_eq!(warning.metadata["hour"], "2026-11-20T11.parquet");
+        assert_eq!(warning.metadata["hour"], "2026-11-20T11");
     }
 
     #[test]
@@ -503,7 +503,7 @@ mod tests {
         let report = probe_at(&w, &stub);
         assert_eq!(report.metadata["warnings"], "REFRESH_MORE_OFTEN");
         assert_eq!(report.warnings.len(), 1);
-        assert_eq!(report.warnings[0].metadata["hour"], "2026-11-20T11.parquet");
+        assert_eq!(report.warnings[0].metadata["hour"], "2026-11-20T11");
     }
 
     #[test]
@@ -522,6 +522,26 @@ mod tests {
         assert_eq!(std::fs::read(&cache).unwrap(), b"a cached token");
         assert_eq!(everything(&w.config.data_dir), before);
         assert_eq!(stub.requests("POST"), 1, "a token of its own");
+    }
+
+    #[test]
+    fn a_probe_that_ran_ends_with_its_total_seconds_on_the_final_line() {
+        // D48.9: the job's total is on the report the process logs last.
+        let (w, stub) = world("total");
+        mount(&stub, modified("2026-11-20T12:01:10Z"));
+        let clock = FakeClock::at(AT_1205);
+        let blizzard = Blizzard::new(stub.endpoints());
+
+        let (report, log) = crate::test_support::logging(|| {
+            let report = crate::bound::totalled(&clock, || run_with(&w.config, &clock, &blizzard));
+            report.log();
+            report
+        });
+
+        assert_eq!(report.reason, "REFRESH_MORE_OFTEN");
+        assert!(report.metadata.contains_key("total_seconds"), "{report:?}");
+        let last = log.lines().rev().find(|l| !l.trim().is_empty()).unwrap();
+        assert!(last.contains("total_seconds"), "{last}");
     }
 
     /// Every file under `dir`, with its size.

@@ -128,6 +128,7 @@ fn collect(
     let dir = bronze_dir(&config.data_dir);
     let file = dir.join(window::file_name(hour));
     let hour_label = window::file_name(hour);
+    let hour_text = window::hour_text(hour);
     // Named for the run (its pid, which is not unique across containers, and
     // a random suffix), so two runs in one hour never share a file.
     let temporary = dir.join(temporary_name(
@@ -138,7 +139,7 @@ fn collect(
 
     let done = |what: &str| {
         Report::ok()
-            .with_metadata("hour", hour_label.clone())
+            .with_metadata("hour", hour_text.clone())
             .with_metadata("result", what)
     };
 
@@ -183,7 +184,7 @@ fn collect(
                         "SNAPSHOT_NOT_REFRESHED",
                         "Blizzard's snapshot is still from before the current hour.",
                     )
-                    .with_metadata("hour", hour_label.clone()),
+                    .with_metadata("hour", hour_text.clone()),
                 );
                 POLL_INTERVAL
             }
@@ -198,7 +199,7 @@ fn collect(
             Err(Failure::Refused) => unreachable!("a refusal is handled in the attempt"),
         };
         if clock.now() + wait >= window_end {
-            return Err(Box::new(window_closed(&hour_label, last)));
+            return Err(Box::new(window_closed(&hour_text, last)));
         }
         clock.sleep(wait);
     }
@@ -234,7 +235,7 @@ fn collect(
                 "COLLECTED_AFTER_RETRIES",
                 "The hour was collected after retrying Blizzard.",
             )
-            .with_metadata("hour", hour_label.clone())
+            .with_metadata("hour", hour_text.clone())
             .with_metadata("retries", retries.to_string()),
         );
         report = report.with_metadata("retries", retries.to_string());
@@ -243,10 +244,10 @@ fn collect(
         let past = refresh_past_hour(snapshot.last_modified);
         report = report.with_metadata("refresh_past_hour", clock_text(past));
         if !refresh_as_expected(past) {
-            warnings.push(refresh_time_moved(&hour_label, past));
+            warnings.push(refresh_time_moved(&hour_text, past));
         }
         if !snapshot.unknown_fields.is_empty() {
-            warnings.push(field_new(&hour_label, &snapshot.unknown_fields));
+            warnings.push(field_new(&hour_text, &snapshot.unknown_fields));
         }
     }
     for warning in &warnings {

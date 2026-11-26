@@ -1114,7 +1114,7 @@ fn unknown_listing_field_is_logged_by_name() {
         panic!("one warning: {report:?}");
     };
     assert_eq!(warning.metadata["fields"], "buyout,item.bonus");
-    assert_eq!(warning.metadata["hour"], "2026-11-26T11.parquet");
+    assert_eq!(warning.metadata["hour"], "2026-11-26T11");
     assert_eq!(log.matches("SNAPSHOT_FIELD_NEW").count(), 1, "{log}");
     assert!(log.contains("WARN"), "{log}");
 }
@@ -1173,10 +1173,7 @@ fn a_change_that_lasts_repeats_its_warning_every_hour() {
             ["REFRESH_TIME_MOVED", "SNAPSHOT_FIELD_NEW"],
             "{hour}"
         );
-        assert_eq!(
-            report.warnings[0].metadata["hour"],
-            format!("{hour}.parquet")
-        );
+        assert_eq!(report.warnings[0].metadata["hour"], hour);
     }
 }
 
@@ -1223,6 +1220,10 @@ fn a_decimal_or_minus_zero_in_a_listing_makes_the_hour_a_gap() {
         let (w, report) = collecting(name, LM_11, &snapshot_of(&[listing(1), second]));
         assert_eq!(report.reason, "SNAPSHOT_VALUE_UNEXPECTED", "{name}");
         assert_eq!(report.metadata["field"], field, "{name}");
+        assert_eq!(
+            report.metadata["value"], json,
+            "{name}: as Blizzard wrote it"
+        );
         assert_eq!(exit(&report), 70, "{name}");
         assert!(!w.bronze("2026-11-26T11.parquet").exists(), "{name}");
     }

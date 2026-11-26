@@ -6,10 +6,12 @@
 //! `auctions` to a sink as it is read, so what the parser holds does not grow
 //! with the snapshot.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
+use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use duckdb::{Connection, params};
@@ -92,7 +94,62 @@ enum Problem {
     Value { field: String, value: String },
 }
 
+/// The last bytes read from the body, so a number can be quoted as Blizzard
+/// wrote it: the parser hands over a decimal, or a whole number beyond 64
+/// bits, as a double, which no longer has its digits. The reader is asked for
+/// one byte at a time, so the number is the tail of what it has given, less
+/// the delimiter the parser has peeked at.
+#[derive(Clone, Default)]
+struct Recent(Rc<RefCell<VecDeque<u8>>>);
+
+impl Recent {
+    fn push(&self, bytes: &[u8]) {
+        let mut seen = self.0.borrow_mut();
+        for byte in bytes {
+            if seen.len() == RECENT_BYTES {
+                seen.pop_front();
+            }
+            seen.push_back(*byte);
+        }
+    }
+
+    /// The number the parser has just read: the last run of number
+    /// characters, past at most one delimiter.
+    fn number(&self) -> String {
+        let seen = self.0.borrow();
+        let is_number =
+            |b: &u8| b.is_ascii_digit() || matches!(b, b'-' | b'+' | b'.' | b'e' | b'E');
+        let mut bytes: Vec<u8> = seen
+            .iter()
+            .rev()
+            .skip_while(|b| !is_number(b))
+            .take_while(|b| is_number(b))
+            .copied()
+            .collect();
+        bytes.reverse();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// What a reader gives is also noted in a [`Recent`].
+struct Noting<R> {
+    inner: R,
+    recent: Recent,
+}
+
+impl<R: Read> Read for Noting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.recent.push(&buf[..read]);
+        Ok(read)
+    }
+}
+
+/// How many of the last bytes are kept: more than any number worth quoting.
+const RECENT_BYTES: usize = 1024;
+
 struct State<'a> {
+    recent: Recent,
     sink: Sink<'a>,
     summary: ParseSummary,
     sink_error: Option<String>,
@@ -107,7 +164,7 @@ struct State<'a> {
 enum Scalar {
     Unsigned(u64),
     Negative(i64),
-    Decimal(f64),
+    Decimal,
     Text(String),
     /// A boolean, null, array or object where a scalar was needed.
     Other,
@@ -132,8 +189,8 @@ impl<'de> de::Deserialize<'de> for Scalar {
                     Scalar::Negative(v)
                 })
             }
-            fn visit_f64<E>(self, v: f64) -> Result<Scalar, E> {
-                Ok(Scalar::Decimal(v))
+            fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
+                Ok(Scalar::Decimal)
             }
             fn visit_str<E>(self, v: &str) -> Result<Scalar, E> {
                 Ok(Scalar::Text(v.to_owned()))
@@ -196,7 +253,11 @@ impl State<'_> {
             Scalar::Unsigned(v) if (least..=most).contains(&v) => Ok(v),
             Scalar::Unsigned(v) => Err(self.unexpected_value(field, &v.to_string())),
             Scalar::Negative(v) => Err(self.unexpected_value(field, &v.to_string())),
-            Scalar::Decimal(v) => Err(self.unexpected_value(field, &v.to_string())),
+            // A double has lost its digits: quote what Blizzard wrote.
+            Scalar::Decimal => {
+                let written = self.recent.number();
+                Err(self.unexpected_value(field, &written))
+            }
             Scalar::Text(_) | Scalar::Other => {
                 self.misshapen(field);
                 Err(de::Error::custom("not a number"))
@@ -385,15 +446,19 @@ pub fn parse_listings<R: Read>(
     reader: R,
     sink: &mut dyn FnMut(Listing) -> Result<(), String>,
 ) -> Result<ParseSummary, ParseError> {
+    let recent = Recent::default();
     let mut state = State {
+        recent: recent.clone(),
         sink,
         summary: ParseSummary::default(),
         sink_error: None,
         problem: None,
         saw_auctions: false,
     };
-    let mut deserializer =
-        serde_json::Deserializer::from_reader(BufReader::with_capacity(64 * 1024, reader));
+    let mut deserializer = serde_json::Deserializer::from_reader(Noting {
+        inner: BufReader::with_capacity(64 * 1024, reader),
+        recent,
+    });
     let result = deserializer
         .deserialize_map(RootVisitor(&mut state))
         .and_then(|()| deserializer.end());
@@ -779,7 +844,7 @@ mod tests {
             ("quantity", "0", "0"),
             ("unit_price", "-3", "-3"),
             ("unit_price", "2.25", "2.25"),
-            ("unit_price", "18446744073709551616", "18446744073709552000"),
+            ("unit_price", "18446744073709551616", "18446744073709551616"),
             ("unit_price", "0", "0"),
             ("id", "-1", "-1"),
             ("id", "0.5", "0.5"),
@@ -845,7 +910,7 @@ mod tests {
         ] {
             let (result, _) = collect(&listing_with(field, json));
             assert!(
-                matches!(&result, Err(ParseError::Value { field: f, listings: 1, .. }) if f == field),
+                matches!(&result, Err(ParseError::Value { field: f, value, listings: 1 }) if f == field && value == json),
                 "{field} {json}: {result:?}"
             );
         }
@@ -1037,13 +1102,29 @@ mod tests {
             };
             assert_eq!(value, shown);
         }
-        // A 70-digit number is quoted as it is read, cut at 64 characters.
+        // A 70-digit number is quoted as Blizzard wrote it, cut at 64.
         let digits = "9".repeat(70);
-        let (result, _) = collect(&listing_with("quantity", &digits));
-        let Err(ParseError::Value { value, .. }) = result else {
-            panic!("expected an unexpected value");
-        };
-        assert_eq!(value.chars().count(), QUOTED_VALUE_MAX);
+        for (field, written, shown) in [
+            ("quantity", digits.clone(), "9".repeat(64)),
+            ("unit_price", "-0".to_owned(), "-0".to_owned()),
+            ("quantity", "1E+3".to_owned(), "1E+3".to_owned()),
+            (
+                "quantity",
+                format!("-{digits}"),
+                format!("-{}", "9".repeat(63)),
+            ),
+            (
+                "quantity",
+                format!("0.{}", "1".repeat(80)),
+                format!("0.{}", "1".repeat(62)),
+            ),
+        ] {
+            let (result, _) = collect(&listing_with(field, &written));
+            let Err(ParseError::Value { value, .. }) = result else {
+                panic!("{written}: expected an unexpected value");
+            };
+            assert_eq!(value, shown);
+        }
     }
 
     #[test]
