@@ -852,3 +852,20 @@ fn a_file_that_vanished_with_no_hour_in_place_is_fundamental_exit_2() {
     assert_eq!(report.reason, "TEMPORARY_FILE_GONE");
     assert_eq!(exit(&report), 2);
 }
+
+// DuckDB out of memory writing the bronze file (X4, D28.9)
+
+#[test]
+fn bronze_write_failure_in_collect_is_unexpected_exit_70_out_of_memory_included() {
+    let w = World::at("oom", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot(TOKEN, LM_11, 5);
+
+    let report = crate::lake::starved::under(crate::lake::starved::TINY, || w.go());
+
+    assert_eq!(report.reason, "BRONZE_WRITE_FAILED", "{report:?}");
+    assert_eq!(report.error_type, Some(ErrorType::Unexpected));
+    assert_eq!(exit(&report), 70);
+    assert!(!w.bronze("2026-11-26T11.parquet").exists());
+    assert!(w.temporaries().is_empty(), "{:?}", w.temporaries());
+}

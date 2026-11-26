@@ -206,6 +206,11 @@ impl World {
         .unwrap()
     }
 
+    /// Opens the lake as it is, with no migration.
+    pub fn open_unmigrated(&self) -> Lake {
+        Lake::open(&self.backend(), &self.dir.join("tmp")).unwrap()
+    }
+
     /// Opens the lake and migrates it.
     pub fn open(&self) -> Lake {
         let lake = Lake::open(&self.backend(), &self.dir.join("tmp")).unwrap();

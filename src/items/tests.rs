@@ -1095,3 +1095,83 @@ fn a_snapshots_folder_that_cannot_be_read_is_fundamental_not_empty() {
     assert_eq!(report.reason, "LOCAL_IO_FAILED");
     assert_eq!(exit_status(&report), ExitStatus::Fundamental);
 }
+
+// DuckDB out of memory in the item files (X4, X5, D28.10)
+
+/// A world with two items to fetch, both answering 200.
+fn two_items(name: &str) -> World {
+    let w = World::at(name, START);
+    w.snapshot("2026-11-26T11", &[10, 11]);
+    w.stub.token_ok(5);
+    w.stub.item_ok(10);
+    w.stub.item_ok(11);
+    w
+}
+
+#[test]
+fn items_failing_to_open_its_store_for_the_responses_exits_70() {
+    // Before the first request: DuckDB cannot be set up to hold the responses (a
+    // setting it refuses is a failure of its own, and not a full disk).
+    let w = two_items("oom-store");
+    let ids = ids_to_fetch(&w.config.data_dir).unwrap();
+    let report = crate::lake::starved::under("not-a-size", || {
+        fetch(
+            &w.config,
+            &w.clock,
+            &Blizzard::new(w.stub.endpoints()),
+            &ids,
+            Holding::Take,
+        )
+    });
+    assert_eq!(report.reason, "BRONZE_WRITE_FAILED", "{report:?}");
+    assert_eq!(report.outcome, Severity::Fatal);
+    assert_eq!(exit(&report), 70);
+    assert_eq!(w.stub.requests("GET") + w.stub.requests("POST"), 0);
+    assert!(w.item_files().is_empty());
+}
+
+#[test]
+fn items_bronze_write_failure_after_the_first_request_is_a_carried_error_exit_3() {
+    // The store opens, then DuckDB cannot keep a response: an error the step
+    // carries on past, and the items it could not write are fetched next run.
+    let w = two_items("oom-after");
+    let ids = ids_to_fetch(&w.config.data_dir).unwrap();
+    let report = crate::lake::starved::under(crate::lake::starved::TINY, || {
+        fetch(
+            &w.config,
+            &w.clock,
+            &Blizzard::new(w.stub.endpoints()),
+            &ids,
+            Holding::Take,
+        )
+    });
+    assert_eq!(exit(&report), 3, "{report:?}");
+    assert_eq!(report.outcome, Severity::Error);
+    assert_eq!(report.errors[0].reason, "BRONZE_WRITE_FAILED", "{report:?}");
+    assert!(w.stub.requests("GET") >= 1);
+    assert!(w.item_files().is_empty());
+    assert_eq!(
+        ids_to_fetch(&w.config.data_dir).unwrap(),
+        [ItemId(10), ItemId(11)],
+        "the next run fetches them"
+    );
+}
+
+#[test]
+fn items_bronze_read_failure_before_the_first_request_exits_70() {
+    // X4, D28.11, D14.14: DuckDB cannot read bronze's snapshot files, so the
+    // step stops before its first request, unexpected, exit 70.
+    let w = World::at("read-failure", START);
+    let dir = w.config.data_dir.join("bronze/commodities/eu");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("2026-11-26T11.parquet"), "not parquet").unwrap();
+    w.stub.token_ok(5);
+
+    let report = w.go();
+
+    assert_eq!(report.reason, "BRONZE_READ_FAILED", "{report:?}");
+    assert_eq!(report.outcome, Severity::Fatal);
+    assert_eq!(exit(&report), 70);
+    assert_eq!(w.stub.requests("GET") + w.stub.requests("POST"), 0);
+    assert!(w.item_files().is_empty());
+}

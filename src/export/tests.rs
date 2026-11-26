@@ -667,3 +667,172 @@ fn a_fundamental_failure_writing_an_hour_stops_the_later_hours() {
     assert!(outcome.rewritten.is_empty(), "{:?}", outcome.rewritten);
     assert!(!hour_file(&w.config.data_dir, "item_hour", h(12)).exists());
 }
+
+// ------------------------------------------------- DuckDB out of memory (X3, X5)
+
+/// Every file under the export, by name.
+fn written(w: &World) -> Vec<String> {
+    if export_folder(w).exists() {
+        names(w)
+    } else {
+        Vec::new()
+    }
+}
+
+/// A lake that is migrated and holds no hour, in a world with no export.
+fn empty_lake(name: &str) -> World {
+    let w = World::new(name);
+    drop(w.open());
+    w
+}
+
+/// Makes the read of `table` fail with DuckDB's own out-of-memory error, as a
+/// view that raises it: lowering an open connection's limit is refused by
+/// DuckDB whenever it holds more than the new limit, so the error would depend
+/// on what the connection happens to hold. `columns` are the view's, as SQL
+/// select items, the first of which raises. DuckDB prefixes the raised text
+/// ("Invalid Input Error: Out of Memory Error: …"), so this relies on the
+/// recogniser finding the text anywhere in the message.
+fn failing_to_read(lake: &Lake, table: &str, columns: &str) {
+    lake.execute(
+        &format!("DROP TABLE {table}; CREATE VIEW {table} AS SELECT {columns};"),
+        "making the read fail",
+    )
+    .unwrap();
+}
+
+#[test]
+fn export_out_of_memory_opening_the_lake_exits_2_when_run_alone() {
+    // D28.7, X3: out of memory in migrating the lake, or in opening a lake that
+    // is there, is fundamental: exit 2, and nothing is written.
+    let fresh = World::new("export-oom-migrating");
+    let report = crate::lake::starved::under(crate::lake::starved::TINY, || export_it(&fresh));
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+    assert!(written(&fresh).is_empty());
+
+    let held = world("export-oom-opening");
+    let report = crate::lake::starved::under(crate::lake::starved::TINY, || export_it(&held));
+    // Attaching the existing file is what runs out.
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental, "{report:#?}");
+    assert!(written(&held).is_empty());
+}
+
+#[test]
+fn export_run_alone_exits_by_its_errors_type_when_the_lake_fails_to_open() {
+    // D28.13, X3, X4: a lake that cannot be opened is 2; a failure of the lake
+    // while opening or migrating it that is not a full disk or no memory is
+    // `LAKE_FAILED`, 70. Never 3, which is for an error carried on past.
+    let w = World::new("export-no-lake");
+    let report = run_with(
+        &w.config,
+        &w.clock,
+        &crate::lake::Backend::PlainFile("/nonexistent-dir/lake.duckdb".into()),
+    );
+    assert_eq!(report.reason, "LAKE_UNAVAILABLE", "{report:#?}");
+    assert_eq!(exit_status(&report).code(), 2);
+
+    // A lake whose migration record is not what dp wrote: migrating fails.
+    let w = World::new("export-lake-failed");
+    {
+        let lake = w.open_unmigrated();
+        lake.execute(
+            "CREATE SCHEMA meta; CREATE TABLE meta.migration (not_a_version INTEGER);",
+            "damaging the lake",
+        )
+        .unwrap();
+    }
+    let report = export_it(&w);
+    assert_eq!(report.reason, "LAKE_FAILED", "{report:#?}");
+    assert_eq!(report.outcome, Severity::Fatal);
+    assert_eq!(exit_status(&report).code(), 70);
+    assert!(written(&w).is_empty());
+}
+
+#[test]
+fn export_out_of_memory_reading_the_committed_hours_is_an_error_for_no_hour() {
+    // D28.7, X5: DuckDB runs out of memory reading `meta.processed`: an error
+    // the export carries, for no hour, and no file is written.
+    let w = world("export-oom-reading");
+    let lake = w.open();
+    let held = w.lock();
+    failing_to_read(
+        &lake,
+        "meta.processed",
+        "'eu-commodities' AS market, \
+         CAST(error('Out of Memory Error: failed to pin block') AS TIMESTAMPTZ) AS hour",
+    );
+    let outcome = export_with(&lake, &w.config.data_dir, &w.clock, &held, &publish);
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert_eq!(outcome.errors[0].reason, "OUT_OF_MEMORY");
+    assert_eq!(outcome.errors[0].metadata["doing"], "reading the hours");
+    assert!(!outcome.errors[0].metadata.contains_key("hour"));
+    let report = outcome.into_report();
+    assert_eq!(
+        exit_status(&report),
+        ExitStatus::CompletedWithErrors,
+        "{report:#?}"
+    );
+    assert_eq!(report.metadata["hours"], "0");
+    assert!(written(&w).is_empty(), "{:?}", written(&w));
+}
+
+#[test]
+fn export_out_of_memory_rewriting_item_day_stops_the_export_before_item_and_profiles_sql() {
+    // D28.7, X5: with no hour to write, the first file is item_day.parquet; its
+    // failure is the export's, and the files after it are not tried.
+    let w = empty_lake("export-oom-item-day");
+    let lake = w.open();
+    let held = w.lock();
+    failing_to_read(
+        &lake,
+        "gold.item_day",
+        "CAST(error('Out of Memory Error: failed to pin block') AS INTEGER) AS item",
+    );
+    let outcome = export_with(&lake, &w.config.data_dir, &w.clock, &held, &publish);
+    assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+    assert_eq!(outcome.errors[0].reason, "OUT_OF_MEMORY");
+    assert_eq!(outcome.errors[0].metadata["file"], "item_day.parquet");
+    assert!(outcome.rewritten.is_empty());
+    assert!(written(&w).is_empty(), "{:?}", written(&w));
+    assert_eq!(
+        exit_status(&outcome.into_report()),
+        ExitStatus::CompletedWithErrors
+    );
+}
+
+#[test]
+fn export_out_of_memory_writing_an_hour_is_an_error_for_that_hour_and_stops_the_export() {
+    // D28.7, X5: the first hour's file is the one that fails; no later hour and
+    // no other file is written, and the run exits 3.
+    let w = world("export-oom-hour");
+    {
+        let lake = w.open();
+        let held = w.lock();
+        // The limit is taken back at the first write, when DuckDB holds the
+        // hours' list: it refuses to go that low with memory in use, which is
+        // the same out-of-memory error, as is the write itself were it taken.
+        let write = |lake: &Lake, file: &Path, select: &str| {
+            lake.execute(
+                &format!("SET memory_limit='{}';", crate::lake::starved::TINY),
+                "taking the memory back",
+            )?;
+            publish(lake, file, select)
+        };
+        let outcome = export_with(&lake, &w.config.data_dir, &w.clock, &held, &write);
+        assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        assert_eq!(outcome.errors[0].reason, "OUT_OF_MEMORY");
+        assert_eq!(outcome.errors[0].metadata["hour"], "2026-11-20T10");
+        assert!(outcome.hours.is_empty() && outcome.rewritten.is_empty());
+        let report = outcome.into_report();
+        assert_eq!(exit_status(&report), ExitStatus::CompletedWithErrors);
+        assert_eq!(report.metadata["hours"], "0");
+    }
+    assert!(written(&w).is_empty(), "{:?}", written(&w));
+
+    // The next run, with the memory back, writes everything.
+    let repaired = export_it(&w);
+    assert_eq!(repaired.outcome, Severity::Ok, "{repaired:#?}");
+    assert_eq!(repaired.metadata["hours"], "3");
+}

@@ -839,6 +839,97 @@ mod tests {
     }
 
     #[test]
+    fn profile_shows_units_listed_and_the_units_the_fill_price_covers() {
+        // P11, P3: the units listed are the item's, and the units the fill
+        // price covers are the default N's where that many are listed, and all
+        // that are listed where fewer are.
+        let (lake, _dir) = lake("profile-units");
+        let mut rows = series(1, 0..31, 5);
+        rows.extend(series(2, 0..31, 8));
+        insert_hours(&lake, &rows);
+        // Item 1 lists 10 units (the seed's), 3 at 100 and 7 at 110; item 2
+        // lists 2, at 100.
+        insert_levels(&lake, 1, 30, &[(100, 3), (110, 7)]);
+        insert_levels(&lake, 2, 30, &[(100, 2)]);
+        lake.execute(
+            &format!(
+                "UPDATE gold.item_hour SET units_listed = 2 WHERE item = 2 AND hour = {}",
+                at(30)
+            ),
+            "listing fewer",
+        )
+        .unwrap();
+        /// Item, units listed, default N, fill price and the units it covers.
+        type UnitsRow = (u32, u64, u32, Option<String>, Option<u64>);
+        let rows: Vec<UnitsRow> = lake
+            .connection()
+            .prepare(
+                "SELECT item, units_listed, default_n, CAST(fill_price AS VARCHAR), fill_units \
+                 FROM profile ORDER BY item",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                // 5 units: 3 at 100 and 2 at 110, 520 / 5.
+                (1, 10, 5, Some("104.00".to_owned()), Some(5)),
+                // 8 asked for, 2 listed: all of them, saying 2.
+                (2, 2, 8, Some("100.00".to_owned()), Some(2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn items_filter_by_name_class_and_subclass() {
+        // P1: the profile has a column each for the name, the class and the
+        // subclass, and a client's filter on each finds the right items; an
+        // item with no response has its ID for a name and no class.
+        let (lake, _dir) = lake("profile-filter");
+        for item in 1..=4 {
+            insert_hours(&lake, &series(item, 0..3, 1));
+        }
+        lake.execute(
+            "INSERT INTO reference.item VALUES \
+             (1, 'Flask of Power', 'Consumable', 'Flask', 0, NULL, NULL, now()), \
+             (2, 'Linen Cloth', 'Tradeskill', 'Cloth', 0, NULL, NULL, now()), \
+             (3, 'Healing Potion', 'Consumable', 'Potion', 0, NULL, NULL, now())",
+            "seeding reference",
+        )
+        .unwrap();
+        let found = |filter: &str| -> Vec<u32> {
+            lake.connection()
+                .prepare(&format!(
+                    "SELECT item FROM profile WHERE {filter} ORDER BY item"
+                ))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(found("name = 'Linen Cloth'"), [2]);
+        assert_eq!(found("name LIKE '%Po%'"), [1, 3]);
+        assert_eq!(found("class = 'Consumable'"), [1, 3]);
+        assert_eq!(found("class = 'Tradeskill'"), [2]);
+        assert_eq!(found("subclass = 'Potion'"), [3]);
+        assert_eq!(found("class = 'Consumable' AND subclass = 'Flask'"), [1]);
+        assert_eq!(
+            found("class = 'Tradeskill' AND subclass = 'Potion'"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(found("name = 'No Such Item'"), Vec::<u32>::new());
+        // No response yet: the ID is the name and the class is unknown.
+        assert_eq!(found("name = '4'"), [4]);
+        assert_eq!(found("class IS NULL"), [4]);
+    }
+
+    #[test]
     fn the_histories_name_an_item_by_its_id_until_it_has_a_reference() {
         let (lake, _dir) = lake("histories");
         insert_hours(&lake, &series(1, 0..2, 1));

@@ -15,6 +15,7 @@ use crate::collect::failure::Failure;
 use crate::collect::test_support::{SECRET, Stub, TOKEN, http_date};
 use crate::config::Secret;
 use crate::error::ErrorType;
+use crate::test_support::{files_holding, logging};
 use crate::transform::test_support::{World, h, item_file, l};
 
 fn fatal(error_type: ErrorType) -> Report {
@@ -593,4 +594,141 @@ fn a_rerun_of_the_real_steps_does_nothing_and_exits_0() {
     );
     let second = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
     assert_eq!(code(&second), 0, "{second:?}");
+}
+
+#[test]
+fn hourly_carries_an_out_of_memory_step_as_exit_3() {
+    // X5, D28.8, H0: where the transform, or the export, runs out of memory
+    // under `dp hourly`, that step fails with its fundamental error and the run
+    // exits 3 (the exit it would have had alone is 2), the other steps having
+    // run.
+    for failing in ["transform", "export"] {
+        let w = World::new(&format!("hourly-oom-{failing}"));
+        w.snapshot(10, &[l(1, 100, 5)]);
+        if failing == "transform" {
+            // A lake already made, so the memory runs out in the hour.
+            drop(w.open());
+        }
+        let limit = if failing == "transform" {
+            crate::lake::starved::AFTER_OPENING
+        } else {
+            crate::lake::starved::TINY
+        };
+        let times = HourTimes::default();
+        let ran = RefCell::new(Vec::new());
+        let steps = Steps {
+            collect: &|| (Report::ok(), None),
+            items: &|_| {
+                ran.borrow_mut().push("items");
+                Report::ok()
+            },
+            transform: &|held| {
+                ran.borrow_mut().push("transform");
+                if failing == "transform" {
+                    crate::lake::starved::under(limit, || {
+                        crate::transform::run_locked(
+                            &w.config,
+                            &w.clock,
+                            &w.backend(),
+                            &|_, _| Ok(()),
+                            held,
+                            &times,
+                        )
+                    })
+                } else {
+                    Report::ok()
+                }
+            },
+            export: &|held| {
+                ran.borrow_mut().push("export");
+                if failing == "export" {
+                    crate::lake::starved::under(limit, || {
+                        crate::export::run_locked(&w.config, &w.clock, &w.backend(), held, &times)
+                    })
+                } else {
+                    Report::ok()
+                }
+            },
+        };
+        let report = run_steps(&w.config, &w.clock, &steps);
+        assert_eq!(code(&report), 3, "{failing}: {report:#?}");
+        assert_eq!(ran.into_inner(), ["items", "transform", "export"]);
+        assert_eq!(report.errors.len(), 1, "{failing}: {report:#?}");
+        assert_eq!(report.errors[0].reason, "OUT_OF_MEMORY", "{failing}");
+        assert_eq!(report.errors[0].metadata["step"], failing);
+        assert_eq!(
+            report.errors[0].error_type,
+            Some(ErrorType::TechnicalFundamental)
+        );
+        assert_eq!(report.metadata[&format!("step_{failing}")], "OUT_OF_MEMORY");
+    }
+}
+
+#[test]
+fn hourly_with_the_lock_held_past_the_wait_reports_only_collect_seconds_and_the_total() {
+    // TM, D35.4: collect ran, took no lock, and the lock stayed held past the
+    // wait: the steps after it never ran, so they have no key (never null or
+    // 0), and the total is the whole run, the wait included.
+    let w = World::new("hourly-lock-timings");
+    let _held = lock::acquire(&w.config.lock_file, Duration::ZERO, &w.clock).unwrap();
+    let report = bound::totalled(&w.clock, || {
+        run_stubs(
+            &w,
+            Report::ok(),
+            &[Report::ok(), Report::ok(), Report::ok()],
+        )
+        .1
+    });
+    assert_eq!(code(&report), 75, "{report:#?}");
+    for step in ["items", "transform", "export"] {
+        assert!(
+            !report.metadata.contains_key(&format!("{step}_seconds")),
+            "{step}: {report:#?}"
+        );
+    }
+    assert_eq!(report.metadata["collect_seconds"], "0.0");
+    assert_eq!(
+        report.metadata["total_seconds"],
+        bound::seconds(LOCK_WAIT),
+        "{report:#?}"
+    );
+    let keys: Vec<&str> = report
+        .metadata
+        .keys()
+        .map(String::as_str)
+        .filter(|key| key.ends_with("_seconds"))
+        .collect();
+    assert_eq!(keys, ["collect_seconds", "total_seconds"]);
+}
+
+#[test]
+fn secret_never_appears_in_logs_bronze_or_export() {
+    // SEC, O44: the client secret is read from its file and used to ask for a
+    // token; after a whole hour (collect, items, transform, export) and a day's
+    // export it is in no log line, no report and no file of bronze or the
+    // export. The scan finds what is there (the item's name), so it can find
+    // what should not be.
+    let (w, stub) = blizzard_world("hourly-secret");
+    let (report, log) = logging(|| {
+        let report = run_with(&w.config, &w.clock, || stub.endpoints(), &w.backend());
+        report.log();
+        report
+    });
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert!(log.contains("took a new Blizzard access token"), "{log}");
+    let data = &w.config.data_dir;
+    assert!(!files_holding(&data.join("bronze"), "Flask").is_empty());
+    assert!(!files_holding(&data.join("export"), "Flask").is_empty());
+    for hidden in [SECRET, TOKEN] {
+        assert!(!log.contains(hidden), "{hidden} in the log");
+        assert!(!format!("{report:?}").contains(hidden));
+        assert_eq!(
+            files_holding(&data.join("bronze"), hidden),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            files_holding(&data.join("export"), hidden),
+            Vec::<PathBuf>::new()
+        );
+    }
 }

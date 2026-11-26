@@ -1594,3 +1594,207 @@ fn the_transform_sql_uses_only_what_ducklake_supports() {
         }
     }
 }
+
+// ------------------------------------------------------- the exit, run alone
+
+/// A world with hour 10 in bronze and a lake that is already migrated, so a
+/// run's failure is in its hour and not in the lake's opening.
+fn world_with_a_migrated_lake(name: &str) -> World {
+    let w = World::new(name);
+    w.snapshot(10, &[l(1, 100, 1)]);
+    drop(w.open());
+    w
+}
+
+#[test]
+fn transform_out_of_memory_exits_2_when_run_alone() {
+    // X3, D28.6: DuckDB really runs out of memory under the job's limit, in
+    // the work after the lake is opened; the run stops on a fundamental error,
+    // exit 2, and the hour is not committed.
+    let w = world_with_a_migrated_lake("oom-alone");
+    let report = crate::lake::starved::under(crate::lake::starved::AFTER_OPENING, || w.run());
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(report.error_type, Some(ErrorType::TechnicalFundamental));
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+    assert_eq!(mark(&w.open()), None, "no hour is committed");
+}
+
+#[test]
+fn transform_out_of_memory_in_migrating_the_lake_exits_2_when_run_alone() {
+    // X3: the same before any hour, on a lake that is still to be migrated.
+    let w = World::new("oom-migrating");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let report = crate::lake::starved::under(crate::lake::starved::TINY, || w.run());
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+}
+
+#[test]
+fn transform_run_alone_exits_by_its_errors_type_and_never_3() {
+    // D28.12, X3, X4, H2: the lock held past the wait 75; the lake
+    // unavailable, a full disk or no memory 2; a failure of the lake or an
+    // unexpected one in an hour 70. A run alone has no pivot, so never 3.
+    let fails = |failure: fn() -> Failure| {
+        let w = world_with_a_migrated_lake("exit-by-type");
+        run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+            if at == Step::Apply {
+                Err(failure())
+            } else {
+                Ok(())
+            }
+        })
+    };
+    /// What a case is called, the failure it injects, the reason and the exit.
+    type Case = (&'static str, fn() -> Failure, &'static str, u8);
+    let cases: [Case; 4] = [
+        (
+            "out of memory",
+            || crate::lake::out_of_memory("Out of Memory Error: x", "injected"),
+            "OUT_OF_MEMORY",
+            2,
+        ),
+        (
+            "a full disk",
+            || {
+                crate::collect::failure::io_failure(
+                    &std::io::Error::from(std::io::ErrorKind::StorageFull),
+                    "injected",
+                )
+            },
+            "DISK_FULL",
+            2,
+        ),
+        (
+            "a failure of the lake",
+            || lake_failure("Binder Error: no such column", "injected"),
+            "LAKE_FAILED",
+            70,
+        ),
+        (
+            "an unexpected failure in the hour",
+            || Failure::unexpected("INJECTED", "x"),
+            "INJECTED",
+            70,
+        ),
+    ];
+    for (what, failure, reason, status) in cases {
+        let report = fails(failure);
+        assert_eq!(exit_status(&report).code(), status, "{what}: {report:#?}");
+        assert_eq!(report.outcome, Severity::Fatal, "{what}");
+        assert_eq!(report.reason, reason, "{what}");
+    }
+    let w = world_with_a_migrated_lake("exit-by-type-lock");
+    let _held = w.lock();
+    assert_eq!(exit_status(&w.run()).code(), 75);
+}
+
+// ------------------------------------------------- the price of a sale (EV-2, EV-7)
+
+#[test]
+fn quantity_drop_at_a_changed_price_is_a_sale_at_the_new_price() {
+    // TD-M, D1.7, EV-7: 802 goes from 120 x 3 to 125 x 2 behind intact
+    // listings: a sale of the 1 unit the quantity dropped by, priced at the
+    // 125 it is listed at now, and a warning names it. 800's quantity rose and
+    // 801's price changed: kept, no event, each named in a warning.
+    let w = World::new("td-m");
+    let live = |c: &[L]| c.iter().map(|x| x.item(1)).collect::<Vec<_>>();
+    let before = live(&[l(800, 100, 5), l(801, 110, 4), l(802, 120, 3)]);
+    w.snapshot(9, &before);
+    w.snapshot(10, &before);
+    w.snapshot(11, &live(&[l(800, 100, 7), l(801, 115, 4), l(802, 125, 2)]));
+    let outcome = w.process();
+    assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+    let lake = w.open();
+    let at_11 = events_at(&lake, 11);
+    assert_eq!(at_11.len(), 1, "{at_11:#?}");
+    assert_eq!(
+        at_11[0],
+        Event {
+            unit_price: Copper(125),
+            ..event(h(11), 802, EventKind::PartlySold, 1, 1)
+        }
+    );
+    assert_eq!(live_by_id(&lake, 802).unit_price, 125);
+    assert!(
+        outcome
+            .warnings
+            .contains(&(HourWarning::SaleBehindIntact, 802)),
+        "{:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome.warnings.contains(&(HourWarning::QuantityRose, 800)),
+        "{:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome.warnings.contains(&(HourWarning::PriceChanged, 801)),
+        "{:?}",
+        outcome.warnings
+    );
+}
+
+fn live_by_id(lake: &Lake, id: u64) -> Live {
+    live(lake).into_iter().find(|l| l.id == id).unwrap()
+}
+
+#[test]
+fn partly_sold_event_is_priced_at_the_listings_current_price() {
+    // EV-2: the drop is priced at the listing's price in the snapshot that
+    // showed it, not the price it was first seen at: 1 is reduced and
+    // re-priced, 2 is reduced at the price it had.
+    let w = World::new("ev2-price");
+    replay(
+        &w,
+        &[
+            (9, vec![l(1, 100, 10), l(2, 200, 6)]),
+            (10, vec![l(1, 110, 7), l(2, 200, 4)]),
+        ],
+    );
+    let lake = w.open();
+    let at_10 = events_at(&lake, 10);
+    let priced = |id: u64| {
+        let event = only(&at_10, id);
+        (event.kind, event.units, event.unit_price)
+    };
+    assert_eq!(priced(1), (EventKind::PartlySold, 3, Copper(110)));
+    assert_eq!(priced(2), (EventKind::PartlySold, 2, Copper(200)));
+}
+
+// ------------------------------------------------- the latest hour (H3)
+
+#[test]
+fn latest_hour_not_yet_collected_is_no_gap() {
+    // H3, D17.5: the hours held are 10 and 11 and hour 12 is not yet collected:
+    // with no later snapshot it is no gap. Once hour 13 is held, a later run
+    // finds 12 missing and records it, found at that run's time.
+    let w = World::new("not-yet-collected");
+    replay(&w, &[(10, vec![l(1, 100, 1)]), (11, vec![l(1, 100, 1)])]);
+    let lake = w.open();
+    assert_eq!(gaps(&lake), Vec::<Hour>::new());
+    assert_eq!(mark(&lake), Some(h(11)));
+    drop(lake);
+
+    // A run again with still nothing newer is no more of a gap.
+    w.clock.sleep(StdDuration::from_secs(3600));
+    assert_eq!(w.run().outcome, Severity::Ok);
+    assert_eq!(gaps(&w.open()), Vec::<Hour>::new());
+
+    w.snapshot(13, &[l(1, 100, 1)]);
+    w.clock.sleep(StdDuration::from_secs(3600));
+    let found_at = w.clock.now();
+    assert_eq!(w.run().outcome, Severity::Ok);
+    let lake = w.open();
+    assert_eq!(gaps(&lake), [h(12)]);
+    assert_eq!(processed(&lake).last(), Some(&(h(13), Some(2))));
+    let recorded: String = lake
+        .connection()
+        .query_row("SELECT CAST(found_at AS VARCHAR) FROM meta.gap", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        recorded,
+        found_at.format("%Y-%m-%d %H:%M:%S+00").to_string()
+    );
+}

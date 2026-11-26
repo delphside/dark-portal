@@ -30,7 +30,7 @@ use crate::settings::scheduling::{
     DAILY_AFTER_CLOSE_ALLOWANCE, DAILY_RETRY_INTERVAL, DAILY_RUN_TIME_LIMIT, DAY_CLOSE_BOUND,
     TEMPORARY_FILE_MARGIN,
 };
-use crate::test_support::logging;
+use crate::test_support::{files_holding, logging};
 use crate::transform::MARKET;
 use crate::transform::test_support::{World, h, item_file, l};
 use crate::types::Hour;
@@ -2092,6 +2092,71 @@ fn daily_pushes_through_the_bucket_transport_and_never_names_the_access() {
     assert!(!format!("{report:?}").contains("par-secret"));
 }
 
+#[test]
+fn bucket_access_url_never_appears_in_logs_bronze_or_the_export() {
+    // SEC, D33.9, O44: the bucket's pre-authenticated URL is a secret read from
+    // its file. Pushed to, refused by and failing, the bucket leaves it in no
+    // log line, no report, no file of bronze or the export, and not the record
+    // of what was pushed.
+    let secret = "par-secret";
+    let mut w = world("daily-par-never");
+    let snapshot = host_file(&w, KEPT_SNAPSHOT, b"");
+    // A real Parquet file, so the scan can read its rows.
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT 1 AS id) TO {} (FORMAT parquet)",
+            quoted(&snapshot.to_string_lossy())
+        ))
+        .unwrap();
+    let stub = Stub::new();
+    stub.mount(
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/p/par-secret/o/daily/item\.parquet$"))
+            .respond_with(ResponseTemplate::new(503)),
+    );
+    stub.mount(
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/p/par-secret/o/bronze/.*"))
+            .respond_with(ResponseTemplate::new(500)),
+    );
+    stub.mount(Mock::given(method("PUT")).respond_with(ResponseTemplate::new(200)));
+    w.config.bucket = Some("bucket".to_owned());
+    w.config.bucket_access = Some(Secret::new(format!("{}/p/{secret}/o/", stub.server.uri())));
+    let par = transport::from_config(&w.config).unwrap();
+    let mut seen = String::new();
+    for now in [NOW, "2026-11-21T00:55:00Z"] {
+        let (report, log) = logging(|| {
+            let report = go_at(&w, now, Some(par.as_ref()));
+            report.log();
+            report
+        });
+        seen.push_str(&format!("{report:?}\n{log}"));
+    }
+    let puts = stub
+        .runtime
+        .block_on(stub.server.received_requests())
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .count();
+    assert!(puts >= 3, "the bucket was used: {puts}");
+    assert!(seen.contains("BUCKET"), "the failures were logged: {seen}");
+    let address = stub.server.uri();
+    for hidden in [secret, address.as_str()] {
+        assert!(!seen.contains(hidden), "{hidden} in a report or the log");
+        for folder in ["bronze", "export", "state"] {
+            assert_eq!(
+                files_holding(&w.config.data_dir.join(folder), hidden),
+                Vec::<PathBuf>::new(),
+                "{hidden} in {folder}"
+            );
+        }
+    }
+    // The scan finds what is there.
+    assert!(!files_holding(&w.config.data_dir.join("state"), "bucket").is_empty());
+}
+
 // ------------------------------------------------------------ the retries
 
 /// A report exiting `75`, as a lock held past the wait does.
@@ -2439,4 +2504,463 @@ fn daily_removes_a_spill_folder_a_dead_run_left_and_not_one_a_job_may_be_using()
     assert!(!other_container.exists());
     assert!(live.join("duckdb_temp_storage-1.tmp").exists());
     assert_eq!(report.metadata["spill_folders_removed"], "2");
+}
+
+// ----------------------------------------- out of memory, and the lake gone
+
+#[test]
+fn daily_out_of_memory_before_the_pivot_exits_2() {
+    // D29.13, DX, X3: DuckDB runs out of memory in the work before the day's
+    // commit (here after the lake is opened, then in the close itself): fatal,
+    // fundamental, exit 2, the day not closed and nothing after it done.
+    let w = world("daily-oom-before");
+    host_file(&w, OLD_SNAPSHOT, b"old");
+    let report = crate::lake::starved::under(crate::lake::starved::AFTER_OPENING, || go(&w));
+    assert_eq!(code(&report), 2, "{report:#?}");
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert!(day_rows(&w).is_empty());
+    assert!(w.config.data_dir.join(OLD_SNAPSHOT).exists());
+    assert!(!export::export_dir(&w.config.data_dir).exists());
+
+    let w = world("daily-oom-close");
+    let report = hooked(&w, &|| {
+        Err(crate::lake::out_of_memory(
+            "Out of Memory Error: failed to pin block",
+            "closing the days",
+        ))
+    });
+    assert_eq!(code(&report), 2, "{report:#?}");
+    assert_eq!(report.reason, "OUT_OF_MEMORY");
+    assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 0);
+    assert!(day_rows(&w).is_empty());
+}
+
+#[test]
+fn daily_with_the_lake_unavailable_exits_2_without_closing_the_day() {
+    // D29.13, DX, X3: a lake that cannot be opened stops the run before the
+    // pivot, whatever else is there to do: no day is closed, nothing is
+    // exported, pushed or deleted, and no retry follows a 2.
+    let mut w = world("daily-no-lake");
+    with_bucket(&mut w);
+    host_file(&w, OLD_SNAPSHOT, b"old");
+    let bucket = Bucket::default();
+    let clock = FakeClock::at(NOW);
+    let report = run_retrying_with(
+        &w,
+        &clock,
+        &Backend::PlainFile("/nonexistent-dir/lake.duckdb".into()),
+        Some(&bucket),
+    );
+    assert_eq!(code(&report), 2, "{report:#?}");
+    assert_eq!(report.reason, "LAKE_UNAVAILABLE");
+    assert_eq!(report.metadata["attempts"], "1");
+    assert!(clock.slept().is_empty());
+    assert!(day_rows(&w).is_empty(), "the world's own lake is untouched");
+    assert!(bucket.attempts.borrow().is_empty());
+    assert!(!export::export_dir(&w.config.data_dir).exists());
+    assert!(w.config.data_dir.join(OLD_SNAPSHOT).exists());
+}
+
+/// [`run_retrying`] on a lake and a bucket given.
+fn run_retrying_with(
+    w: &World,
+    clock: &dyn Clock,
+    backend: &Backend,
+    transport: Option<&dyn Transport>,
+) -> Report {
+    retrying(clock, &mut || {
+        run_with(&w.config, clock, nowhere(), backend, transport)
+    })
+}
+
+#[test]
+fn daily_export_out_of_memory_is_an_error_and_exits_3() {
+    // D29.14, DX, X5: the export runs out of memory after the pivot: an error
+    // the run carries on past, so the day is closed and the deletions that
+    // follow still run, and the exit is 3, not the 2 a failure before the
+    // pivot gives.
+    let w = world("daily-export-oom");
+    host_file(&w, OLD_SNAPSHOT, b"old");
+    let report = run_hooked(
+        &w.config,
+        &FakeClock::at(NOW),
+        nowhere(),
+        &w.backend(),
+        None,
+        &|| Ok(()),
+        &|lake, file, select| {
+            // DuckDB will not take the limit back that far with memory in use
+            // (itself the error), and would run out writing the file if it did.
+            lake.execute(
+                &format!("SET memory_limit='{}';", crate::lake::starved::TINY),
+                "taking the memory back",
+            )?;
+            export::publish(lake, file, select)
+        },
+    );
+    assert_eq!(code(&report), 3, "{report:#?}");
+    assert_eq!(report.outcome, Severity::Error);
+    assert_eq!(report.errors[0].reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(report.errors[0].metadata["doing"], "writing an hour");
+    assert_eq!(day_rows(&w).len(), 1, "the day is closed");
+    assert!(
+        !w.config.data_dir.join(OLD_SNAPSHOT).exists(),
+        "the deletions after the export ran"
+    );
+    assert!(report.metadata.contains_key("items_retry_seconds"));
+}
+
+// ------------------------------------------------- the order after the close
+
+/// A clock that notes, each time it is read, which of five facts hold: the
+/// steps read it at their start and their end, so the notes say when each
+/// step's work was first seen done.
+struct Noting<'a> {
+    inner: FakeClock,
+    facts: &'a dyn Fn() -> [bool; 5],
+    seen: RefCell<Vec<[bool; 5]>>,
+}
+
+impl Clock for Noting<'_> {
+    fn now(&self) -> DateTime<Utc> {
+        self.seen.borrow_mut().push((self.facts)());
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+    }
+}
+
+#[test]
+fn daily_does_the_export_push_deletions_stale_files_then_items_in_that_order() {
+    // DL, D32.9: after the close, the export, the push, the deletions, the
+    // stale temporary files, then asking again for the items. Each step's work
+    // is first seen done after the earlier step's and before the later one's.
+    let mut w = world_with_secret("daily-order");
+    with_bucket(&mut w);
+    items_that_answered_404(&w);
+    let old_export = host_file(&w, "export/item_hour/2026-10-01T00.parquet", b"x");
+    let old_snapshot = host_file(&w, OLD_SNAPSHOT, b"old");
+    let stale = host_file(
+        &w,
+        "bronze/commodities/eu/2026-11-20T22.parquet.1-aa.tmp",
+        b"x",
+    );
+    let stub = blizzard(&[
+        (7, ResponseTemplate::new(404)),
+        (8, ResponseTemplate::new(404)),
+    ]);
+    let bucket = Bucket::default();
+    let data = w.config.data_dir.clone();
+    let facts = || {
+        let new_item_file = fs::read_dir(data.join("bronze/items"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.file_name() != "2026-11-19T103600.parquet")
+            })
+            .unwrap_or(false);
+        [
+            data.join("export/item_day.parquet").exists(),
+            !bucket.objects().is_empty(),
+            !old_export.exists() && !old_snapshot.exists(),
+            !stale.exists(),
+            new_item_file,
+        ]
+    };
+    let clock = Noting {
+        inner: FakeClock::at(NOW),
+        facts: &facts,
+        seen: RefCell::default(),
+    };
+    let report = run_with(
+        &w.config,
+        &clock,
+        stub.endpoints(),
+        &w.backend(),
+        Some(&bucket),
+    );
+    assert_eq!(code(&report), 0, "{report:#?}");
+    let seen = clock.seen.borrow();
+    let first: Vec<usize> = (0..5)
+        .map(|fact| {
+            seen.iter()
+                .position(|facts| facts[fact])
+                .unwrap_or_else(|| panic!("fact {fact} never held: {seen:?}"))
+        })
+        .collect();
+    assert!(
+        first.windows(2).all(|pair| pair[0] < pair[1]),
+        "export, push, deletions, stale files, items: first seen at {first:?}"
+    );
+}
+
+#[test]
+fn daily_export_deletions_of_files_and_clearing_run_past_the_deadline() {
+    // DL, D32.7, TD-N: the close ends at 01:26, past the 01:25 deadline. The
+    // lake's deletions and asking again for the items are left (this world has
+    // no bucket, so there is no push to leave), and each is one error, exit 3; the export, the deletion of export hour
+    // files, the deletion of host snapshots and the clearing of stale files
+    // and spill folders still run.
+    let w = world_with_secret("daily-past-deadline");
+    items_that_answered_404(&w);
+    let old_export = host_file(&w, "export/item_hour/2026-10-01T00.parquet", b"x");
+    let old_snapshot = host_file(&w, OLD_SNAPSHOT, b"old");
+    let stale = host_file(
+        &w,
+        "bronze/commodities/eu/2026-11-20T22.parquet.1-aa.tmp",
+        b"x",
+    );
+    let now: DateTime<Utc> = "2026-11-21T00:52:00Z".parse().unwrap();
+    let spill = spill_folder(
+        &w,
+        "1-0123456789abcdef",
+        now,
+        DAILY_RUN_TIME_LIMIT + TEMPORARY_FILE_MARGIN + secs(1),
+    );
+    let stub = blizzard(&[(7, ResponseTemplate::new(404))]);
+    let old_gold_hour = FOUR_WEEKS_BEFORE_MIDNIGHT - 1;
+    old_gold(&w, old_gold_hour);
+    let report = go_slow(
+        &w,
+        &FakeClock::at("2026-11-21T00:52:00Z"),
+        stub.endpoints(),
+        None,
+        secs(34 * 60),
+    );
+    assert_eq!(code(&report), 3, "{report:#?}");
+    assert_eq!(
+        reasons(&report),
+        ["DAILY_LEFT_FOR_NEXT_RUN", "DAILY_LEFT_FOR_NEXT_RUN"],
+        "the lake's deletions and the items, each once"
+    );
+    assert_eq!(day_rows(&w).len(), 1);
+    // What runs past the deadline.
+    let export = export::export_dir(&w.config.data_dir);
+    assert!(export.join("item_day.parquet").exists());
+    assert!(export.join("item_hour/2026-11-20T10.parquet").exists());
+    assert!(!old_export.exists());
+    assert!(!old_snapshot.exists());
+    assert!(!stale.exists());
+    assert!(!spill.exists());
+    // What it leaves.
+    assert!(item_requests(&stub).is_empty());
+    assert_eq!(
+        count(
+            &w,
+            &format!(
+                "SELECT count(*) FROM gold.item_hour WHERE hour_number(hour) = {}",
+                h(old_gold_hour).0
+            )
+        ),
+        1,
+        "the lake's old row is left for the next run"
+    );
+}
+
+#[test]
+fn daily_export_stopped_part_way_is_written_again_by_the_next_run() {
+    // D32.10, DL: only the daily run time limit bounds the export, and a run
+    // stopped there (its process ended, here by a panic) leaves a part-written
+    // export. The day is closed, so the next run writes what is lacking and
+    // clears the temporary file.
+    let w = world("daily-export-stopped");
+    let written = std::cell::Cell::new(0_usize);
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_hooked(
+            &w.config,
+            &FakeClock::at(NOW),
+            nowhere(),
+            &w.backend(),
+            None,
+            &|| Ok(()),
+            &|lake, file, select| {
+                written.set(written.get() + 1);
+                if written.get() == 5 {
+                    fs::write(file.with_extension("parquet.1-aa.tmp"), b"part of a file").unwrap();
+                    panic!("the run is stopped at its time limit");
+                }
+                export::publish(lake, file, select)
+            },
+        )
+    }));
+    assert!(stopped.is_err());
+    let export = export::export_dir(&w.config.data_dir);
+    let hour_files = |table: &str| {
+        fs::read_dir(export.join(table))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+            .count()
+    };
+    assert_eq!(hour_files("item_hour"), 2);
+    assert!(!export.join("item_day.parquet").exists());
+    assert_eq!(
+        day_rows(&w).len(),
+        1,
+        "the day was closed before the export"
+    );
+
+    let report = go_at(&w, "2026-11-21T00:55:00Z", None);
+    assert_eq!(code(&report), 0, "{report:#?}");
+    assert_eq!(hour_files("item_hour"), 24);
+    assert_eq!(hour_files("price_level_hour"), 24);
+    assert!(export.join("item_day.parquet").exists());
+    let tmp = fs::read_dir(export.join("price_level_hour"))
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+    assert!(!tmp, "the temporary file is cleared");
+}
+
+// ------------------------------------------------- the timings, early or left
+
+/// The steps' keys a report carries its times under.
+const STEP_KEYS: [&str; 6] = [
+    "close_seconds",
+    "export_seconds",
+    "push_seconds",
+    "expiry_seconds",
+    "temporary_seconds",
+    "items_retry_seconds",
+];
+
+/// A daily run as the command makes it: the attempts, and the whole run timed.
+fn timed_daily(clock: &dyn Clock, attempt: &mut dyn FnMut() -> Report) -> Report {
+    crate::bound::totalled(clock, || retrying(clock, attempt))
+}
+
+#[test]
+fn daily_after_its_close_reports_all_six_step_seconds_and_attempts_for_a_step_skipped_or_left() {
+    // TM, D35.5: once the close has ended every step has its key, a skipped or
+    // left one included, near zero; and `attempts` and `total_seconds`.
+    let all_six = |report: &Report, what: &str| {
+        for key in STEP_KEYS {
+            assert!(
+                report.metadata.contains_key(key),
+                "{what}: {key}: {report:#?}"
+            );
+        }
+        assert_eq!(report.metadata["attempts"], "1", "{what}");
+        assert!(report.metadata.contains_key("total_seconds"), "{what}");
+    };
+
+    // No bucket and no item to ask again: the push and the items are skipped.
+    let w = world("daily-six-skipped");
+    let clock = FakeClock::at(NOW);
+    let report = timed_daily(&clock, &mut || {
+        run_with(&w.config, &clock, nowhere(), &w.backend(), None)
+    });
+    assert_eq!(code(&report), 0, "{report:#?}");
+    all_six(&report, "skipped");
+    assert_eq!(report.metadata["push_seconds"], "0.0");
+    assert_eq!(report.metadata["items_retry_seconds"], "0.0");
+
+    // The deadline passes in the close: the push, the lake's deletions and the
+    // items are left.
+    let mut w = world_with_secret("daily-six-left");
+    with_bucket(&mut w);
+    items_that_answered_404(&w);
+    let stub = blizzard(&[(7, ResponseTemplate::new(404))]);
+    let bucket = Bucket::default();
+    let clock = FakeClock::at("2026-11-21T00:52:00Z");
+    let report = timed_daily(&clock, &mut || {
+        go_slow(&w, &clock, stub.endpoints(), Some(&bucket), secs(34 * 60))
+    });
+    assert_eq!(code(&report), 3, "{report:#?}");
+    all_six(&report, "left");
+    assert_eq!(report.metadata["close_seconds"], "2040.0");
+    assert_eq!(report.metadata["push_seconds"], "0.0");
+    assert_eq!(report.metadata["items_retry_seconds"], "0.0");
+    assert_eq!(report.metadata["total_seconds"], "2040.0");
+
+    // A step fails.
+    let w = world("daily-six-failed");
+    let clock = FakeClock::at(NOW);
+    let report = timed_daily(&clock, &mut || {
+        run_hooked(
+            &w.config,
+            &clock,
+            nowhere(),
+            &w.backend(),
+            None,
+            &|| Ok(()),
+            &|_, _, _| Err(io_failure(&io::Error::other("no"), "writing")),
+        )
+    });
+    assert_eq!(code(&report), 3, "{report:#?}");
+    all_six(&report, "failed");
+}
+
+#[test]
+fn daily_ending_before_its_close_reports_only_the_total_and_attempts() {
+    // TM, D35.6: the lock held past the wait, too late to close, the day before
+    // not closable and the close failing each end the run before the close has
+    // ended: no step has a key, never null or 0; the total and `attempts` stay.
+    let only_total_and_attempts = |report: &Report, what: &str| {
+        for key in STEP_KEYS {
+            assert!(
+                !report.metadata.contains_key(key),
+                "{what}: {key}: {report:#?}"
+            );
+        }
+        assert_eq!(report.metadata["attempts"], "1", "{what}");
+        assert!(report.metadata.contains_key("total_seconds"), "{what}");
+    };
+
+    // The lock is held past the wait: ten minutes of the clock.
+    let w = world("daily-early-lock");
+    let clock = FakeClock::at("2026-11-21T04:00:00Z");
+    let _held = lock::acquire(&w.config.lock_file, Duration::ZERO, &clock).unwrap();
+    let report = timed_daily(&clock, &mut || {
+        run_with(&w.config, &clock, nowhere(), &w.backend(), None)
+    });
+    assert_eq!(report.reason, "LOCK_WAIT_EXPIRED");
+    only_total_and_attempts(&report, "lock held");
+    assert_eq!(report.metadata["total_seconds"], "600.0");
+
+    // Too late to close: 03:30's deadline was 03:25.
+    let w = world("daily-early-late");
+    let clock = FakeClock::at("2026-11-21T03:30:00Z");
+    let report = timed_daily(&clock, &mut || {
+        run_with(&w.config, &clock, nowhere(), &w.backend(), None)
+    });
+    assert_eq!(report.reason, "DAILY_TOO_LATE_TO_CLOSE");
+    only_total_and_attempts(&report, "too late");
+
+    // The day before cannot yet be closed.
+    let w = world("daily-early-not-yet");
+    w.open()
+        .execute(
+            &format!(
+                "DELETE FROM meta.processed WHERE hour = {0}; DELETE FROM gold.item_hour WHERE hour = {0};",
+                at(23)
+            ),
+            "taking 23:00 away",
+        )
+        .unwrap();
+    let clock = FakeClock::at("2026-11-21T03:40:00Z");
+    let report = timed_daily(&clock, &mut || {
+        run_with(&w.config, &clock, nowhere(), &w.backend(), None)
+    });
+    assert_eq!(report.reason, "DAY_NOT_CLOSABLE");
+    only_total_and_attempts(&report, "not closable");
+
+    // The close fails.
+    let w = world("daily-early-close-fails");
+    let clock = FakeClock::at(NOW);
+    let report = timed_daily(&clock, &mut || {
+        run_hooked(
+            &w.config,
+            &clock,
+            nowhere(),
+            &w.backend(),
+            None,
+            &|| Err(Failure::unexpected("BOOM", "Unexpected.")),
+            &export::publish,
+        )
+    });
+    assert_eq!(code(&report), 70);
+    only_total_and_attempts(&report, "close fails");
 }

@@ -80,12 +80,56 @@ impl Drop for Spill {
 /// are loaded but never installed, `memory_limit` and `threads` are the job's
 /// (5.4.1), and `temp_directory` is the connection's own `spill`.
 pub(crate) fn job_limits(spill: &Spill) -> String {
+    #[cfg(test)]
+    let memory_limit = starved::limit().unwrap_or(JOB_MEMORY_LIMIT);
+    #[cfg(not(test))]
+    let memory_limit = JOB_MEMORY_LIMIT;
     format!(
         "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
-         SET memory_limit='{JOB_MEMORY_LIMIT}'; SET threads={JOB_THREADS}; \
+         SET memory_limit='{memory_limit}'; SET threads={JOB_THREADS}; \
          SET temp_directory={};",
         crate::collect::snapshot::quoted(&spill.path().to_string_lossy())
     )
+}
+
+/// A test's way to starve a job of memory: for the closure's duration, on
+/// this thread, every connection a job opens takes a limit in place of the
+/// job's `memory_limit` (a small one makes DuckDB really run out; one it
+/// cannot parse makes opening fail). Nothing in the product reads it.
+#[cfg(test)]
+pub(crate) mod starved {
+    use std::cell::Cell;
+
+    /// A limit under which DuckDB cannot allocate the first block of a write
+    /// (a table insert, a Parquet file) but still reads.
+    pub(crate) const TINY: &str = "100KB";
+
+    /// A limit under which a lake already made opens and its migrations are
+    /// found applied, and DuckDB then runs out of memory in the work after
+    /// them (reading an hour, writing a file). Found by trying, for the
+    /// pinned DuckDB; a lake not yet made, or the first write of any file,
+    /// needs less.
+    pub(crate) const AFTER_OPENING: &str = "3MB";
+
+    thread_local! {
+        static LIMIT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn limit() -> Option<&'static str> {
+        LIMIT.with(Cell::get)
+    }
+
+    /// Runs `f` with every connection opened on this thread limited to `limit`.
+    pub(crate) fn under<T>(limit: &'static str, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<&'static str>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LIMIT.with(|cell| cell.set(self.0));
+            }
+        }
+        let _restore = Restore(LIMIT.with(|cell| cell.replace(Some(limit))));
+        f()
+    }
 }
 
 /// The name the lake is attached under, and so the catalog every statement's
@@ -159,6 +203,11 @@ pub(crate) fn out_of_memory(message: &str, doing: &str) -> Failure {
 }
 
 fn unavailable(message: &str, doing: &str) -> Failure {
+    // No memory and a full disk are the operator's to fix, and are named as such
+    // wherever they are met: only what is left is the lake being unavailable.
+    if says_out_of_memory(message) || says_disk_full(message) {
+        return lake_failure(message, doing);
+    }
     Failure::Stop(Box::new(
         Report::fatal(
             ErrorType::TechnicalFundamental,
@@ -398,6 +447,33 @@ mod tests {
         assert_eq!(report.reason, "OUT_OF_MEMORY");
         assert_eq!(exit_status(&report), ExitStatus::Fundamental);
         assert_eq!(report.metadata["doing"], "comparing");
+    }
+
+    #[test]
+    fn an_attach_that_runs_out_of_memory_or_disk_is_named_so_and_is_fundamental() {
+        // X3: only what is left is the lake unavailable.
+        let oom = unavailable(
+            "Out of Memory Error: failed to pin block",
+            "attaching the lake",
+        );
+        let disk = unavailable("IO Error: No space left on device", "attaching the lake");
+        let other = unavailable("IO Error: Cannot open file", "attaching the lake");
+        let reason = |failure| match failure {
+            Failure::Stop(report) => (report.reason.clone(), exit_status(&report)),
+            other => panic!("expected a stop, got {other:?}"),
+        };
+        assert_eq!(
+            reason(oom),
+            ("OUT_OF_MEMORY".to_owned(), ExitStatus::Fundamental)
+        );
+        assert_eq!(
+            reason(disk),
+            ("DISK_FULL".to_owned(), ExitStatus::Fundamental)
+        );
+        assert_eq!(
+            reason(other),
+            ("LAKE_UNAVAILABLE".to_owned(), ExitStatus::Fundamental)
+        );
     }
 
     #[test]
