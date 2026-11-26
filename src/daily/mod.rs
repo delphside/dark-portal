@@ -188,9 +188,15 @@ impl Steps<'_> {
             );
         let mut warnings: Vec<Report> = Vec::new();
         if close_took > DAY_CLOSE_BOUND {
-            warnings.push(close_over_bound(close_took));
+            let warning = close_over_bound(close_took);
+            warning.log();
+            warnings.push(warning);
         }
-        warnings.extend(expired.iter().map(|day| day_expired(*day)));
+        for day in &expired {
+            let warning = day_expired(*day);
+            warning.log();
+            warnings.push(warning);
+        }
         if !expired.is_empty() {
             report = report.with_metadata(
                 "days_expired_unclosed",
@@ -207,12 +213,11 @@ impl Steps<'_> {
         );
         let pushing = self.push(deadline, &mut errors);
         report = report.with_metadata("objects_pushed", pushing.objects.to_string());
-        warnings.extend(
-            pushing
-                .retried
-                .iter()
-                .map(|(object, retries)| pushed_after_retries(object, *retries)),
-        );
+        for (object, retries) in &pushing.retried {
+            let warning = pushed_after_retries(object, *retries);
+            warning.log();
+            warnings.push(warning);
+        }
         if !pushing.retried.is_empty() {
             report = report.with_metadata(
                 "objects_pushed_after_retries",
@@ -234,9 +239,6 @@ impl Steps<'_> {
         let not_found = self.ask_again(deadline, &mut errors);
         report = report.with_metadata("items_asked_again", not_found.to_string());
 
-        for warning in &warnings {
-            warning.log();
-        }
         if errors.is_empty() {
             return Ok(warned(report, &warnings));
         }
@@ -414,7 +416,8 @@ fn close_over_bound(took: std::time::Duration) -> Report {
 /// The run's report where nothing failed: a warning whenever any warning was
 /// raised in the run (1.10 *The severity of an error*), the first one's
 /// reason leading and every reason listed; the report as it is where none was.
-/// The one place the run's severity is decided.
+/// The one place the run's severity is decided; each warning is logged where
+/// it is raised, so a run killed later has logged it.
 fn warned(report: Report, warnings: &[Report]) -> Report {
     let Some(first) = warnings.first() else {
         return report;

@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use duckdb::Connection;
@@ -773,21 +774,28 @@ fn a_day_with_no_item_row_is_closed_once_and_recorded() {
 }
 
 #[test]
-fn a_day_with_item_rows_and_no_closed_record_is_replaced_not_doubled() {
+fn a_day_with_item_rows_and_no_closed_record_is_kept_and_recorded() {
     // A lake rebuilt from bronze with `item_day` restored has no
-    // `meta.day_closed`: closing the day replaces its rows.
+    // `meta.day_closed`: the day is closed already, its rows are never
+    // recomputed, and the close only records it.
     let w = world("daily-close-restored");
     let first = go(&w);
     assert_eq!(code(&first), 0, "{first:?}");
     let closed = day_rows(&w);
     assert_eq!(closed.len(), 1);
+    // A value the close would not compute, to show the rows are not recomputed.
     w.open()
-        .execute("DELETE FROM meta.day_closed;", "forgetting the closed days")
+        .execute(
+            "UPDATE gold.item_day SET hours_held = 1; DELETE FROM meta.day_closed;",
+            "restoring the day",
+        )
         .unwrap();
+    let kept = day_rows(&w);
+    assert_ne!(kept, closed);
     let again = go(&w);
     assert_eq!(code(&again), 0, "{again:?}");
-    assert_eq!(again.metadata["days_closed"], "2026-11-20");
-    assert_eq!(day_rows(&w), closed);
+    assert_eq!(again.metadata["days_closed"], "", "{again:?}");
+    assert_eq!(day_rows(&w), kept);
     assert_eq!(count(&w, "SELECT count(*) FROM meta.day_closed"), 1);
 }
 
@@ -1335,6 +1343,54 @@ fn a_run_past_its_deadline_starts_no_optional_step_and_says_what_it_left() {
         ),
         1
     );
+}
+
+#[derive(Clone)]
+struct Logged(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl io::Write for Logged {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_close_warnings_are_logged_before_the_steps_after_the_pivot() {
+    // A run killed after the pivot has logged what the close raised.
+    let w = world("daily-close-warnings-logged");
+    let clock = FakeClock::at(NOW);
+    let log = Logged(Arc::default());
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let report = tracing::subscriber::with_default(subscriber, || {
+        run_hooked(
+            &w.config,
+            &clock,
+            nowhere(),
+            &w.backend(),
+            None,
+            &|| {
+                clock.sleep(DAY_CLOSE_BOUND + secs(1));
+                Ok(())
+            },
+            &|lake, file, select| {
+                tracing::warn!("AFTER_THE_PIVOT");
+                export::publish(lake, file, select)
+            },
+        )
+    });
+    assert_eq!(report.reason, "DAY_CLOSE_OVER_BOUND", "{report:?}");
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    let warned = text.find("DAY_CLOSE_OVER_BOUND").expect(&text);
+    let after = text.find("AFTER_THE_PIVOT").expect(&text);
+    assert!(warned < after, "{text}");
 }
 
 #[test]

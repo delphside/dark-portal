@@ -9,7 +9,9 @@
 //!
 //! **A day is closed** where `meta.day_closed` holds a row of it, written in
 //! the transaction that closes it for every day closed, one in which no item
-//! had a row included. A closable day not closed is closed, every one in one
+//! had a row included, or where `gold.item_day` already has rows of it (a lake
+//! rebuilt with `item_day` restored). The rows of such a day are never
+//! recomputed: the close only records it, in the transaction of the others. A closable day not closed is closed, every one in one
 //! transaction, which is the run's pivot. The day before today (UTC) must be
 //! closable or the run does nothing and ends `75` ([`Closing::NotYet`]): a day
 //! that cannot yet be closed is no reason to close an older one, and the next
@@ -110,11 +112,20 @@ pub(crate) fn close(
         &format!("SELECT hour_number(hour) FROM meta.gap WHERE market = {market}"),
         "reading the gaps",
     )?;
-    let closed = numbers(
+    let recorded = numbers(
         lake,
         "SELECT CAST(day - DATE '1970-01-01' AS BIGINT) FROM meta.day_closed",
         "reading the closed days",
     )?;
+    let held = numbers(
+        lake,
+        "SELECT DISTINCT CAST(day - DATE '1970-01-01' AS BIGINT) FROM gold.item_day",
+        "reading the days with item rows",
+    )?;
+    // A day with item rows is closed, record or none: never recomputed, only
+    // recorded.
+    let adopted: Vec<Day> = held.difference(&recorded).copied().collect();
+    let closed: BTreeSet<Day> = recorded.union(&held).copied().collect();
     let reported = numbers(
         lake,
         "SELECT CAST(day - DATE '1970-01-01' AS BIGINT) FROM meta.day_expired",
@@ -141,7 +152,7 @@ pub(crate) fn close(
         .filter(|day| closable(*day) && !reported.contains(day))
         .collect();
     let days: Vec<Day> = open.into_iter().filter(|day| closable(*day)).collect();
-    if days.is_empty() && expired.is_empty() {
+    if days.is_empty() && expired.is_empty() && adopted.is_empty() {
         return Ok(Closing::nothing());
     }
 
@@ -174,17 +185,20 @@ pub(crate) fn close(
     let result = (|| {
         lake.begin()?;
         if !days.is_empty() {
-            // A day whose `meta.day_closed` row is missing may have its rows
-            // already (a lake rebuilt with `item_day` restored): replaced,
-            // never added to.
-            lake.execute(
-                "DELETE FROM gold.item_day WHERE day IN (SELECT day FROM closing_day);",
-                doing,
-            )?;
             lake.execute(CLOSE_SQL, doing)?;
             // Every day closed is recorded, one with no item row too.
             lake.execute(
                 &format!("INSERT INTO meta.day_closed SELECT day, {recorded_at} FROM closing_day;"),
+                doing,
+            )?;
+        }
+        if !adopted.is_empty() {
+            let rows: Vec<String> = adopted
+                .iter()
+                .map(|&day| format!("(DATE '{}', {recorded_at})", date_of(day)))
+                .collect();
+            lake.execute(
+                &format!("INSERT INTO meta.day_closed VALUES {};", rows.join(", ")),
                 doing,
             )?;
         }
