@@ -69,8 +69,9 @@ pub(crate) fn run_hooked(
     write: export::Writer,
     times: &HourTimes,
 ) -> Report {
-    // One bound on an hour's `transform` and `export` together: each adds the
-    // time it spent on each hour to `times`, and the last judges the sum.
+    // One bound on an hour's `transform` and `export` together: each adds its
+    // whole run, shared across its hours, to `times`, and the last judges the
+    // sum.
     let steps = Steps {
         collect: &|| collect::run_keeping(config, clock, endpoints()),
         items: &|held| items::run_holding(config, clock, endpoints(), lock::Holding::Held(held)),

@@ -99,8 +99,9 @@ pub(crate) fn run_hooked(
 
 /// As [`run_with`], for a caller that holds the VM-wide lock already (`dp
 /// hourly`): it opens the lake, applies the migrations and processes the hours
-/// without taking the lock again. The time each hour took is added to
-/// `times`; the caller judges the hourly processing bound on it.
+/// without taking the lock again. The time of the whole run, shared across the
+/// hours it processed, is added to `times`; the caller judges the hourly
+/// processing bound on it.
 pub(crate) fn run_locked(
     config: &Config,
     clock: &dyn Clock,
