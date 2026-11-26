@@ -1192,6 +1192,18 @@ fn collect_in_a_collected_hour_has_no_refresh_time_and_raises_no_warning() {
 }
 
 #[test]
+fn the_collected_log_line_names_the_hour_as_the_reports_do() {
+    let (outcome, log) = crate::test_support::logging(|| collecting("log-hour", LM_11, BODY));
+    let (w, report) = outcome;
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert!(w.bronze("2026-11-26T11.parquet").exists());
+    let line = log.lines().find(|l| l.contains("collected the snapshot"));
+    let line = line.unwrap_or_else(|| panic!("{log}"));
+    assert!(line.contains("2026-11-26T11"), "{line}");
+    assert!(!line.contains(".parquet"), "{line}");
+}
+
+#[test]
 fn a_run_that_fails_reports_no_refresh_time() {
     // G56: a failure before the snapshot is read carries none.
     let w = World::at("failed-no-refresh", AT_1135);

@@ -128,7 +128,7 @@ fn collect(
     let dir = bronze_dir(&config.data_dir);
     let file = dir.join(window::file_name(hour));
     let hour_label = window::file_name(hour);
-    let hour_text = window::hour_text(hour);
+    let hour_text = crate::transform::bronze::hour_name(hour);
     // Named for the run (its pid, which is not unique across containers, and
     // a random suffix), so two runs in one hour never share a file.
     let temporary = dir.join(temporary_name(
@@ -224,7 +224,7 @@ fn collect(
     // The hour is collected, so a temporary file of this hour that is not
     // this run's is left by a run that was killed, or lost the race.
     clear_stale(&dir, &hour_label, &temporary);
-    tracing::info!(hour = %hour_label, "collected the snapshot");
+    tracing::info!(hour = %hour_text, "collected the snapshot");
     // Nothing failed, but each of these is for a person to look at: each is
     // logged here and kept on the report.
     let mut warnings = Vec::new();

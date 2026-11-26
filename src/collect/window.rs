@@ -27,11 +27,6 @@ pub fn window_end(hour: Hour) -> DateTime<Utc> {
     next_hour + Duration::minutes(i64::from(RETRY_WINDOW_END_MINUTE))
 }
 
-/// An hour as the reports and warnings name it: `YYYY-MM-DDTHH`.
-pub fn hour_text(hour: Hour) -> String {
-    file_name(hour).trim_end_matches(".parquet").to_owned()
-}
-
 /// The file name of an hour's snapshot: `YYYY-MM-DDTHH.parquet`.
 pub fn file_name(hour: Hour) -> String {
     let start = hour.start().expect("an hour in range");

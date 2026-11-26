@@ -62,7 +62,7 @@ fn probe(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Repo
     let now = clock.now();
     let previous = Hour(Hour::containing(now).0 - 1);
     let file = bronze_dir(&config.data_dir).join(window::file_name(previous));
-    let hour_label = window::hour_text(previous);
+    let hour_label = crate::transform::bronze::hour_name(previous);
     let report = Report::ok().with_metadata("hour", hour_label.clone());
 
     let connection = Connection::open_in_memory()

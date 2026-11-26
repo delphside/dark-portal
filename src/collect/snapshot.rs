@@ -132,6 +132,13 @@ impl Recent {
 }
 
 /// What a reader gives is also noted in a [`Recent`].
+///
+/// **This relies on `serde_json` reading a reader through `io::Bytes`, one
+/// byte per `read`** (1.0.154), so it must be the outermost reader: a
+/// `BufReader` outside it would hand over 64 KiB at a time and the tail would
+/// no longer end at the number. [`compose`] is the one place the readers are
+/// stacked, and `parse_listings` the one caller; a number whose tail is not
+/// the number visited falls back to the visited value's text.
 struct Noting<R> {
     inner: R,
     recent: Recent,
@@ -146,7 +153,7 @@ impl<R: Read> Read for Noting<R> {
 }
 
 /// How many of the last bytes are kept: more than any number worth quoting.
-const RECENT_BYTES: usize = 1024;
+const RECENT_BYTES: usize = 128;
 
 struct State<'a> {
     recent: Recent,
@@ -164,7 +171,7 @@ struct State<'a> {
 enum Scalar {
     Unsigned(u64),
     Negative(i64),
-    Decimal,
+    Decimal(f64),
     Text(String),
     /// A boolean, null, array or object where a scalar was needed.
     Other,
@@ -189,8 +196,8 @@ impl<'de> de::Deserialize<'de> for Scalar {
                     Scalar::Negative(v)
                 })
             }
-            fn visit_f64<E>(self, _: f64) -> Result<Scalar, E> {
-                Ok(Scalar::Decimal)
+            fn visit_f64<E>(self, v: f64) -> Result<Scalar, E> {
+                Ok(Scalar::Decimal(v))
             }
             fn visit_str<E>(self, v: &str) -> Result<Scalar, E> {
                 Ok(Scalar::Text(v.to_owned()))
@@ -254,9 +261,21 @@ impl State<'_> {
             Scalar::Unsigned(v) => Err(self.unexpected_value(field, &v.to_string())),
             Scalar::Negative(v) => Err(self.unexpected_value(field, &v.to_string())),
             // A double has lost its digits: quote what Blizzard wrote.
-            Scalar::Decimal => {
+            Scalar::Decimal(visited) => {
                 let written = self.recent.number();
-                Err(self.unexpected_value(field, &written))
+                // The tail is trusted only where it is the number the parser
+                // visited: a number longer than the ring, or a reader that
+                // reads ahead, gives another one, and then the visited
+                // value's own text is quoted.
+                let text = if written
+                    .parse::<f64>()
+                    .is_ok_and(|w| same_number(w, visited))
+                {
+                    written
+                } else {
+                    visited.to_string()
+                };
+                Err(self.unexpected_value(field, &text))
             }
             Scalar::Text(_) | Scalar::Other => {
                 self.misshapen(field);
@@ -440,6 +459,22 @@ impl<'de> Visitor<'de> for ItemSeed<'_, '_> {
     }
 }
 
+/// Whether two doubles are one number: `serde_json` rounds a long number a
+/// little differently from `str::parse`, so they may differ in the last
+/// digits, but never by a part in a billion unless they are other numbers.
+fn same_number(a: f64, b: f64) -> bool {
+    a == b || (a - b).abs() <= a.abs().max(b.abs()) * 1e-9
+}
+
+/// The reader the parser reads: the body through a buffer, and [`Noting`]
+/// outside it, which sees every byte the parser takes.
+fn compose<R: Read>(reader: R, recent: Recent) -> Noting<BufReader<R>> {
+    Noting {
+        inner: BufReader::with_capacity(64 * 1024, reader),
+        recent,
+    }
+}
+
 /// Reads a snapshot body as a stream and hands each listing to `sink`. The
 /// body is read through a buffer and never held whole.
 pub fn parse_listings<R: Read>(
@@ -455,10 +490,7 @@ pub fn parse_listings<R: Read>(
         problem: None,
         saw_auctions: false,
     };
-    let mut deserializer = serde_json::Deserializer::from_reader(Noting {
-        inner: BufReader::with_capacity(64 * 1024, reader),
-        recent,
-    });
+    let mut deserializer = serde_json::Deserializer::from_reader(compose(reader, recent));
     let result = deserializer
         .deserialize_map(RootVisitor(&mut state))
         .and_then(|()| deserializer.end());
@@ -1125,6 +1157,40 @@ mod tests {
             };
             assert_eq!(value, shown);
         }
+    }
+
+    #[test]
+    fn the_noting_reader_is_outside_the_buffer_and_sees_one_byte_at_a_time() {
+        // `serde_json` reads through `io::Bytes`: what `Noting` has seen must
+        // end where the parser is, which a buffer outside it would break.
+        let recent = Recent::default();
+        let mut reader = compose(b"[12.5,99999]".as_slice(), recent.clone());
+        let mut byte = [0u8; 1];
+        for _ in 0..5 {
+            reader.read_exact(&mut byte).unwrap();
+        }
+        assert_eq!(recent.number(), "12.5");
+    }
+
+    #[test]
+    fn a_number_longer_than_the_ring_is_quoted_by_its_visited_value_never_by_its_tail() {
+        let digits = "7".repeat(RECENT_BYTES * 2);
+        let (result, _) = collect(&listing_with("quantity", &digits));
+        let Err(ParseError::Value { value, .. }) = result else {
+            panic!("expected an unexpected value");
+        };
+        // The visited double's own digits: 7777..., then zeros; the tail of
+        // the ring would be 128 sevens.
+        assert!(value.starts_with("7777777777777"), "{value}");
+        assert_eq!(value.chars().count(), QUOTED_VALUE_MAX);
+        assert!(value.ends_with("0000000000"), "{value}");
+        // One that fits the ring is quoted as written.
+        let fits = "7".repeat(QUOTED_VALUE_MAX + 20);
+        let (result, _) = collect(&listing_with("quantity", &fits));
+        let Err(ParseError::Value { value, .. }) = result else {
+            panic!("expected an unexpected value");
+        };
+        assert_eq!(value, fits[..QUOTED_VALUE_MAX]);
     }
 
     #[test]
