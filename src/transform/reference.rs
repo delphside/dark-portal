@@ -40,9 +40,9 @@ pub struct Summary {
 /// before the transform, so a rebuild per run is as current as one per hour,
 /// and a run catching up on many hours does it once and not many times. A bad
 /// item file then fails this step and not an hour: silver and gold stay whole,
-/// and the next run tries again. The run does it after its hours (and also
-/// where an hour failed) so the table is as current as the files whatever
-/// happened.
+/// and the next run tries again. The run does it after its hours, also where
+/// an hour failed, so the table is as current as the files; not after a
+/// fundamental failure, when another write would fail the same way.
 ///
 /// The replacement is one transaction, and is made only where the rebuilt
 /// table differs, so an hour with no new item answers writes no file to the

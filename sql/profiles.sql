@@ -35,8 +35,8 @@ GROUP BY hour;
 -- The average unit price of the cheapest n_units units listed at at_hour, held
 -- to two decimal places of copper and rounded half away from zero, with the
 -- units it covers: fewer than n_units where fewer are listed. Null where none
--- are listed. An n_units below 1, or not a whole number, is refused. The rounding is integer
--- arithmetic, so a half is never at the mercy of a float.
+-- are listed. An n_units below 1, or not a whole number, is refused. The
+-- rounding is integer arithmetic, so a half is never at the mercy of a float.
 CREATE OR REPLACE TEMP MACRO fill_price(item_id, at_hour, n_units) AS (
     WITH asked AS (
         SELECT CAST(n_units AS HUGEINT) AS n, n_units = CAST(n_units AS HUGEINT) AS whole
