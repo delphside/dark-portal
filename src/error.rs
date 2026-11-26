@@ -1,7 +1,7 @@
 //! Errors: the programme's one scheme, as
 //! [1.10 *Errors: one scheme for every system*](https://github.com/delphside/programme/blob/main/docs/1.10-development-standards.md#errors-one-scheme-for-every-system)
 //! sets it out, and the exit statuses `dp` ends with
-//! ([5.1.1 *Restarts and recovery*](../docs/5.1.1-architecture.md#restarts-and-recovery)).
+//! (5.1.1 *Restarts and recovery*, `docs/5.1.1-architecture.md`).
 //!
 //! Every run, call and request ends in one [`Report`]: 1.10's *result object*,
 //! named so since `Result` is the standard library's. [`exit_status`] is the
