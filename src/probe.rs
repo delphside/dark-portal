@@ -276,9 +276,9 @@ mod tests {
             // Half-hourly after a move: :02 and :32.
             (
                 "half-hourly-02",
-                "2026-11-20T11:02:00Z",
+                "2026-11-20T11:32:00Z",
                 "2026-11-20T12:02:00Z",
-                false,
+                true,
             ),
             (
                 "half-hourly-32",
