@@ -159,7 +159,6 @@ impl World {
                 lock_file: dir.join("dp.lock"),
                 adhoc_memory_limit: "4GB".into(),
                 adhoc_threads: 1,
-                container_memory: "5GB".into(),
             },
         }
     }
