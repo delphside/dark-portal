@@ -129,6 +129,7 @@ impl World {
             blizzard_client_id: "client-id".to_owned(),
             blizzard_client_secret: Secret::new("secret"),
             bucket: None,
+            bucket_access: None,
             lock_file: dir.join("dp.lock"),
             adhoc_memory_limit: "1GB".to_owned(),
             adhoc_threads: 1,

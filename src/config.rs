@@ -51,12 +51,42 @@ pub struct Config {
     pub blizzard_client_secret: Secret,
     /// `DP_BUCKET`: the Object Storage bucket, or `None` for none.
     pub bucket: Option<String>,
+    /// `DP_BUCKET_ACCESS_FILE`'s contents: what gives write access to the
+    /// bucket. Set where `bucket` is. What it is, and how it is used, is
+    /// `crate::daily::transport`'s (docs/5.1.3).
+    pub bucket_access: Option<Secret>,
     /// `DP_LOCK_FILE`: the VM-wide lock every writing job takes.
     pub lock_file: PathBuf,
     /// `DP_ADHOC_MEMORY_LIMIT`: DuckDB's `memory_limit` for an ad hoc query.
     pub adhoc_memory_limit: String,
     /// `DP_ADHOC_THREADS`: DuckDB's `threads` for an ad hoc query.
     pub adhoc_threads: u32,
+}
+
+/// A secret from the file at `path`, without its trailing newline. `what`
+/// names it in a message; `variable` is the setting that names the file. The
+/// path is never in the report.
+fn read_secret(path: &str, variable: &str, what: &str) -> Result<Secret, Box<Report>> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        let mut report = fundamental(
+            "SECRET_FILE_UNREADABLE",
+            &format!("{what} file cannot be read; check its path and its owner."),
+            variable,
+        );
+        report
+            .metadata
+            .insert("kind".to_owned(), format!("{:?}", e.kind()));
+        report
+    })?;
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.is_empty() {
+        return Err(fundamental(
+            "SECRET_FILE_EMPTY",
+            &format!("{what} file is empty; put the secret in it."),
+            variable,
+        ));
+    }
+    Ok(Secret::new(text))
 }
 
 fn fundamental(reason: &str, message: &str, variable: &str) -> Box<Report> {
@@ -97,26 +127,21 @@ impl Config {
             })
         };
 
-        let secret_file = required("DP_BLIZZARD_CLIENT_SECRET_FILE")?;
-        let secret = std::fs::read_to_string(&secret_file).map_err(|e| {
-            let mut report = fundamental(
-                "SECRET_FILE_UNREADABLE",
-                "The Blizzard client secret file cannot be read; check its path and its owner.",
-                "DP_BLIZZARD_CLIENT_SECRET_FILE",
-            );
-            report
-                .metadata
-                .insert("kind".to_owned(), format!("{:?}", e.kind()));
-            report
-        })?;
-        let secret = secret.trim_end_matches(['\n', '\r']);
-        if secret.is_empty() {
-            return Err(fundamental(
-                "SECRET_FILE_EMPTY",
-                "The Blizzard client secret file is empty; put the secret in it.",
-                "DP_BLIZZARD_CLIENT_SECRET_FILE",
-            ));
-        }
+        let secret = read_secret(
+            &required("DP_BLIZZARD_CLIENT_SECRET_FILE")?,
+            "DP_BLIZZARD_CLIENT_SECRET_FILE",
+            "The Blizzard client secret",
+        )?;
+        let bucket = lookup("DP_BUCKET").filter(|v| !v.is_empty());
+        // A bucket without the means to write to it would fail every night.
+        let bucket_access = match bucket {
+            Some(_) => Some(read_secret(
+                &required("DP_BUCKET_ACCESS_FILE")?,
+                "DP_BUCKET_ACCESS_FILE",
+                "The bucket access secret",
+            )?),
+            None => None,
+        };
 
         let threads = required("DP_ADHOC_THREADS")?;
         let adhoc_threads = threads.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| {
@@ -131,8 +156,9 @@ impl Config {
             env: required("DP_ENV")?,
             data_dir: PathBuf::from(required("DP_DATA_DIR")?),
             blizzard_client_id: required("DP_BLIZZARD_CLIENT_ID")?,
-            blizzard_client_secret: Secret::new(secret),
-            bucket: lookup("DP_BUCKET").filter(|v| !v.is_empty()),
+            blizzard_client_secret: secret,
+            bucket,
+            bucket_access,
             lock_file: PathBuf::from(required("DP_LOCK_FILE")?),
             adhoc_memory_limit: required("DP_ADHOC_MEMORY_LIMIT")?,
             adhoc_threads,
@@ -166,6 +192,7 @@ mod tests {
                 secret_path.to_str().unwrap(),
             ),
             ("DP_BUCKET", "bucket"),
+            ("DP_BUCKET_ACCESS_FILE", secret_path.to_str().unwrap()),
             ("DP_LOCK_FILE", "/srv/dp/dp.lock"),
             ("DP_ADHOC_MEMORY_LIMIT", "4GB"),
             ("DP_ADHOC_THREADS", "1"),
@@ -189,6 +216,7 @@ mod tests {
     fn every_setting_is_read() {
         let dir = temp_dir("read");
         let config = read(&vars(&secret_file(&dir))).unwrap();
+        assert_eq!(config.bucket_access.unwrap().expose(), SECRET);
         assert_eq!(config.env, "production");
         assert_eq!(config.data_dir, PathBuf::from("/srv/dp/production"));
         assert_eq!(config.blizzard_client_id, "client-id");
@@ -204,15 +232,36 @@ mod tests {
         let dir = temp_dir("bucket");
         let mut v = vars(&secret_file(&dir));
         v.insert("DP_BUCKET".into(), String::new());
-        assert_eq!(read(&v).unwrap().bucket, None);
+        // With no bucket there is nothing to write to: its access is not read.
+        v.remove("DP_BUCKET_ACCESS_FILE");
+        let config = read(&v).unwrap();
+        assert_eq!((config.bucket, config.bucket_access), (None, None));
         v.remove("DP_BUCKET");
         assert_eq!(read(&v).unwrap().bucket, None);
+    }
+
+    #[test]
+    fn a_bucket_without_its_access_is_refused_as_fundamental() {
+        let dir = temp_dir("bucket-access");
+        let mut v = vars(&secret_file(&dir));
+        v.remove("DP_BUCKET_ACCESS_FILE");
+        let report = read(&v).unwrap_err();
+        assert_eq!(report.reason, "MISSING_SETTING");
+        assert_eq!(report.metadata["variable"], "DP_BUCKET_ACCESS_FILE");
+        assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+
+        v.insert("DP_BUCKET_ACCESS_FILE".into(), "/nonexistent/access".into());
+        let report = read(&v).unwrap_err();
+        assert_eq!(report.reason, "SECRET_FILE_UNREADABLE");
+        assert_eq!(report.metadata["variable"], "DP_BUCKET_ACCESS_FILE");
+        assert!(!format!("{report:?}").contains("/nonexistent"));
     }
 
     #[test]
     fn the_secret_is_never_printed() {
         let dir = temp_dir("print");
         let config = read(&vars(&secret_file(&dir))).unwrap();
+        assert!(config.bucket_access.is_some());
         assert!(!format!("{config:?}").contains(SECRET));
         assert!(!format!("{config:#?}").contains(SECRET));
         assert!(!format!("{}", config.blizzard_client_secret).contains(SECRET));

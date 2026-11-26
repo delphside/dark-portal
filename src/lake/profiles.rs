@@ -18,7 +18,7 @@ use crate::settings::profiles::{
 /// `sql/profiles.sql`, embedded.
 pub const PROFILES_SQL: &str = include_str!("../../sql/profiles.sql");
 
-const HOURS_PER_DAY: u32 = 24;
+pub(crate) const HOURS_PER_DAY: u32 = 24;
 
 /// The macros `sql/profiles.sql` reads its windows from, made from the
 /// settings.

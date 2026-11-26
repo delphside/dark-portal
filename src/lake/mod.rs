@@ -24,6 +24,7 @@ use crate::error::{ErrorType, Report};
 use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
 
 pub use migrations::{MIGRATIONS, Migration};
+pub(crate) use profiles::HOURS_PER_DAY;
 pub use profiles::{PROFILES_SQL, settings_sql};
 
 /// The name the lake is attached under, and so the catalog every statement's

@@ -24,3 +24,6 @@ pub const BRONZE_KEEP_BUCKET: Option<Duration> = Some(Duration::from_secs(365 * 
 
 /// "daily history in the bucket": indefinitely.
 pub const DAILY_HISTORY_BUCKET_KEEP: Option<Duration> = None;
+
+/// "bucket push timeout": 5 minutes for one object, upload included.
+pub const BUCKET_PUSH_TIMEOUT: Duration = Duration::from_secs(5 * 60);

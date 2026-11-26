@@ -95,6 +95,34 @@ pub fn ids_to_fetch(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
     Ok(ids)
 }
 
+/// Every item whose latest response in bronze's item files is a 404, in
+/// ascending order: what `dp daily` asks again (K4). The latest is by
+/// `fetched_at`, then by file name, as the reference table's is
+/// (5.4.2 *`reference`*).
+pub fn ids_not_found(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
+    let items = items_dir(data_dir);
+    if !has_parquet(&items)? {
+        return Ok(Vec::new());
+    }
+    let connection = open()?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT item FROM (SELECT item, status, row_number() OVER (PARTITION BY item \
+             ORDER BY fetched_at DESC, filename DESC) AS recency \
+             FROM read_parquet({}, filename = true)) WHERE recency = 1 AND status = 404 \
+             ORDER BY item",
+            quoted(&items.join("*.parquet").to_string_lossy())
+        ))
+        .map_err(|e| read_failure(&e.to_string()))?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, u32>(0))
+        .map_err(|e| read_failure(&e.to_string()))?
+        .map(|id| id.map(ItemId))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| read_failure(&e.to_string()))?;
+    Ok(ids)
+}
+
 /// A run's responses, held by DuckDB until they are written.
 pub struct Responses {
     connection: Connection,

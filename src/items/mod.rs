@@ -35,6 +35,7 @@ mod pacer;
 mod store;
 
 pub(crate) use store::has_parquet;
+pub(crate) use store::ids_not_found;
 pub use store::items_dir;
 #[cfg(test)]
 mod tests;
@@ -84,6 +85,27 @@ pub fn run_holding(
         Err(failure) => return stopped(failure),
     };
     fetch(config, clock, &Blizzard::new(endpoints), &ids, holding)
+}
+
+/// Fetches the item IDs given, whatever bronze holds for them: `dp daily`'s way
+/// to ask again for the items whose latest response is a 404 (K4). It is the
+/// same fetch as [`run`]'s, at the same rate and with the same pacer, store
+/// and exit; a 404 again is recorded and is a warning, not an error. The caller
+/// holds the VM-wide lock and lends it.
+pub fn fetch_ids(
+    config: &Config,
+    clock: &dyn Clock,
+    endpoints: Endpoints,
+    ids: &[ItemId],
+    held: &crate::collect::lock::Lock,
+) -> Report {
+    fetch(
+        config,
+        clock,
+        &Blizzard::new(endpoints),
+        ids,
+        Holding::Held(held),
+    )
 }
 
 /// The start of the next hourly run after `now`: the hourly timer start's

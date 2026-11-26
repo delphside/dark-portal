@@ -86,6 +86,7 @@ fn one_hour_of_300_000_listings_against_a_populated_silver() {
         blizzard_client_id: "x".to_owned(),
         blizzard_client_secret: Secret::new("x"),
         bucket: None,
+        bucket_access: None,
         lock_file: dir.join("dp.lock"),
         adhoc_memory_limit: "1GB".to_owned(),
         adhoc_threads: 1,

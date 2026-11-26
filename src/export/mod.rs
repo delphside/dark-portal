@@ -161,7 +161,14 @@ fn carried(failure: Failure, doing: &str) -> Report {
 /// Whether an hour is older than the hourly keep at `now`: by the hour the
 /// file is for, and strictly older, so an hour exactly the keep ago is kept.
 pub(crate) fn past_keep(hour: Hour, now: DateTime<Utc>) -> bool {
-    let (Some(keep), Some(start)) = (HOURLY_KEEP, hour.start()) else {
+    past(HOURLY_KEEP, hour, now)
+}
+
+/// Whether an hour is older than `keep` at `now`, with the same measure as
+/// [`past_keep`]: the one place a keep is applied to an hour. `None` keeps
+/// indefinitely.
+pub(crate) fn past(keep: Option<Duration>, hour: Hour, now: DateTime<Utc>) -> bool {
+    let (Some(keep), Some(start)) = (keep, hour.start()) else {
         return false;
     };
     chrono::Duration::from_std(keep).is_ok_and(|keep| start + keep < now)
@@ -174,7 +181,7 @@ pub(crate) type Writer<'a> = &'a dyn Fn(&Lake, &Path, &str) -> Result<(), Failur
 /// Writes what the export lacks or has stale, each hour file with `write`.
 /// The lake is open and migrated and `_held` is the caller's proof that it
 /// holds the lock.
-fn export_with(
+pub(crate) fn export_with(
     lake: &Lake,
     data_dir: &Path,
     clock: &dyn Clock,
@@ -321,7 +328,10 @@ fn temporary_for(file: &Path) -> Result<PathBuf, Failure> {
 /// Writes `file` whole: `write` fills a temporary name, which is synced and
 /// renamed into place, and its folder synced. The temporary file does not
 /// outlive a failure.
-fn place(file: &Path, write: impl FnOnce(&Path) -> Result<(), Failure>) -> Result<(), Failure> {
+pub(crate) fn place(
+    file: &Path,
+    write: impl FnOnce(&Path) -> Result<(), Failure>,
+) -> Result<(), Failure> {
     let temporary = temporary_for(file)?;
     let what = "an export file";
     let result = write(&temporary)
@@ -436,7 +446,6 @@ fn rewrite_profiles(file: &Path) -> Result<bool, Failure> {
 
 /// The export's hour files older than the hourly keep at `now`: what `dp
 /// daily` deletes. A name that is not an hour's file is not one of them.
-#[cfg_attr(not(test), expect(dead_code, reason = "`dp daily` calls it, next"))]
 pub(crate) fn expired_hour_files(
     data_dir: &Path,
     now: DateTime<Utc>,
