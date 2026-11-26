@@ -1,5 +1,5 @@
 //! Deployment settings, read from the environment variables listed in
-//! [5.4.1](../docs/5.4.1-configuration.md#deployment-settings). A missing or
+//! `docs/5.4.1-configuration.md`. A missing or
 //! malformed one is a *technical, fundamental* error: the operator fixes the
 //! environment's `.env`.
 
@@ -10,7 +10,7 @@ use crate::error::{ErrorType, Report};
 
 /// A secret: its `Debug` and `Display` never print it, so it cannot reach a
 /// log by accident. It is never logged, nor written to bronze or the export
-/// ([5.4.1](../docs/5.4.1-configuration.md#deployment-settings)).
+/// (`docs/5.4.1-configuration.md`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
@@ -57,8 +57,6 @@ pub struct Config {
     pub adhoc_memory_limit: String,
     /// `DP_ADHOC_THREADS`: DuckDB's `threads` for an ad hoc query.
     pub adhoc_threads: u32,
-    /// `DP_CONTAINER_MEMORY`: the container's memory limit.
-    pub container_memory: String,
 }
 
 fn fundamental(reason: &str, message: &str, variable: &str) -> Box<Report> {
@@ -70,6 +68,10 @@ fn fundamental(reason: &str, message: &str, variable: &str) -> Box<Report> {
 
 impl Config {
     /// Reads the settings from the process's environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_lookup`](Config::from_lookup).
     pub fn from_env() -> Result<Config, Box<Report>> {
         Config::from_lookup(|name| std::env::var(name).ok())
     }
@@ -78,6 +80,12 @@ impl Config {
     /// `None`; [`from_env`](Config::from_env) passes the environment, a test
     /// passes a map. Reads the secret from the file `DP_BLIZZARD_CLIENT_SECRET_FILE`
     /// names, without its trailing newline.
+    ///
+    /// # Errors
+    ///
+    /// A *technical, fundamental* fatal, exit `2`, naming the variable, where a
+    /// required variable is missing or empty, `DP_ADHOC_THREADS` is not a
+    /// positive whole number, or the secret file cannot be read or is empty.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, Box<Report>> {
         let required = |name: &str| {
             lookup(name).filter(|v| !v.is_empty()).ok_or_else(|| {
@@ -128,7 +136,6 @@ impl Config {
             lock_file: PathBuf::from(required("DP_LOCK_FILE")?),
             adhoc_memory_limit: required("DP_ADHOC_MEMORY_LIMIT")?,
             adhoc_threads,
-            container_memory: required("DP_CONTAINER_MEMORY")?,
         })
     }
 }
@@ -162,7 +169,6 @@ mod tests {
             ("DP_LOCK_FILE", "/srv/dp/dp.lock"),
             ("DP_ADHOC_MEMORY_LIMIT", "4GB"),
             ("DP_ADHOC_THREADS", "1"),
-            ("DP_CONTAINER_MEMORY", "5GB"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -191,7 +197,6 @@ mod tests {
         assert_eq!(config.lock_file, PathBuf::from("/srv/dp/dp.lock"));
         assert_eq!(config.adhoc_memory_limit, "4GB");
         assert_eq!(config.adhoc_threads, 1);
-        assert_eq!(config.container_memory, "5GB");
     }
 
     #[test]

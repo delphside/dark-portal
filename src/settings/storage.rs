@@ -1,5 +1,5 @@
 //! Product settings of the *storage* area: each a *keep*, which deletes what
-//! is older than it ([5.4.1](../../docs/5.4.1-configuration.md#product-settings)).
+//! is older than it (`docs/5.4.1-configuration.md`).
 //! `None` is "indefinitely".
 
 use std::time::Duration;

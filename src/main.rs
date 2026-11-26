@@ -9,8 +9,12 @@ use dp::error::{ExitStatus, exit_status};
 
 fn main() -> ExitCode {
     // Logs go to stderr, which systemd sends to the journal.
+    // The journal stamps each line itself and stores escape codes as typed,
+    // so no time and no colour.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
         .init();
 
     let cli = match Cli::try_parse() {

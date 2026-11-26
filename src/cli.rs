@@ -1,14 +1,25 @@
 //! The command line: one subcommand per job
-//! ([5.1.1](../docs/5.1.1-architecture.md)). Each is a stub until its
+//! (`docs/5.1.1-architecture.md`). Each is a stub until its
 //! increment is built.
 
 use clap::{Parser, Subcommand};
 
 use crate::error::{ErrorType, Report};
 
+/// The exit statuses, for `--help` (1.10, *What a script's exit status
+/// means*).
+const EXIT_STATUSES: &str = "Exit statuses:
+  0   completed
+  1   stopped on a business error
+  2   stopped on a fundamental error, such as a missing setting or a full disk
+  3   completed with errors, which the next run repeats
+  64  usage error
+  70  unexpected error
+  75  temporary failure, such as a late snapshot or the lock held; retry";
+
 /// `dp`: collects the auction house and keeps its history.
 #[derive(Debug, Parser)]
-#[command(name = "dp", version, about)]
+#[command(name = "dp", version, about, after_help = EXIT_STATUSES)]
 pub struct Cli {
     /// The job to run.
     #[command(subcommand)]
@@ -18,17 +29,18 @@ pub struct Cli {
 /// The jobs `dp` runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
 pub enum Command {
-    /// The hourly run: collect, then transform and export the hour.
+    /// The hourly run: collect, items, transform and export, in that order.
     Hourly,
     /// Collect the current hour's snapshot into bronze.
     Collect,
-    /// Fetch item data into bronze.
+    /// Fetch item data for item IDs new to bronze.
     Items,
-    /// Transform an hour from bronze into silver and gold.
+    /// Process every bronze hour after the high-water mark.
     Transform,
-    /// Export an hour for the clients.
+    /// Write the export: every committed hour it lacks.
     Export,
-    /// The daily run: close the day before.
+    /// Close the day, push to the bucket, delete what is past its keep and
+    /// retry items that answered 404.
     Daily,
 }
 

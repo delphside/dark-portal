@@ -189,6 +189,14 @@ impl Report {
         let reason = self.reason.as_str();
         let domain = self.domain.as_str();
         let message = self.message.as_str();
+        // The metadata as one field, so every key reaches the journal.
+        let metadata = self
+            .metadata
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let metadata = metadata.as_str();
         match self.outcome {
             Severity::Ok => {
                 tracing::info!(
@@ -196,6 +204,7 @@ impl Report {
                     "error.type" = error_type,
                     "error.reason" = reason,
                     "error.domain" = domain,
+                    metadata,
                     "{message}"
                 )
             }
@@ -205,6 +214,7 @@ impl Report {
                     "error.type" = error_type,
                     "error.reason" = reason,
                     "error.domain" = domain,
+                    metadata,
                     "{message}"
                 )
             }
@@ -214,9 +224,18 @@ impl Report {
                     "error.type" = error_type,
                     "error.reason" = reason,
                     "error.domain" = domain,
+                    metadata,
                     "{message}"
                 )
             }
+        }
+        // Each failure the run carried on past, and the cause, is logged with
+        // its own type (1.10, exit 3).
+        if let Some(cause) = &self.cause {
+            cause.log();
+        }
+        for error in &self.errors {
+            error.log();
         }
     }
 }

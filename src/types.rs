@@ -1,5 +1,5 @@
 //! The types Dark Portal's data is held in, as
-//! [5.4.5](../docs/5.4.5-data-dictionary.md) lists them.
+//! `docs/5.4.5-data-dictionary.md` lists them.
 //!
 //! A type with a fixed set of values is held in storage as a `VARCHAR` holding
 //! one of them, since DuckLake has no `ENUM`; [`as_str`](TimeLeft::as_str) and
@@ -98,7 +98,7 @@ pub struct ItemId(pub u32);
 pub struct AuctionId(pub u64);
 
 /// The hour starting of a snapshot, as hours since the Unix epoch, UTC
-/// ([5.2.2](../docs/5.2.2-listing-lifecycle-and-events.md#times)).
+/// (`docs/5.2.2-listing-lifecycle-and-events.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hour(pub i64);
 
@@ -157,7 +157,7 @@ impl Duration {
 }
 
 fixed_values! {
-    /// An event ([5.2.2](../docs/5.2.2-listing-lifecycle-and-events.md#the-events)).
+    /// An event (`docs/5.2.2-listing-lifecycle-and-events.md`).
     EventKind {
         Posted => "posted",
         PartlySold => "partly_sold",
@@ -178,7 +178,7 @@ fixed_values! {
 
 fixed_values! {
     /// How sure a fact is
-    /// ([5.2.2](../docs/5.2.2-listing-lifecycle-and-events.md#how-sure-a-fact-is)).
+    /// (`docs/5.2.2-listing-lifecycle-and-events.md`).
     Tier {
         Observed => "observed",
         Certain => "certain",

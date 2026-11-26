@@ -1,5 +1,5 @@
 //! Product settings of the *collection* area
-//! ([5.4.1](../../docs/5.4.1-configuration.md#product-settings)).
+//! (`docs/5.4.1-configuration.md`).
 
 use std::time::Duration;
 

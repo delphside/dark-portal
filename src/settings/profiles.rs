@@ -1,5 +1,5 @@
 //! Product settings of the *profiles* area
-//! ([5.4.1](../../docs/5.4.1-configuration.md#product-settings)).
+//! (`docs/5.4.1-configuration.md`).
 
 /// "default *N* window": 7 days.
 pub const DEFAULT_N_WINDOW_DAYS: u32 = 7;
