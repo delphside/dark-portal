@@ -15,6 +15,6 @@ ExecStart=/usr/local/libexec/dp/dp-run hourly
 # failed, which is true: the hour is still unfetched until a later run takes it.
 Restart=no
 # 5.4.1: the item fetch ends 50 min after the start (the lock wait before the
-# next hourly run) and `transform` and `export` are bounded at 5 min, 55 min.
-# A test reads this against the settings.
+# next hourly run, `items::fetch_end`) and `transform` and `export` are bounded
+# at 5 min, 55 min. A test reads this against the settings.
 RuntimeMaxSec=55min

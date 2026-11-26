@@ -130,6 +130,46 @@ fn hourly_runs_collect_items_transform_export_in_order() {
 }
 
 #[test]
+fn the_report_has_the_time_of_each_step() {
+    // Each step takes a different time of the clock, which is what the report
+    // carries under the step's name, whatever the step returned.
+    let w = World::new("hourly-timings");
+    let sleeps = [
+        ("collect", 3),
+        ("items", 5),
+        ("transform", 7),
+        ("export", 11),
+    ];
+    let took = |step: &str| Duration::from_secs(sleeps.iter().find(|(s, _)| *s == step).unwrap().1);
+    let steps = Steps {
+        collect: &|| {
+            w.clock.sleep(took("collect"));
+            (Report::ok(), None)
+        },
+        items: &|_| {
+            w.clock.sleep(took("items"));
+            Report::ok()
+        },
+        transform: &|_| {
+            w.clock.sleep(took("transform"));
+            error(ErrorType::TechnicalBlip)
+        },
+        export: &|_| {
+            w.clock.sleep(took("export"));
+            Report::ok()
+        },
+    };
+    let report = run_steps(&w.config, &w.clock, &steps);
+    for (step, seconds) in sleeps {
+        assert_eq!(
+            report.metadata[&format!("{step}_seconds")],
+            format!("{seconds}.0"),
+            "{step}: {report:?}"
+        );
+    }
+}
+
+#[test]
 fn hourly_runs_items_transform_and_export_after_any_collect_result() {
     // O50, D18.2 to D18.5.
     for (name, collect, _) in collects() {

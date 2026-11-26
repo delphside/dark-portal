@@ -28,7 +28,8 @@
 #   64  usage error
 #   70  unexpected error: dp's, or an exit status docker passes on that is none
 #       of the above, such as a kill's 137
-#   75  temporary failure: dp's, or the docker daemon is unreachable; retry
+#   75  temporary failure: dp's, the docker daemon is unreachable, or a run of
+#       the same job is live already (the container's name is taken); retry
 #
 # There is no pivot of its own: the job in the container has it
 # (docs/5.1.1 *Restarts and recovery*), and this script changes nothing.
@@ -96,9 +97,10 @@ if [[ ! -f "$DP_LOCK_FILE" ]]; then
     die 2 "the lock file $DP_LOCK_FILE does not exist; make it as docs/5.3.2 says"
 fi
 
+name="dp-${subcommand}-${env_name}"
 docker_args=(
     --rm --init
-    --name "dp-${subcommand}-${env_name}"
+    --name "$name"
     --user "$DP_RUN_USER"
     --memory "$DP_CONTAINER_MEMORY" --memory-swap "$DP_CONTAINER_MEMORY"
     --read-only --tmpfs /tmp --cap-drop ALL
@@ -119,6 +121,19 @@ fi
 if ! docker info > /dev/null 2>&1; then
     die 75 "the docker daemon is unreachable"
 fi
+
+# The container is named for its job and environment, so a run of the same job
+# that is live holds the name: that is the lock's case, a blip, and not a
+# failure to run. Ask before running, since docker's 125 for a name in use
+# cannot be told from its other 125s. Only a running container counts; one that
+# is left stopped is a fault for `docker run` to report as exit 2. The names
+# are compared whole, not as docker's name filter matches them.
+running=$(docker ps --format '{{.Names}}') || die 75 "docker could not list its containers"
+while IFS= read -r running_name; do
+    if [[ "$running_name" == "$name" ]]; then
+        die 75 "a run of the same job is live already: $name"
+    fi
+done <<< "$running"
 
 status=0
 docker run "${docker_args[@]}" "$DP_IMAGE" "$subcommand" "$@" || status=$?

@@ -13,7 +13,7 @@ use duckdb::{Connection, params};
 use crate::collect::failure::{Failure, io_failure};
 use crate::collect::snapshot::{duckdb_failure, quoted, sync_file, timestamp};
 use crate::error::{ErrorType, Report};
-use crate::lake::{job_limits, scratch_dir};
+use crate::lake::{Spill, job_limits, scratch_dir};
 use crate::settings::collection::REGION;
 use crate::types::ItemId;
 
@@ -50,13 +50,16 @@ fn read_failure(message: &str) -> Failure {
     ))
 }
 
-fn open(scratch: &Path) -> Result<Connection, Failure> {
-    let limits = job_limits(scratch)?;
+/// A connection under the job limits, and its spill folder, which goes when
+/// the folder is dropped: bind it first, as `let (_spill, connection) = open(..)?`,
+/// so the connection is closed before it.
+fn open(scratch: &Path) -> Result<(Spill, Connection), Failure> {
+    let spill = Spill::create(scratch)?;
     let connection = Connection::open_in_memory().map_err(|e| duckdb_failure(&e.to_string()))?;
     connection
-        .execute_batch(&limits)
+        .execute_batch(&job_limits(&spill))
         .map_err(|e| duckdb_failure(&e.to_string()))?;
-    Ok(connection)
+    Ok((spill, connection))
 }
 
 /// Every item ID in bronze's snapshot files that bronze's item files have no
@@ -80,7 +83,7 @@ pub fn ids_to_fetch(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
     }
     sql.push_str(" ORDER BY item");
 
-    let connection = open(&scratch_dir(data_dir))?;
+    let (_spill, connection) = open(&scratch_dir(data_dir))?;
     let mut statement = connection
         .prepare(&sql)
         .map_err(|e| read_failure(&e.to_string()))?;
@@ -102,7 +105,7 @@ pub fn ids_not_found(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
     if !has_parquet(&items)? {
         return Ok(Vec::new());
     }
-    let connection = open(&scratch_dir(data_dir))?;
+    let (_spill, connection) = open(&scratch_dir(data_dir))?;
     let mut statement = connection
         .prepare(&format!(
             "SELECT item FROM (SELECT item, status, row_number() OVER (PARTITION BY item \
@@ -123,14 +126,16 @@ pub fn ids_not_found(data_dir: &Path) -> Result<Vec<ItemId>, Failure> {
 
 /// A run's responses, held by DuckDB until they are written.
 pub struct Responses {
+    // In this order: the connection is closed before its spill folder goes.
     connection: Connection,
+    _spill: Spill,
     rows: u64,
 }
 
 impl Responses {
     /// An empty set.
     pub fn new(scratch: &Path) -> Result<Responses, Failure> {
-        let connection = open(scratch)?;
+        let (spill, connection) = open(scratch)?;
         connection
             .execute_batch(
                 "CREATE TABLE response(item UINTEGER, fetched_at TIMESTAMPTZ, \
@@ -139,6 +144,7 @@ impl Responses {
             .map_err(|e| duckdb_failure(&e.to_string()))?;
         Ok(Responses {
             connection,
+            _spill: spill,
             rows: 0,
         })
     }

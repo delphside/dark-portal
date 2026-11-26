@@ -6,6 +6,12 @@
 //! the sum, once, where the steps are done: after `export` under `dp hourly`,
 //! after the step itself where `dp transform` or `dp export` runs alone, so a
 //! step alone is judged against the whole bound.
+//!
+//! **Timings.** Every job's final report carries its total time and each step's,
+//! in seconds, as report metadata (`total_seconds`, `<step>_seconds`), which is
+//! logged on the final line. [`seconds`] is the one format, [`record`] the one
+//! way a step's time is put on a report, and the monthly capacity plan reads
+//! them against the bounds and limits (5.4.1, `docs/5.4.1-configuration.md`).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -73,7 +79,7 @@ fn over_bound_warning(hour: Hour, took: Duration) -> Report {
         "An hour took longer to transform and export than the hourly processing bound.",
     )
     .with_metadata("hour", hour_name(hour))
-    .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
+    .with_metadata("seconds", seconds(took))
     .with_metadata(
         "bound_seconds",
         HOURLY_PROCESSING_BOUND.as_secs().to_string(),
@@ -83,6 +89,37 @@ fn over_bound_warning(hour: Hour, took: Duration) -> Report {
 /// The time since `started`, as the clock tells it.
 pub(crate) fn since(clock: &dyn Clock, started: chrono::DateTime<chrono::Utc>) -> Duration {
     (clock.now() - started).to_std().unwrap_or_default()
+}
+
+/// A time as the seconds a report carries, to a tenth.
+pub(crate) fn seconds(took: Duration) -> String {
+    format!("{:.1}", took.as_secs_f64())
+}
+
+/// Puts the time since `started` on `report` as `<step>_seconds`; the time.
+pub(crate) fn record(
+    report: &mut Report,
+    clock: &dyn Clock,
+    step: &str,
+    started: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    let took = since(clock, started);
+    report.metadata.insert(seconds_key(step), seconds(took));
+    took
+}
+
+/// Runs a job and puts its total time on the report it ends with, as
+/// `total_seconds`: the one place a job's total is taken, for every job.
+pub(crate) fn totalled(clock: &dyn Clock, job: impl FnOnce() -> Report) -> Report {
+    let started = clock.now();
+    let mut report = job();
+    record(&mut report, clock, "total", started);
+    report
+}
+
+/// The seconds a step's time is carried under: the key [`record`] writes.
+pub(crate) fn seconds_key(step: &str) -> String {
+    format!("{step}_seconds")
 }
 
 /// Judges the bound on `times` and counts the hours over it on `report`: the
@@ -153,5 +190,27 @@ mod tests {
         times.add(Hour(10), BOUND + Duration::from_secs(1));
         let report = finish(&times, Report::ok());
         assert_eq!(report.metadata["hours_over_bound"], "1");
+    }
+
+    #[test]
+    fn a_jobs_total_is_the_clocks_time_over_the_job_in_seconds_to_a_tenth() {
+        let clock = crate::collect::clock::FakeClock::at("2026-11-26T11:35:00Z");
+        let report = totalled(&clock, || {
+            clock.sleep(Duration::from_millis(12_340));
+            Report::ok()
+        });
+        assert_eq!(report.metadata["total_seconds"], "12.3");
+    }
+
+    #[test]
+    fn a_steps_time_is_recorded_under_its_name() {
+        let clock = crate::collect::clock::FakeClock::at("2026-11-26T11:35:00Z");
+        let started = clock.now();
+        clock.sleep(Duration::from_secs(90));
+        let mut report = Report::ok();
+        let took = record(&mut report, &clock, "export", started);
+        assert_eq!(took, Duration::from_secs(90));
+        assert_eq!(report.metadata[&seconds_key("export")], "90.0");
+        assert_eq!(report.metadata["export_seconds"], "90.0");
     }
 }

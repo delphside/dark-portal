@@ -286,8 +286,8 @@ pub enum ExitStatus {
     /// `70`: stopped on an *unexpected* error (`EX_SOFTWARE`); paged.
     Unexpected,
     /// `75`: stopped on a *technical, blip* that kept failing (`EX_TEMPFAIL`),
-    /// such as the lock held past the lock wait. The scheduler retries on this
-    /// alone.
+    /// such as the lock held past the lock wait. A retry is for this alone:
+    /// `dp daily` retries itself, and the next timer start is the hourly one.
     Blip,
 }
 

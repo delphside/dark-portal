@@ -217,9 +217,16 @@ fn collect(
     Ok(done("collected"))
 }
 
+/// What makes a name one run's own: its `pid`, which is not unique across
+/// containers, and `random` ([`random_suffix`]). The one scheme, which a
+/// temporary file and a DuckDB spill folder ([`crate::lake::Spill`]) share.
+pub(crate) fn unique_tag(pid: u32, random: &str) -> String {
+    format!("{pid}-{random}")
+}
+
 /// The temporary name of an hour's file for a run: its `pid` and `random`.
 pub(crate) fn temporary_name(hour_file: &str, pid: u32, random: &str) -> String {
-    format!("{hour_file}.{pid}-{random}.tmp")
+    format!("{hour_file}.{}.tmp", unique_tag(pid, random))
 }
 
 /// 16 hex characters from the kernel's random source.

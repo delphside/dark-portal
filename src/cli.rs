@@ -3,7 +3,8 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::collect::{self, Endpoints, SystemClock};
+use crate::bound;
+use crate::collect::{self, Clock, Endpoints, SystemClock};
 use crate::config::Config;
 use crate::error::Report;
 use crate::{daily, export, hourly, items, transform};
@@ -63,6 +64,16 @@ impl Command {
 /// Runs a command. Each reads its settings first: a missing or malformed one
 /// stops it as *fundamental*, exit `2`.
 pub fn run(command: Command) -> Report {
+    run_timed(command, &SystemClock)
+}
+
+/// [`run`], its total time taken by `clock`: on the report of a job that stopped
+/// at its settings as on any other.
+fn run_timed(command: Command, clock: &dyn Clock) -> Report {
+    bound::totalled(clock, || run_with_settings(command))
+}
+
+fn run_with_settings(command: Command) -> Report {
     match Config::from_env() {
         Ok(config) => match command {
             Command::Hourly => hourly::run(&config, &SystemClock),
@@ -125,6 +136,11 @@ mod tests {
             Command::Daily,
         ] {
             let report = run(command);
+            assert!(
+                report.metadata.contains_key("total_seconds"),
+                "{}: every job's report has its total time",
+                command.name()
+            );
             assert_eq!(report.reason, "MISSING_SETTING", "{}", command.name());
             assert_eq!(
                 exit_status(&report),

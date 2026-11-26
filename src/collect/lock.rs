@@ -100,7 +100,7 @@ pub fn acquire(path: &Path, wait: Duration, clock: &dyn Clock) -> Result<Lock, F
                     return Err(Failure::Stop(Box::new(Report::fatal(
                         ErrorType::TechnicalBlip,
                         "LOCK_WAIT_EXPIRED",
-                        "Another job held the lock past the lock wait; the scheduler tries again.",
+                        "Another job held the lock past the lock wait; the job is tried again.",
                     ))));
                 }
                 clock.sleep(RETRY_EVERY);

@@ -14,6 +14,12 @@
 //! **A day that cannot be closed stops the run** (`75`, before the pivot): a
 //! later step would work on a day the lake does not yet hold.
 //!
+//! **An attempt that cannot finish its close in time does not start it**
+//! ([`too_late`]): once it has the lock, if less than [`DAY_CLOSE_BOUND`] and
+//! the [`DAILY_AFTER_CLOSE_ALLOWANCE`] (the export and the deletions of files,
+//! which no deadline gates) is left before its deadline, it closes nothing,
+//! releases the lock and exits `75`, and [`run`] tries again.
+//!
 //! **After the pivot**, in order, each under the lock held since the start:
 //!
 //! 1. the export, so that `item_day` in it and in the bucket holds the closed
@@ -35,8 +41,17 @@
 //!
 //! **A run that exits `75` is run again by [`run`] itself** ([`retrying`]):
 //! with the lock released, after [`DAILY_RETRY_INTERVAL`], while the next
-//! attempt would start before the retries end ([`DAILY_RETRIES_END_HOUR_UTC`]).
-//! The status is the last attempt's, honest: `75` where the retries ran out.
+//! attempt would start before the retries end: [`DAILY_RETRIES_END_HOUR_UTC`]
+//! on the day it started, or the [`DAILY_RETRIES_SPAN`] after it started where
+//! that is earlier, so a run started early or by hand cannot outrun the daily
+//! run time limit. The status is the last attempt's, honest: `75` where the
+//! retries ran out.
+//!
+//! **Timings** ([`crate::bound`]): the report carries the time of the close
+//! (`close_seconds`), the export, the push, the deletions (`expiry_seconds`),
+//! the clearing of temporary files and spill folders (`temporary_seconds`) and
+//! the items asked again (`items_retry_seconds`), and how many `attempts` were
+//! made.
 
 mod close;
 mod expiry;
@@ -48,6 +63,7 @@ pub(crate) mod transport;
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
 
+use crate::bound;
 use crate::collect::failure::Failure;
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
@@ -57,7 +73,8 @@ use crate::export::{self, Writer};
 use crate::items::fetch_end;
 use crate::lake::{Backend, Lake};
 use crate::settings::scheduling::{
-    DAILY_RETRIES_END_HOUR_UTC, DAILY_RETRY_INTERVAL, DAY_CLOSE_BOUND, LOCK_WAIT,
+    DAILY_AFTER_CLOSE_ALLOWANCE, DAILY_RETRIES_END_HOUR_UTC, DAILY_RETRIES_SPAN,
+    DAILY_RETRY_INTERVAL, DAY_CLOSE_BOUND, LOCK_WAIT,
 };
 use crate::settings::storage::BRONZE_KEEP_HOST_SNAPSHOTS;
 use crate::transform::fatal;
@@ -83,11 +100,15 @@ pub fn run(config: &Config, clock: &dyn Clock, endpoints: Endpoints) -> Report {
 }
 
 /// When the retries end for a run that started at `start`: 03:00 UTC (the
-/// daily retries end) on the day it started. A start after that, such as a
-/// persistent timer's catch-up at 04:00, has no retries.
+/// daily retries end) on the day it started, or the daily retries span after
+/// `start` where that is earlier: the run time limit counts from `start`, so a
+/// run started before the timer's time, such as by hand, retries for no longer
+/// than one started by it. A start after 03:00, such as a persistent timer's
+/// catch-up at 04:00, has no retries.
 fn retries_end(start: DateTime<Utc>) -> DateTime<Utc> {
     let end = NaiveTime::from_hms_opt(DAILY_RETRIES_END_HOUR_UTC, 0, 0).expect("an hour of a day");
-    start.date_naive().and_time(end).and_utc()
+    let span = ChronoDuration::from_std(DAILY_RETRIES_SPAN).expect("a span in range");
+    start.date_naive().and_time(end).and_utc().min(start + span)
 }
 
 /// Makes the attempt, and makes it again, after the daily retry interval and
@@ -96,8 +117,10 @@ fn retries_end(start: DateTime<Utc>) -> DateTime<Utc> {
 /// end. The report is the last attempt's, so `75` where the retries ran out.
 pub(crate) fn retrying(clock: &dyn Clock, attempt: &mut dyn FnMut() -> Report) -> Report {
     let end = retries_end(clock.now());
+    let mut attempts: u32 = 0;
     loop {
-        let report = attempt();
+        attempts += 1;
+        let report = attempt().with_metadata("attempts", attempts.to_string());
         if exit_status(&report) != ExitStatus::Blip {
             return report;
         }
@@ -198,6 +221,10 @@ impl Steps<'_> {
         let config = self.config;
         let now = self.clock.now();
         let deadline = deadline(now);
+        let left = (deadline - now).to_std().unwrap_or_default();
+        if left < DAY_CLOSE_BOUND + DAILY_AFTER_CLOSE_ALLOWANCE {
+            return Err(Box::new(too_late(left)));
+        }
         let lake = Lake::open(self.backend, &crate::lake::scratch_dir(&config.data_dir))
             .and_then(|lake| lake.migrate(now).map(|_| lake))
             .and_then(|lake| lake.load_profiles().map(|()| lake))
@@ -224,7 +251,7 @@ impl Steps<'_> {
         );
 
         report = report
-            .with_metadata("close_seconds", format!("{:.1}", close_took.as_secs_f64()))
+            .with_metadata("close_seconds", bound::seconds(close_took))
             .with_metadata(
                 "close_over_bound",
                 (close_took > DAY_CLOSE_BOUND).to_string(),
@@ -251,10 +278,14 @@ impl Steps<'_> {
             );
         }
 
+        let started = self.clock.now();
         errors.extend(
             export::export_with(&lake, &config.data_dir, self.clock, self.held, self.write).errors,
         );
+        bound::record(&mut report, self.clock, "export", started);
+        let started = self.clock.now();
         let pushing = self.push(deadline, &mut errors);
+        bound::record(&mut report, self.clock, "push", started);
         report = report.with_metadata("objects_pushed", pushing.objects.to_string());
         for (object, retries) in &pushing.retried {
             let warning = pushed_after_retries(object, *retries);
@@ -272,15 +303,23 @@ impl Steps<'_> {
                     .join(","),
             );
         }
+        let started = self.clock.now();
         self.expire(&lake, now, deadline, &mut errors, &mut report);
+        bound::record(&mut report, self.clock, "expiry", started);
+        let started = self.clock.now();
         match temporary::clear_stale(&config.data_dir, now) {
-            Ok(removed) => {
-                report = report.with_metadata("temporary_files_removed", removed.to_string());
+            Ok(cleared) => {
+                report = report
+                    .with_metadata("temporary_files_removed", cleared.files.to_string())
+                    .with_metadata("spill_folders_removed", cleared.spill_folders.to_string());
             }
             Err(failure) => errors.push(carried(failure, "clearing temporary files")),
         }
+        bound::record(&mut report, self.clock, "temporary", started);
+        let started = self.clock.now();
         let not_found = self.ask_again(deadline, &mut errors);
         report = report.with_metadata("items_asked_again", not_found.to_string());
+        bound::record(&mut report, self.clock, "items_retry", started);
 
         if errors.is_empty() {
             return Ok(warned(report, &warnings));
@@ -446,13 +485,28 @@ pub(crate) fn left_for_next_run(step: &str, count: usize) -> Report {
     .with_metadata("why", "the daily deadline")
 }
 
+/// Too little is left before the deadline to close the days and do what no
+/// deadline gates after: nothing is changed, and the run is tried again.
+fn too_late(left: std::time::Duration) -> Report {
+    Report::fatal(
+        ErrorType::TechnicalBlip,
+        "DAILY_TOO_LATE_TO_CLOSE",
+        "Too little time is left before the daily deadline to close the days; dp daily tries again.",
+    )
+    .with_metadata("left_seconds", bound::seconds(left))
+    .with_metadata(
+        "needed_seconds",
+        bound::seconds(DAY_CLOSE_BOUND + DAILY_AFTER_CLOSE_ALLOWANCE),
+    )
+}
+
 /// The close took longer than the day close bound.
 fn close_over_bound(took: std::time::Duration) -> Report {
     Report::warning(
         "DAY_CLOSE_OVER_BOUND",
         "Closing the days took longer than the day close bound.",
     )
-    .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
+    .with_metadata("seconds", bound::seconds(took))
     .with_metadata("bound_seconds", DAY_CLOSE_BOUND.as_secs().to_string())
 }
 
@@ -505,13 +559,13 @@ fn failures(deleted: expiry::Deleted, doing: &str) -> Vec<Report> {
         .collect()
 }
 
-/// The day before cannot yet be closed: retry, which systemd does until the
-/// daily retries end.
+/// The day before cannot yet be closed: retry, which `dp daily` does itself
+/// ([`retrying`]).
 fn not_yet(day: chrono::NaiveDate) -> Report {
     Report::fatal(
         ErrorType::TechnicalBlip,
         "DAY_NOT_CLOSABLE",
-        "The day before has an hour that is neither processed nor a gap; the scheduler tries again.",
+        "The day before has an hour that is neither processed nor a gap; dp daily tries again.",
     )
     .with_metadata("day", day.to_string())
 }

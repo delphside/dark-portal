@@ -34,17 +34,58 @@ pub fn scratch_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("state/duckdb-tmp")
 }
 
+/// A DuckDB connection's own spill folder, `<pid>-<16 hex random>` under
+/// [`scratch_dir`]: the scheme the temporary files of bronze are named by
+/// ([`unique_tag`](crate::collect::unique_tag)). Two DuckDB instances that
+/// spilled to one folder would write the same file names, so every connection
+/// has its own, and the process's pid is not unique across containers. The
+/// folder is removed when this is dropped, which is when its connection is
+/// closed: declare a `Spill` before the connection that uses it, or a field
+/// after it. One left by a dead run is removed by `dp daily`
+/// ([`crate::daily`]'s stale-file step).
+#[derive(Debug)]
+pub struct Spill {
+    path: PathBuf,
+}
+
+impl Spill {
+    /// Makes a new folder under `root`, which is [`scratch_dir`] of the data
+    /// folder in a job.
+    ///
+    /// # Errors
+    ///
+    /// *Technical* where the folder cannot be made: a full disk is *fundamental*.
+    pub fn create(root: &Path) -> Result<Spill, Failure> {
+        let tag = crate::collect::unique_tag(std::process::id(), &crate::collect::random_suffix()?);
+        let path = root.join(tag);
+        std::fs::create_dir_all(&path)
+            .map_err(|e| io_failure(&e, "creating the DuckDB spill folder"))?;
+        Ok(Spill { path })
+    }
+
+    /// The folder.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // What is left is a stale folder, which `dp daily` removes.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// The statements that set every connection of a job the same way: extensions
 /// are loaded but never installed, `memory_limit` and `threads` are the job's
-/// (5.4.1), and `temp_directory` is `scratch`, which is made here.
-pub(crate) fn job_limits(scratch: &Path) -> Result<String, Failure> {
-    std::fs::create_dir_all(scratch).map_err(|e| io_failure(&e, "creating the scratch folder"))?;
-    Ok(format!(
+/// (5.4.1), and `temp_directory` is the connection's own `spill`.
+pub(crate) fn job_limits(spill: &Spill) -> String {
+    format!(
         "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
          SET memory_limit='{JOB_MEMORY_LIMIT}'; SET threads={JOB_THREADS}; \
          SET temp_directory={};",
-        crate::collect::snapshot::quoted(&scratch.to_string_lossy())
-    ))
+        crate::collect::snapshot::quoted(&spill.path().to_string_lossy())
+    )
 }
 
 /// The name the lake is attached under, and so the catalog every statement's
@@ -68,7 +109,9 @@ pub enum Backend {
 /// An open lake: a DuckDB connection with the catalog attached as `lake` and
 /// made the default, so `silver.event` is `lake.silver.event`.
 pub struct Lake {
+    // In this order: the connection is closed before its spill folder goes.
     connection: Connection,
+    _spill: Spill,
 }
 
 /// A failure of the lake's own: the lake could not be used, which is not the
@@ -157,7 +200,8 @@ pub(crate) fn attach_statement(backend: &Backend) -> String {
 
 impl Lake {
     /// Opens the lake under the job limits (`memory_limit` and `threads`).
-    /// `scratch` is where DuckDB spills what does not fit the memory limit.
+    /// `scratch` is the folder DuckDB's spill folder of this lake is made in
+    /// ([`Spill`]), for what does not fit the memory limit.
     ///
     /// # Errors
     ///
@@ -165,7 +209,8 @@ impl Lake {
     /// image installs them at build; autoinstall stays off) or the folder
     /// cannot be used.
     pub fn open(backend: &Backend, scratch: &Path) -> Result<Lake, Failure> {
-        let limits = job_limits(scratch)?;
+        let spill = Spill::create(scratch)?;
+        let limits = job_limits(&spill);
         let connection = Connection::open_in_memory()
             .map_err(|e| lake_failure(&e.to_string(), "opening DuckDB"))?;
         let batch = |sql: &str, doing: &str| {
@@ -186,7 +231,10 @@ impl Lake {
             .execute_batch(&attach)
             .map_err(|e| unavailable(&e.to_string(), "attaching the lake"))?;
         batch(&format!("USE {CATALOG};"), "using the lake")?;
-        Ok(Lake { connection })
+        Ok(Lake {
+            connection,
+            _spill: spill,
+        })
     }
 
     /// The connection, for the statements of a job.
@@ -225,27 +273,76 @@ mod tests {
     use super::*;
     use crate::error::{ExitStatus, exit_status};
 
+    fn scratch(name: &str) -> PathBuf {
+        let scratch = std::env::temp_dir().join(format!("dp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        scratch
+    }
+
     #[test]
-    fn a_job_connection_spills_to_the_scratch_folder_not_the_working_directory() {
+    fn a_job_connection_spills_to_its_own_folder_not_the_working_directory() {
         // The image's working directory is read-only: DuckDB's default spill
         // folder, `.tmp` beside it, would not be writable.
-        let scratch = std::env::temp_dir().join(format!("dp-spill-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
+        let root = scratch("spill");
+        let spill = Spill::create(&root).unwrap();
         let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(&job_limits(&scratch).unwrap())
-            .unwrap();
+        connection.execute_batch(&job_limits(&spill)).unwrap();
         let set: String = connection
             .query_row("SELECT current_setting('temp_directory')", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(set, scratch.to_string_lossy());
-        assert!(scratch.is_dir());
+        assert_eq!(set, spill.path().to_string_lossy());
+        assert!(spill.path().is_dir());
+        assert_eq!(spill.path().parent(), Some(root.as_path()));
         assert_eq!(
             scratch_dir(Path::new("/srv/dp/x")),
             Path::new("/srv/dp/x/state/duckdb-tmp")
         );
+    }
+
+    #[test]
+    fn two_connections_get_different_folders_named_for_the_process_and_a_random_suffix() {
+        let root = scratch("spill-two");
+        let first = Spill::create(&root).unwrap();
+        let second = Spill::create(&root).unwrap();
+        assert_ne!(first.path(), second.path());
+        for spill in [&first, &second] {
+            let name = spill.path().file_name().unwrap().to_string_lossy();
+            let (pid, random) = name.split_once('-').expect(&name);
+            assert_eq!(pid, std::process::id().to_string());
+            assert_eq!(random.len(), 16, "{name}");
+            assert!(random.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        }
+    }
+
+    /// How many spill folders `root` holds.
+    fn folders(root: &Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .count()
+    }
+
+    #[test]
+    fn two_lakes_of_one_process_spill_apart_and_each_folder_goes_with_its_lake() {
+        let root = scratch("spill-drop");
+        let a = Lake::open(&Backend::PlainFile(root.join("a.duckdb")), &root).unwrap();
+        let b = Lake::open(&Backend::PlainFile(root.join("b.duckdb")), &root).unwrap();
+        let spilling = |lake: &Lake| -> String {
+            lake.connection()
+                .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_ne!(spilling(&a), spilling(&b));
+        assert_eq!(folders(&root), 2);
+        drop(a);
+        assert_eq!(folders(&root), 1);
+        drop(b);
+        assert_eq!(folders(&root), 0);
     }
 
     #[test]

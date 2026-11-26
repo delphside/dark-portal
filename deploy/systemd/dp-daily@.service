@@ -13,7 +13,9 @@ ExecStart=/usr/local/libexec/dp/dp-run daily
 # recovery*), and ends with the last attempt's status. Any other status waits
 # for the next timer start.
 Restart=no
-# 5.4.1: from the timer start (00:50) to the daily deadline of the last attempt
-# that the daily retries end (03:00) allows (03:25), 155 min. A test reads this
-# against the settings.
-RuntimeMaxSec=155min
+# 5.4.1: from the timer start (00:50) to the daily retries end (03:00), 130 min,
+# then the last attempt's lock wait (10 min), its close at the day close bound
+# (15 min) and the after-close allowance (10 min): 165 min. `dp daily` ends its
+# retries no later than 130 min after it starts, so a run started early or by
+# hand stays within this. A test reads this against the settings.
+RuntimeMaxSec=165min

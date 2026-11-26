@@ -19,7 +19,7 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 
 use super::failure::{Failure, io_failure, says_disk_full};
 use crate::error::{ErrorType, Report};
-use crate::lake::job_limits;
+use crate::lake::{Spill, job_limits};
 use crate::types::{AuctionId, Copper, ItemId, Listing, TimeLeft};
 
 /// Why a body could not be turned into listings.
@@ -302,7 +302,9 @@ fn write_into<R: Read>(
     temporary: &Path,
     scratch: &Path,
 ) -> Result<ParseSummary, Failure> {
-    let limits = job_limits(scratch)?;
+    // Declared first, so it goes after the connection.
+    let spill = Spill::create(scratch)?;
+    let limits = job_limits(&spill);
     let connection = Connection::open_in_memory().map_err(|e| duckdb_failure(&e.to_string()))?;
     connection
         .execute_batch(&format!(

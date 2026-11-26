@@ -6,6 +6,8 @@
 //! `collect` hands over the lock it took for its rename and the later steps are
 //! lent it ([`Lock`]), so it is held from the rename to the end of `export`.
 
+use std::time::Duration;
+
 use crate::bound::{self, HourTimes};
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
@@ -93,7 +95,19 @@ fn failed(report: &Report) -> bool {
 /// Runs the steps in order. The report is the run's result, and its exit
 /// status is `dp hourly`'s.
 pub(crate) fn run_steps(config: &Config, clock: &dyn Clock, steps: &Steps<'_>) -> Report {
+    // Each step's time goes on the run's report, as `<step>_seconds`.
+    let mut timings: Vec<(&str, Duration)> = Vec::new();
+    let timed = |timings: &mut Vec<(&'static str, Duration)>,
+                 step: &'static str,
+                 run: &dyn Fn() -> Report| {
+        let started = clock.now();
+        let report = run();
+        timings.push((step, bound::since(clock, started)));
+        report
+    };
+    let started = clock.now();
     let (collected, kept) = (steps.collect)();
+    timings.push(("collect", bound::since(clock, started)));
     let mut results: Vec<(&str, Report)> = vec![("collect", collected)];
 
     // Where `collect` took no lock (the hour was collected already, or it
@@ -104,20 +118,29 @@ pub(crate) fn run_steps(config: &Config, clock: &dyn Clock, steps: &Steps<'_>) -
     };
     match held {
         Ok(held) => {
-            results.push(("items", (steps.items)(&held)));
-            results.push(("transform", (steps.transform)(&held)));
-            results.push(("export", (steps.export)(&held)));
+            results.push((
+                "items",
+                timed(&mut timings, "items", &|| (steps.items)(&held)),
+            ));
+            results.push((
+                "transform",
+                timed(&mut timings, "transform", &|| (steps.transform)(&held)),
+            ));
+            results.push((
+                "export",
+                timed(&mut timings, "export", &|| (steps.export)(&held)),
+            ));
         }
         Err(failure) => {
             let report = crate::transform::fatal(failure).with_metadata("step", "lock");
             results.push(("lock", report));
         }
     }
-    finish(results)
+    finish(results, &timings)
 }
 
 /// The run's report from the steps' reports, in order.
-fn finish(results: Vec<(&str, Report)>) -> Report {
+fn finish(results: Vec<(&str, Report)>, timings: &[(&str, Duration)]) -> Report {
     let summary: Vec<(String, String)> = results
         .iter()
         .map(|(step, report)| ((*step).to_owned(), report.reason.clone()))
@@ -174,6 +197,11 @@ fn finish(results: Vec<(&str, Report)>) -> Report {
     }
     for (step, reason) in summary {
         report.metadata.insert(format!("step_{step}"), reason);
+    }
+    for (step, took) in timings {
+        report
+            .metadata
+            .insert(bound::seconds_key(step), bound::seconds(*took));
     }
     report
 }
