@@ -40,8 +40,8 @@ pub const TEMPORARY_FILE_MARGIN: Duration = Duration::from_secs(2 * 60);
 
 /// "daily after-close allowance": 10 minutes for what a daily attempt does after
 /// the close that no deadline gates: the export of the closed days, then the
-/// deletion of export files and host snapshots and the clearing of temporary
-/// files. An attempt closes nothing that leaves less than the day close bound
+/// deletion of export files and host snapshots, the lake's row deletion and
+/// file clean-up once started, and the clearing of temporary files. An attempt closes nothing that leaves less than the day close bound
 /// and this before its deadline, and the daily run time limit allows it after
 /// the close; chosen, and reviewed when the daily timings
 /// ([`crate::bound`]) have been read for a month.
@@ -57,3 +57,9 @@ pub const DAILY_RUN_TIME_LIMIT: Duration = Duration::from_secs(
         + DAY_CLOSE_BOUND.as_secs()
         + DAILY_AFTER_CLOSE_ALLOWANCE.as_secs(),
 );
+
+/// "DuckDB spill folder stale after": how long a spill folder may go untouched
+/// before `dp daily` removes it, the longest a job lives (the daily run time
+/// limit) and the temporary file margin. Derived.
+pub const SPILL_STALE_AFTER: Duration =
+    Duration::from_secs(DAILY_RUN_TIME_LIMIT.as_secs() + TEMPORARY_FILE_MARGIN.as_secs());

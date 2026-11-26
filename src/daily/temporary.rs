@@ -10,7 +10,7 @@
 //!
 //! **A DuckDB spill folder** ([`crate::lake::Spill`]) is named for its process and a random
 //! suffix, and says no time, and a pid says nothing across containers. It is
-//! told by its age instead, by [`spill_stale_after`]: no job lives longer than
+//! told by its age instead, by [`SPILL_STALE_AFTER`]: no job lives longer than
 //! the daily run time limit, so a folder nothing has touched for that and the
 //! temporary file margin was left by a run that is gone, and a running one's
 //! folder, which its job made, is younger.
@@ -26,7 +26,7 @@ use crate::collect::window::window_end;
 use crate::items::{fetch_end, items_dir};
 use crate::lake::scratch_dir;
 use crate::settings::collection::HTTP_TIMEOUT_SNAPSHOT;
-use crate::settings::scheduling::{DAILY_RUN_TIME_LIMIT, LOCK_WAIT, TEMPORARY_FILE_MARGIN};
+use crate::settings::scheduling::{LOCK_WAIT, SPILL_STALE_AFTER, TEMPORARY_FILE_MARGIN};
 use crate::transform::bronze::hour_of;
 
 fn chrono_of(duration: Duration) -> ChronoDuration {
@@ -92,14 +92,8 @@ pub(crate) struct Cleared {
     pub spill_folders: usize,
 }
 
-/// How long a spill folder may go untouched before it is stale: the longest a
-/// job lives, the daily run time limit, and the temporary file margin.
-fn spill_stale_after() -> ChronoDuration {
-    chrono_of(DAILY_RUN_TIME_LIMIT + TEMPORARY_FILE_MARGIN)
-}
-
 /// Removes the spill folders under `root` that nothing has touched since
-/// [`spill_stale_after`] before `now`; how many. A folder whose age cannot be
+/// [`SPILL_STALE_AFTER`] before `now`; how many. A folder whose age cannot be
 /// read is left.
 fn clear_spill(root: &Path, now: DateTime<Utc>) -> Result<usize, Failure> {
     let entries = match std::fs::read_dir(root) {
@@ -112,7 +106,9 @@ fn clear_spill(root: &Path, now: DateTime<Utc>) -> Result<usize, Failure> {
         let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
             continue;
         };
-        if !entry.path().is_dir() || DateTime::<Utc>::from(modified) + spill_stale_after() > now {
+        if !entry.path().is_dir()
+            || DateTime::<Utc>::from(modified) + chrono_of(SPILL_STALE_AFTER) > now
+        {
             continue;
         }
         match std::fs::remove_dir_all(entry.path()) {
