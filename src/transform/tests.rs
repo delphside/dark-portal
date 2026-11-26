@@ -1189,6 +1189,7 @@ fn failed_transform_hour_rolls_back_whole_and_the_next_run_reprocesses_it() {
         Step::Events,
         Step::Records,
         Step::Apply,
+        Step::Gold,
         Step::Meta,
     ] {
         let name = format!("rollback-{step:?}");
@@ -1507,13 +1508,7 @@ fn a_slow_hour_is_warned_of_as_it_finishes_and_the_run_still_completes() {
 
 #[test]
 fn the_transform_sql_uses_only_what_ducklake_supports() {
-    let files = [
-        include_str!("../../sql/transform/1-compare.sql"),
-        include_str!("../../sql/transform/2-events.sql"),
-        include_str!("../../sql/transform/3-records.sql"),
-        include_str!("../../sql/transform/4-apply.sql"),
-    ];
-    for file in files {
+    for (_, file) in hour::STEPS {
         let code: String = file
             .lines()
             .filter(|l| !l.trim_start().starts_with("--"))

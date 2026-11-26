@@ -37,6 +37,16 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "silver",
         sql: include_str!("../../sql/migrations/002-silver.sql"),
     },
+    Migration {
+        version: 3,
+        name: "gold",
+        sql: include_str!("../../sql/migrations/003-gold.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "reference",
+        sql: include_str!("../../sql/migrations/004-reference.sql"),
+    },
 ];
 
 impl Lake {
@@ -167,13 +177,17 @@ mod tests {
     #[test]
     fn an_empty_lake_gets_every_migration_in_order() {
         let (lake, _dir) = open("empty");
-        assert_eq!(lake.migrate(now()).unwrap(), vec![1, 2]);
+        assert_eq!(lake.migrate(now()).unwrap(), vec![1, 2, 3, 4]);
         assert_eq!(
             tables(&lake),
             [
+                "gold.item_day",
+                "gold.item_hour",
+                "gold.price_level_hour",
                 "meta.gap",
                 "meta.migration",
                 "meta.processed",
+                "reference.item",
                 "silver.event",
                 "silver.listing_hour",
                 "silver.listing_record",
@@ -188,7 +202,15 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(recorded, [(1, "meta".to_owned()), (2, "silver".to_owned())]);
+        assert_eq!(
+            recorded,
+            [
+                (1, "meta".to_owned()),
+                (2, "silver".to_owned()),
+                (3, "gold".to_owned()),
+                (4, "reference".to_owned())
+            ]
+        );
     }
 
     #[test]
@@ -208,7 +230,7 @@ mod tests {
             .connection()
             .query_row("SELECT count(*) FROM meta.migration", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(records, 2);
+        assert_eq!(records, 4);
     }
 
     #[test]
@@ -228,12 +250,14 @@ mod tests {
     fn a_migration_that_fails_leaves_nothing_of_itself() {
         let (lake, _dir) = open("fails");
         lake.migrate(now()).unwrap();
-        // Version 3 half-works: its first statement is fine, its second is not.
+        // Version 5 half-works: its first statement is fine, its second is not.
         let broken = [
             MIGRATIONS[0],
             MIGRATIONS[1],
+            MIGRATIONS[2],
+            MIGRATIONS[3],
             Migration {
-                version: 3,
+                version: 5,
                 name: "broken",
                 sql: "CREATE TABLE silver.half (x INTEGER); CREATE TABLE no_such_schema.t (x INTEGER);",
             },
@@ -241,7 +265,7 @@ mod tests {
         let Err(Failure::Stop(report)) = lake.migrate_with(&broken, now()) else {
             panic!("expected a stop");
         };
-        assert_eq!(report.metadata["migration"], "3");
+        assert_eq!(report.metadata["migration"], "5");
         assert!(!tables(&lake).contains(&"silver.half".to_owned()));
         let versions: Vec<u32> = lake
             .connection()
@@ -251,7 +275,7 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(versions, [1, 2]);
+        assert_eq!(versions, [1, 2, 3, 4]);
         // The lake still works after the rollback.
         assert!(lake.migrate(now()).unwrap().is_empty());
     }
@@ -284,12 +308,18 @@ mod tests {
     #[test]
     fn no_migration_uses_what_ducklake_lacks() {
         for migration in MIGRATIONS {
+            // Words, not substrings: the `default_n` column is no `DEFAULT`.
             let sql = migration.sql.to_uppercase();
             let code: String = sql
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("--"))
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join(" ")
+                .replace(|c: char| !(c.is_ascii_alphanumeric() || c == '_'), " ");
+            let code = format!(
+                " {} ",
+                code.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
             for banned in [
                 "PRIMARY KEY",
                 "UNIQUE",
@@ -301,7 +331,11 @@ mod tests {
                 "CREATE SEQUENCE",
                 "DEFAULT",
             ] {
-                assert!(!code.contains(banned), "{} uses {banned}", migration.name);
+                assert!(
+                    !code.contains(&format!(" {banned} ")),
+                    "{} uses {banned}",
+                    migration.name
+                );
             }
         }
     }

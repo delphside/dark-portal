@@ -55,6 +55,3 @@ INSERT INTO silver.listing_hour (id, hour, quantity, time_left, position, units_
 SELECT n.id, n.last_seen, n.quantity, n.time_left, p.position, p.units_ahead,
        p.units_at_or_below
 FROM next_live n JOIN snapshot_place p ON p.id = n.id;
-
--- The hour's gold rows (`item_hour`, `price_level_hour`) are written here, once
--- the events are in (#7).

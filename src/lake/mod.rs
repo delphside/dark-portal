@@ -13,6 +13,7 @@
 //! A job opens the lake under the VM-wide lock; nothing here takes it.
 
 mod migrations;
+mod profiles;
 
 use std::path::{Path, PathBuf};
 
@@ -23,6 +24,7 @@ use crate::error::{ErrorType, Report};
 use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
 
 pub use migrations::{MIGRATIONS, Migration};
+pub use profiles::{PROFILES_SQL, settings_sql};
 
 /// The name the lake is attached under, and so the catalog every statement's
 /// `meta.`, `silver.`, `gold.` and `reference.` resolves in.

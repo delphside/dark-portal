@@ -29,6 +29,8 @@
 
 mod pacer;
 mod store;
+
+pub use store::items_dir;
 #[cfg(test)]
 mod tests;
 
@@ -49,7 +51,7 @@ use crate::settings::collection::{HOURLY_TIMER_START_MINUTE, HTTP_TIMEOUT_OTHER}
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::{Hour, ItemId};
 use pacer::Pacer;
-use store::{Responses, items_dir};
+use store::Responses;
 
 use crate::settings::collection::ITEM_ATTEMPTS;
 

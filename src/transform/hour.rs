@@ -30,6 +30,8 @@ pub enum Step {
     Records,
     /// Silver written.
     Apply,
+    /// Gold's hour written.
+    Gold,
     /// `meta` written, before the commit.
     Meta,
 }
@@ -38,7 +40,7 @@ pub enum Step {
 /// hour as if the step had.
 pub type Hook<'a> = &'a dyn Fn(Hour, Step) -> Result<(), Failure>;
 
-const STEPS: [(Step, &str); 4] = [
+pub(crate) const STEPS: [(Step, &str); 5] = [
     (
         Step::Compare,
         include_str!("../../sql/transform/1-compare.sql"),
@@ -52,6 +54,7 @@ const STEPS: [(Step, &str); 4] = [
         include_str!("../../sql/transform/3-records.sql"),
     ),
     (Step::Apply, include_str!("../../sql/transform/4-apply.sql")),
+    (Step::Gold, include_str!("../../sql/transform/5-gold.sql")),
 ];
 
 /// What an hour did.

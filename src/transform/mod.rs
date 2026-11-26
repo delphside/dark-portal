@@ -28,11 +28,18 @@
 //! against its bound, come from the [`Clock`] (G19: the documents name no
 //! clock seam, so this is the collection's).
 //!
-//! Gold's hour rows, which 5.2.2's matrix writes at *hour closed*, go at the
-//! end of `sql/transform/4-apply.sql` (#7).
+//! **Gold's hour** (`sql/transform/5-gold.sql`) is written in that same
+//! transaction, after silver and before `meta`: `price_level_hour` and
+//! `item_hour`, from the hour's live listings and events.
+//!
+//! **The reference table** is [`reference::rebuild`]: its own step, once a run,
+//! after the hours.
 
 mod bronze;
+#[cfg(test)]
+mod gold_tests;
 mod hour;
+pub mod reference;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -138,7 +145,11 @@ pub struct Outcome {
     /// Each hour that took longer than the hourly processing bound, with its
     /// time. Each was logged as a warning when it finished.
     pub over_bound: Vec<(Hour, Duration)>,
-    /// What stopped the run, as a fatal report.
+    /// What the rebuild of the reference table found; `None` where it did not
+    /// run or failed.
+    pub reference: Option<reference::Summary>,
+    /// What stopped the run, as a fatal report: the first hour that failed,
+    /// else the reference table's failure.
     pub failure: Option<Report>,
 }
 
@@ -173,6 +184,7 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
         hours: Vec::new(),
         warnings: Vec::new(),
         over_bound: Vec::new(),
+        reference: None,
         failure: None,
     };
     let result = (|| -> Result<(), Failure> {
@@ -214,10 +226,16 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
         }
         Ok(())
     })();
-    if let Err(failure) = result {
-        outcome.failure = Some(fatal(
-            failure.with_metadata("hours_processed", outcome.hours.len().to_string()),
-        ));
+    // The reference table is rebuilt whatever the hours did; an hour's failure
+    // is the one reported.
+    let reference = reference::rebuild(lake, data_dir);
+    match (result, reference) {
+        (Err(failure), _) | (Ok(()), Err(failure)) => {
+            outcome.failure = Some(fatal(
+                failure.with_metadata("hours_processed", outcome.hours.len().to_string()),
+            ));
+        }
+        (Ok(()), Ok(summary)) => outcome.reference = Some(summary),
     }
     outcome
 }
@@ -228,4 +246,11 @@ fn finished(outcome: &Outcome) -> Report {
     Report::ok()
         .with_metadata("hours", outcome.hours.len().to_string())
         .with_metadata("hours_over_bound", outcome.over_bound.len().to_string())
+        .with_metadata(
+            "reference_items",
+            outcome
+                .reference
+                .map_or(0, |summary| summary.items)
+                .to_string(),
+        )
 }

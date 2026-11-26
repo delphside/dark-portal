@@ -436,6 +436,9 @@ pub fn dump(lake: &Lake) -> String {
         "SELECT CAST(t AS VARCHAR) FROM silver.listing_hour t",
         "SELECT CAST(t AS VARCHAR) FROM silver.event t",
         "SELECT CAST(t AS VARCHAR) FROM silver.listing_record t",
+        "SELECT CAST(t AS VARCHAR) FROM gold.price_level_hour t",
+        "SELECT CAST(t AS VARCHAR) FROM gold.item_hour t",
+        "SELECT CAST(t AS VARCHAR) FROM reference.item t",
     ] {
         let mut rows: Vec<String> = lake
             .connection()
@@ -453,4 +456,154 @@ pub fn dump(lake: &Lake) -> String {
 
 pub fn mark(lake: &Lake) -> Option<Hour> {
     high_water_mark(lake).unwrap()
+}
+
+/// One `gold.item_hour` row as the tests state it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gold {
+    pub item: u32,
+    pub hour: Hour,
+    pub lowest: Option<u64>,
+    pub units_listed: u64,
+    pub listings: u32,
+    /// posted, sold floor, sold estimate, expired, cancelled; none for the
+    /// first hour collected.
+    pub flows: Option<[u64; 5]>,
+    pub span: Option<u16>,
+}
+
+/// An `item_hour` row of an hour with a span, flows in the order of
+/// [`Gold::flows`].
+pub fn gold(
+    item: u32,
+    hour: Hour,
+    lowest: Option<u64>,
+    units: u64,
+    listings: u32,
+    flows: [u64; 5],
+    span: u16,
+) -> Gold {
+    Gold {
+        item,
+        hour,
+        lowest,
+        units_listed: units,
+        listings,
+        flows: Some(flows),
+        span: Some(span),
+    }
+}
+
+pub fn item_hours(lake: &Lake) -> Vec<Gold> {
+    lake.connection()
+        .prepare(
+            "SELECT item, hour_number(hour), lowest, units_listed, listings, posted_units, \
+             sold_floor_units, sold_estimate_units, expired_units, cancelled_units, span \
+             FROM gold.item_hour ORDER BY hour, item",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            let flows = match r.get::<_, Option<u64>>(5)? {
+                None => {
+                    for i in 6..10 {
+                        assert_eq!(
+                            r.get::<_, Option<u64>>(i)?,
+                            None,
+                            "flows are all null or none"
+                        );
+                    }
+                    None
+                }
+                Some(posted) => Some([posted, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?]),
+            };
+            Ok(Gold {
+                item: r.get(0)?,
+                hour: hour_of(r.get(1)?),
+                lowest: r.get(2)?,
+                units_listed: r.get(3)?,
+                listings: r.get(4)?,
+                flows,
+                span: r.get(10)?,
+            })
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// `gold.price_level_hour` of an item at an hour: price, units, listings.
+pub fn levels(lake: &Lake, item: u32, hour: Hour) -> Vec<(u64, u32, u32)> {
+    lake.connection()
+        .prepare(
+            "SELECT unit_price, units, listings FROM gold.price_level_hour \
+             WHERE item = ? AND hour_number(hour) = ? ORDER BY unit_price",
+        )
+        .unwrap()
+        .query_map(duckdb::params![item, hour.0], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Writes a bronze item file of the given responses: item, fetched at (as
+/// text), status, body.
+pub fn item_file(world: &World, name: &str, rows: &[(u32, &str, u16, Option<&str>)]) {
+    let dir = world.config.data_dir.join("bronze/items");
+    std::fs::create_dir_all(&dir).unwrap();
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE response(item UINTEGER, fetched_at TIMESTAMPTZ, status USMALLINT, \
+             body JSON);",
+        )
+        .unwrap();
+    for (item, fetched_at, status, body) in rows {
+        connection
+            .execute(
+                "INSERT INTO response VALUES (?, CAST(? AS TIMESTAMPTZ), ?, CAST(? AS JSON))",
+                duckdb::params![item, fetched_at, status, body],
+            )
+            .unwrap();
+    }
+    connection
+        .execute_batch(&format!(
+            "COPY (SELECT item, fetched_at, status, body FROM response) TO '{}' (FORMAT PARQUET);",
+            dir.join(format!("{name}.parquet")).to_string_lossy()
+        ))
+        .unwrap();
+}
+
+/// `reference.item`: item, name, class, subclass, vendor sell price, vendor
+/// buy price.
+pub type Reference = (
+    u32,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    u64,
+    Option<u64>,
+);
+
+pub fn reference(lake: &Lake) -> Vec<Reference> {
+    lake.connection()
+        .prepare(
+            "SELECT item, name, class, subclass, vendor_sell_price, vendor_buy_price \
+             FROM reference.item ORDER BY item",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
