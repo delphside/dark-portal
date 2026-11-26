@@ -63,3 +63,14 @@ pub const DAILY_RUN_TIME_LIMIT: Duration = Duration::from_secs(
 /// limit) and the temporary file margin. Derived.
 pub const SPILL_STALE_AFTER: Duration =
     Duration::from_secs(DAILY_RUN_TIME_LIMIT.as_secs() + TEMPORARY_FILE_MARGIN.as_secs());
+
+/// "probe timer start": the hour, UTC, of 12:05.
+pub const PROBE_TIMER_START_HOUR_UTC: u32 = 12;
+
+/// "probe timer start": the minute of 12:05 UTC, well away from the hourly
+/// run's :35, which meets the :31 refresh whatever Blizzard does between.
+pub const PROBE_TIMER_START_MINUTE: u32 = 5;
+
+/// "probe run time limit": 5 minutes, the unit's `RuntimeMaxSec`; chosen, far
+/// above its two requests of the other HTTP timeout.
+pub const PROBE_RUN_TIME_LIMIT: Duration = Duration::from_secs(5 * 60);

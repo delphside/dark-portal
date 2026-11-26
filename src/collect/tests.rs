@@ -919,7 +919,7 @@ fn unusable_body_exits_70_and_leaves_no_bronze_file() {
     let w = World::at("bad-body", AT_1135);
     w.stub.token_ok(5);
     w.stub
-        .mount(snapshot_mock(TOKEN).respond_with(ok(LM_11, r#"{"auctions":[{"id":"x"}]}"#)));
+        .mount(snapshot_mock(TOKEN).respond_with(ok(LM_11, r#"{"auctions":[{"id":"#)));
 
     let report = w.go();
 
@@ -1064,4 +1064,244 @@ fn bronze_write_failure_in_collect_is_unexpected_exit_70_out_of_memory_included(
     assert_eq!(exit(&report), 70);
     assert!(!w.bronze("2026-11-26T11.parquet").exists());
     assert!(w.temporaries().is_empty(), "{:?}", w.temporaries());
+}
+
+// When Blizzard's response changes (5.2.1)
+
+/// A listing as Blizzard gives it.
+fn listing(id: u64) -> String {
+    format!(r#"{{"id":{id},"item":{{"id":10}},"quantity":5,"unit_price":123,"time_left":"LONG"}}"#)
+}
+
+/// `listing` with the unknown fields `buyout` and `item.bonus`.
+fn listing_with_new_fields(id: u64) -> String {
+    listing(id)
+        .replace(r#""id":10"#, r#""id":10,"bonus":[1]"#)
+        .replace(r#""LONG""#, r#""LONG","buyout":5"#)
+}
+
+/// A snapshot of `listings`.
+fn snapshot_of(listings: &[String]) -> String {
+    format!(r#"{{"auctions":[{}]}}"#, listings.join(","))
+}
+
+/// Runs a collect in a world of its own, the stub answering `body` last
+/// modified at `last_modified`.
+fn collecting(name: &str, last_modified: &str, body: &str) -> (World, Report) {
+    let w = World::at(name, AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(ok(last_modified, body), 5);
+    let report = w.go();
+    (w, report)
+}
+
+fn warnings_of(report: &Report) -> Vec<&str> {
+    report.warnings.iter().map(|w| w.reason.as_str()).collect()
+}
+
+#[test]
+fn unknown_listing_field_is_logged_by_name() {
+    // The log is the report's warning, `SNAPSHOT_FIELD_NEW`, once for the run.
+    let body = snapshot_of(&[listing_with_new_fields(1), listing_with_new_fields(2)]);
+    let (outcome, log) = crate::test_support::logging(|| collecting("field-new", LM_11, &body));
+    let (w, report) = outcome;
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert!(w.bronze("2026-11-26T11.parquet").exists());
+    assert_eq!(rows(&w.bronze("2026-11-26T11.parquet")), 2);
+    assert_eq!(report.reason, "SNAPSHOT_FIELD_NEW");
+    let [warning] = report.warnings.as_slice() else {
+        panic!("one warning: {report:?}");
+    };
+    assert_eq!(warning.metadata["fields"], "buyout,item.bonus");
+    assert_eq!(warning.metadata["hour"], "2026-11-26T11.parquet");
+    assert_eq!(log.matches("SNAPSHOT_FIELD_NEW").count(), 1, "{log}");
+    assert!(log.contains("WARN"), "{log}");
+}
+
+#[test]
+fn known_fields_only_give_a_report_with_no_warning() {
+    let (_, report) = collecting("fields-known", LM_11, BODY);
+    assert_eq!(report.outcome, crate::error::Severity::Ok);
+    assert!(report.warnings.is_empty());
+    assert_eq!(report.metadata["refresh_past_hour"], "31:40");
+}
+
+#[test]
+fn time_left_not_a_band_is_collected_as_given() {
+    let body = snapshot_of(&[
+        listing(1),
+        listing(2).replace("LONG", "FOREVER"),
+        listing(3).replace("LONG", "very_long"),
+    ]);
+    let (w, report) = collecting("time-left-new", LM_11, &body);
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert!(report.warnings.is_empty(), "the transform warns of it");
+    let values: Vec<String> = {
+        let connection = Connection::open_in_memory().unwrap();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT time_left FROM read_parquet('{}') ORDER BY id",
+                w.bronze("2026-11-26T11.parquet").display()
+            ))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(values, ["LONG", "FOREVER", "very_long"]);
+}
+
+#[test]
+fn snapshot_missing_a_needed_field_is_a_gap_with_its_own_code_exit_70() {
+    for (name, missing, field) in [
+        ("shape-quantity", "quantity", "quantity"),
+        ("shape-time-left", "time_left", "time_left"),
+    ] {
+        let second = listing(2).replace(&format!(r#""{missing}":"#), r#""renamed":"#);
+        let body = snapshot_of(&[listing(1), second]);
+        let (w, report) = collecting(name, LM_11, &body);
+
+        assert_eq!(report.reason, "SNAPSHOT_SHAPE_CHANGED", "{report:?}");
+        assert_eq!(exit(&report), 70);
+        assert_eq!(report.metadata["field"], field);
+        assert_eq!(report.metadata["listings"], "1");
+        assert!(
+            !w.bronze("2026-11-26T11.parquet").exists(),
+            "a partial hour is a gap"
+        );
+        assert!(w.temporaries().is_empty());
+    }
+}
+
+#[test]
+fn snapshot_structure_changed_is_a_gap_naming_the_path() {
+    for (name, body, path) in [
+        (
+            "structure-item-array",
+            r#"{"auctions":[{"id":1,"item":[{"id":10}],"quantity":5,"unit_price":1,"time_left":"LONG"}]}"#,
+            "item",
+        ),
+        (
+            "structure-item-id-moved",
+            r#"{"auctions":[{"id":1,"item":{"item_id":10},"quantity":5,"unit_price":1,"time_left":"LONG"}]}"#,
+            "item.id",
+        ),
+        (
+            "structure-auctions-renamed",
+            r#"{"listings":[]}"#,
+            "auctions",
+        ),
+    ] {
+        let (w, report) = collecting(name, LM_11, body);
+        assert_eq!(
+            report.reason, "SNAPSHOT_SHAPE_CHANGED",
+            "{name}: {report:?}"
+        );
+        assert_eq!(report.metadata["field"], path, "{name}");
+        assert_eq!(exit(&report), 70);
+        assert!(!w.bronze("2026-11-26T11.parquet").exists());
+    }
+}
+
+#[test]
+fn snapshot_value_the_column_cannot_hold_is_a_gap_with_the_value_exit_70() {
+    for (name, field, json, shown) in [
+        ("value-negative", "quantity", "-1", "-1"),
+        ("value-decimal", "unit_price", "1.5", "1.5"),
+        ("value-range", "quantity", "4294967296", "4294967296"),
+        ("value-zero-price", "unit_price", "0", "0"),
+        ("value-zero-quantity", "quantity", "0", "0"),
+    ] {
+        let second = listing(2).replace(
+            &format!(
+                r#""{field}":{}"#,
+                if field == "quantity" { "5" } else { "123" }
+            ),
+            &format!(r#""{field}":{json}"#),
+        );
+        let body = snapshot_of(&[listing(1), second]);
+        let (w, report) = collecting(name, LM_11, &body);
+
+        assert_eq!(
+            report.reason, "SNAPSHOT_VALUE_UNEXPECTED",
+            "{name}: {report:?}"
+        );
+        assert_eq!(exit(&report), 70, "{name}");
+        assert_eq!(report.metadata["field"], field, "{name}");
+        assert_eq!(report.metadata["value"], shown, "{name}");
+        assert_eq!(report.metadata["listings"], "1", "{name}");
+        assert!(!w.bronze("2026-11-26T11.parquet").exists(), "{name}");
+    }
+}
+
+#[test]
+fn text_beyond_the_longest_is_a_gap_and_the_longest_is_kept() {
+    let kept = "X".repeat(crate::settings::collection::TEXT_MAX_LENGTH);
+    let body = snapshot_of(&[listing(1).replace("LONG", &kept)]);
+    let (_, report) = collecting("text-longest", LM_11, &body);
+    assert_eq!(exit(&report), 0, "{report:?}");
+
+    let over = format!("{kept}X");
+    let body = snapshot_of(&[listing(1).replace("LONG", &over)]);
+    let (_, report) = collecting("text-over", LM_11, &body);
+    assert_eq!(report.reason, "SNAPSHOT_VALUE_UNEXPECTED");
+    assert_eq!(report.metadata["field"], "time_left");
+    assert_eq!(report.metadata["value"], over);
+}
+
+#[test]
+fn refresh_outside_the_expected_window_warns_with_the_time_past_the_hour() {
+    // From :20:00 to :45:00 both included is as expected.
+    for (name, at, past, moved) in [
+        ("refresh-early-edge", "2026-11-26T11:20:00Z", "20:00", false),
+        ("refresh-late-edge", "2026-11-26T11:45:00Z", "45:00", false),
+        ("refresh-usual", LM_11, "31:40", false),
+        ("refresh-early", "2026-11-26T11:19:59Z", "19:59", true),
+        ("refresh-late", "2026-11-26T11:45:01Z", "45:01", true),
+        ("refresh-on-the-hour", "2026-11-26T11:00:00Z", "00:00", true),
+    ] {
+        let (w, report) = collecting(name, at, BODY);
+        assert_eq!(exit(&report), 0, "{name}: {report:?}");
+        assert!(w.bronze("2026-11-26T11.parquet").exists(), "{name}");
+        assert_eq!(report.metadata["refresh_past_hour"], past, "{name}");
+        if moved {
+            assert_eq!(report.reason, "REFRESH_TIME_MOVED", "{name}");
+            let warning = &report.warnings[0];
+            assert_eq!(warning.metadata["refresh_past_hour"], past);
+            assert_eq!(warning.metadata["window_start"], "20:00");
+            assert_eq!(warning.metadata["window_end"], "45:00");
+        } else {
+            assert!(report.warnings.is_empty(), "{name}: {report:?}");
+        }
+    }
+}
+
+#[test]
+fn every_warning_of_a_run_is_listed_on_its_report() {
+    let w = World::at("warnings-listed", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(ResponseTemplate::new(503), 1);
+    let body = snapshot_of(&[listing_with_new_fields(1)]);
+    w.stub.snapshot_answer(ok("2026-11-26T11:50:00Z", &body), 1);
+
+    let report = w.go();
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert_eq!(
+        warnings_of(&report),
+        [
+            "COLLECTED_AFTER_RETRIES",
+            "REFRESH_TIME_MOVED",
+            "SNAPSHOT_FIELD_NEW"
+        ]
+    );
+    assert_eq!(report.reason, "COLLECTED_AFTER_RETRIES");
+    assert_eq!(
+        report.metadata["warnings"],
+        "COLLECTED_AFTER_RETRIES,REFRESH_TIME_MOVED,SNAPSHOT_FIELD_NEW"
+    );
 }

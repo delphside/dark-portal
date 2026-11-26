@@ -168,3 +168,14 @@ dp_run() {
     [ "$status" -eq 0 ]
     [ -f "$FAKE_LOG" ]
 }
+
+@test "the probe is a job of its own: it runs, and a live one is no conflict for the hourly run" {
+    dp_run probe
+    [ "$status" -eq 0 ]
+    [ -f "$FAKE_LOG" ]
+    rm -f "$FAKE_LOG"
+    FAKE_RUNNING=$'dp-probe-test\n' dp_run hourly
+    [ "$status" -eq 0 ]
+    FAKE_RUNNING=$'dp-probe-test\n' dp_run probe
+    [ "$status" -eq 75 ]
+}

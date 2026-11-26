@@ -119,6 +119,51 @@ fn run_stubs(w: &World, collect: Report, later: &[Report; 3]) -> (Vec<&'static s
 }
 
 #[test]
+fn hourly_lists_the_warnings_of_every_step_and_exits_0() {
+    // Each step's warnings, those it lists and one that is itself a warning,
+    // are the hourly run's, which is a warning that nothing failed.
+    let w = World::new("hourly-warnings");
+    let collected = crate::error::warned(
+        Report::ok(),
+        vec![
+            Report::warning("SNAPSHOT_FIELD_NEW", "new"),
+            Report::warning("REFRESH_TIME_MOVED", "moved"),
+        ],
+    );
+    let transformed = Report::warning("TIME_LEFT_UNKNOWN", "odd");
+    let (_, report) = run_stubs(&w, collected, &[Report::ok(), transformed, Report::ok()]);
+
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Warning);
+    assert_eq!(report.reason, "SNAPSHOT_FIELD_NEW");
+    let reasons: Vec<&str> = report.warnings.iter().map(|w| w.reason.as_str()).collect();
+    assert_eq!(
+        reasons,
+        [
+            "SNAPSHOT_FIELD_NEW",
+            "REFRESH_TIME_MOVED",
+            "TIME_LEFT_UNKNOWN"
+        ]
+    );
+}
+
+#[test]
+fn hourly_with_a_failed_step_keeps_its_failure_and_still_lists_the_warnings() {
+    let w = World::new("hourly-warnings-failed");
+    let warned = Report::warning("TIME_LEFT_UNKNOWN", "odd");
+    let (_, report) = run_stubs(
+        &w,
+        Report::ok(),
+        &[error(ErrorType::TechnicalBlip), warned, Report::ok()],
+    );
+
+    assert_eq!(report.reason, "HOURLY_STEPS_FAILED");
+    assert_eq!(code(&report), 3);
+    assert_eq!(report.warnings.len(), 1);
+    assert_eq!(report.warnings[0].reason, "TIME_LEFT_UNKNOWN");
+}
+
+#[test]
 fn hourly_runs_collect_items_transform_export_in_order() {
     let w = World::new("hourly-order");
     let (order, report) = run_stubs(
@@ -409,7 +454,7 @@ fn hourly_holds_the_lock_from_the_rename_through_export() {
         free: Cell::new(0),
     };
     let report = run_with(&w.config, &clock, || stub.endpoints(), &w.backend());
-    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(code(&report), 0, "{report:?}");
     assert_eq!(report.metadata["step_export"], "OK");
     assert!(
         clock.probes.get() > 0,
@@ -427,7 +472,7 @@ fn items_is_lent_the_lock_and_takes_none_of_its_own_for_a_new_item() {
     // and fail.
     let (w, stub) = blizzard_world("hourly-items-lent");
     let report = run_with(&w.config, &w.clock, || stub.endpoints(), &w.backend());
-    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(code(&report), 0, "{report:?}");
     assert_eq!(report.metadata["step_items"], "OK");
     assert!(crate::items::has_parquet(&crate::items::items_dir(&w.config.data_dir)).unwrap());
     assert!(
@@ -491,7 +536,7 @@ fn the_real_steps_take_the_lock_once_and_run_one_hour_through() {
     );
     let clock = FakeClock::at("2026-11-20T10:40:00Z");
     let report = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
-    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(code(&report), 0, "{report:?}");
     assert!(
         clock.slept().is_empty(),
         "nothing waited: {:?}",
@@ -552,7 +597,7 @@ fn transform_and_export_of_an_hour_are_judged_together_against_5_minutes() {
         },
         &times,
     );
-    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(code(&report), 0, "{report:?}");
     assert_eq!(report.metadata["step_export"], "OK");
     assert_eq!(exit_status(&report), ExitStatus::Completed);
     assert_eq!(
@@ -586,7 +631,7 @@ fn runs_own_work_counts_against_the_bound_shared_across_its_hours() {
         Duration::from_secs(301),
     );
     let report = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
-    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(code(&report), 0, "{report:?}");
     assert_eq!(report.metadata["hours_over_bound"], "1");
 }
 
@@ -605,10 +650,8 @@ fn a_rerun_of_the_real_steps_does_nothing_and_exits_0() {
         )],
     );
     let clock = FakeClock::at("2026-11-20T10:40:00Z");
-    assert_eq!(
-        run_with(&w.config, &clock, Endpoints::blizzard, &w.backend()).outcome,
-        Severity::Ok
-    );
+    let first = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
+    assert_eq!(code(&first), 0, "{first:?}");
     let second = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
     assert_eq!(code(&second), 0, "{second:?}");
 }
@@ -795,7 +838,7 @@ fn secret_never_appears_in_logs_bronze_or_export() {
         report.log();
         report
     });
-    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(code(&report), 0, "{report:?}");
     assert!(log.contains("took a new Blizzard access token"), "{log}");
     let data = &w.config.data_dir;
     assert!(!files_holding(&data.join("bronze"), "Flask").is_empty());

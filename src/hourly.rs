@@ -12,7 +12,7 @@ use crate::bound::{self, HourTimes};
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
 use crate::config::Config;
-use crate::error::{ExitStatus, Report, Severity, exit_status, worst_type};
+use crate::error::{ExitStatus, Report, Severity, exit_status, warned, worst_type};
 use crate::lake::Backend;
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::{collect, export, items, transform};
@@ -153,6 +153,11 @@ fn finish(results: Vec<(&str, Report)>, timings: &[(&str, Duration)]) -> Report 
     let (_, collected) = results.next().expect("collect always runs");
     let later: Vec<(&str, Report)> = results.collect();
 
+    // The warnings of every step, which the run's report lists.
+    let warnings: Vec<Report> = std::iter::once(&collected)
+        .chain(later.iter().map(|(_, report)| report))
+        .flat_map(Report::raised)
+        .collect();
     // What did not fail is logged here; what failed is in the run's report,
     // which is logged once, by the caller, with each error's own type.
     let (failures, fine): (Vec<_>, Vec<_>) = later.into_iter().partition(|(_, r)| failed(r));
@@ -192,6 +197,7 @@ fn finish(results: Vec<(&str, Report)>, timings: &[(&str, Duration)]) -> Report 
         }
     };
     report.errors.append(&mut errors);
+    let mut report = warned(report, warnings);
     if let Some(over) = over_bound {
         report.metadata.insert("hours_over_bound".to_owned(), over);
     }

@@ -53,12 +53,15 @@ use std::time::Duration;
 use crate::bound::{self, HourTimes};
 use crate::collect::failure::Failure;
 use crate::collect::lock::Lock;
+use crate::collect::snapshot::last_modified_of;
 use crate::collect::{Clock, lock};
 use crate::config::Config;
-use crate::error::{ErrorType, Report, Severity};
+use crate::error::{ErrorType, Report, Severity, warned};
 use crate::lake::{Backend, Lake, lake_failure};
+use crate::settings::collection::{REFRESH_INTERVAL_LEAST, REFRESH_INTERVAL_MOST};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::Hour;
+use chrono::{DateTime, Utc};
 
 pub(crate) use hour::Hook;
 pub use hour::{HourSummary, MARKET, Step};
@@ -140,9 +143,13 @@ fn open_and_process(
             .with_metadata("id", id.to_string())
             .log();
     }
+    for report in &outcome.reports {
+        report.log();
+    }
+    let reports = outcome.reports.clone();
     match outcome.failure {
-        Some(report) => Err(Box::new(report)),
-        None => Ok(finished(&outcome)),
+        Some(report) => Err(Box::new(warned(report, reports))),
+        None => Ok(warned(finished(&outcome), reports)),
     }
 }
 
@@ -172,6 +179,10 @@ pub struct Outcome {
     pub hours: Vec<HourSummary>,
     /// Each listing warned of, across the hours.
     pub warnings: Vec<(HourWarning, u64)>,
+    /// The warnings of the hours as a whole, one report each: a time left that
+    /// is not a band, an hour missed, a refresh interval that changed. They
+    /// are the run's, which logs them and lists them on its report.
+    pub reports: Vec<Report>,
     /// The time each hour's own processing took, in order. The run adds it,
     /// with the rest of its time, to the hourly processing bound's, which is
     /// judged with the export's ([`crate::bound`]).
@@ -221,6 +232,7 @@ pub fn process_hours(
     let mut outcome = Outcome {
         hours: Vec::new(),
         warnings: Vec::new(),
+        reports: Vec::new(),
         took: Vec::new(),
         reference: None,
         failure: None,
@@ -246,6 +258,10 @@ pub fn process_hours(
             );
             outcome.took.push((hour, took));
             outcome.warnings.extend(summary.warnings.iter().copied());
+            let before = previous.and_then(|previous| {
+                last_modified_of(lake.connection(), &bronze::path(data_dir, previous))
+            });
+            outcome.reports.extend(hour_reports(&summary, before));
             outcome.hours.push(summary);
             previous = Some(hour);
         }
@@ -264,10 +280,60 @@ pub fn process_hours(
                 failure.with_metadata("hours_processed", outcome.hours.len().to_string()),
             ));
         }
-        (Ok(()), Some(Ok(summary))) => outcome.reference = Some(summary),
+        (Ok(()), Some(Ok(summary))) => {
+            outcome.reports.extend(summary.missing.iter().cloned());
+            outcome.reference = Some(summary);
+        }
         (Ok(()), None) => {}
     }
     outcome
+}
+
+/// The warnings of one hour as a whole (5.2.1 *When Blizzard's response
+/// changes*). `before` is the `last-modified` of the hour held before it, where
+/// its file is still there.
+fn hour_reports(summary: &HourSummary, before: Option<DateTime<Utc>>) -> Vec<Report> {
+    let hour = bronze::hour_name(summary.hour);
+    let mut reports = Vec::new();
+    for gap in &summary.gaps {
+        reports.push(
+            Report::warning("HOUR_MISSED", "An hour's snapshot was never collected.")
+                .with_metadata("hour", bronze::hour_name(*gap)),
+        );
+    }
+    if !summary.unknown_time_left.is_empty() {
+        let values: Vec<&str> = summary
+            .unknown_time_left
+            .iter()
+            .map(|(value, _)| value.as_str())
+            .collect();
+        let listings: u64 = summary.unknown_time_left.iter().map(|(_, n)| n).sum();
+        reports.push(
+            Report::warning(
+                "TIME_LEFT_UNKNOWN",
+                "A listing has a time left that is not a band; it is kept as given.",
+            )
+            .with_metadata("hour", hour.clone())
+            .with_metadata("values", values.join(","))
+            .with_metadata("listings", listings.to_string()),
+        );
+    }
+    if let (Some(now), Some(before)) = (summary.last_modified, before) {
+        let between = (now - before).to_std().unwrap_or_default();
+        if !(REFRESH_INTERVAL_LEAST..=REFRESH_INTERVAL_MOST).contains(&between) {
+            reports.push(
+                Report::warning(
+                    "REFRESH_INTERVAL_CHANGED",
+                    "The time between the snapshots' last-modified is not about an hour.",
+                )
+                .with_metadata("hour", hour)
+                .with_metadata("last_modified", now.to_rfc3339())
+                .with_metadata("previous_last_modified", before.to_rfc3339())
+                .with_metadata("minutes", (between.as_secs() / 60).to_string()),
+            );
+        }
+    }
+    reports
 }
 
 /// Whether a failure is *technical, fundamental*: the operator's to fix, and
@@ -286,6 +352,7 @@ fn finished(outcome: &Outcome) -> Report {
             "reference_items",
             outcome
                 .reference
+                .as_ref()
                 .map_or(0, |summary| summary.items)
                 .to_string(),
         )

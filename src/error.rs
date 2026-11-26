@@ -111,6 +111,9 @@ pub struct Report {
     pub cause: Option<Box<Report>>,
     /// The results of the failures a run carried on past, one per unit of work.
     pub errors: Vec<Report>,
+    /// The warnings raised in the run, each logged where it was raised and
+    /// kept here so that the final report has them ([`warned`]).
+    pub warnings: Vec<Report>,
 }
 
 impl Report {
@@ -130,6 +133,7 @@ impl Report {
             violations: Vec::new(),
             cause: None,
             errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -171,6 +175,18 @@ impl Report {
     pub fn with_error(mut self, error: Report) -> Report {
         self.errors.push(error);
         self
+    }
+
+    /// The warnings this report stands for: those it carries, or itself where
+    /// it is a warning that carries none.
+    pub fn raised(&self) -> Vec<Report> {
+        if !self.warnings.is_empty() {
+            return self.warnings.clone();
+        }
+        if self.outcome == Severity::Warning {
+            return vec![self.clone()];
+        }
+        Vec::new()
     }
 
     /// Adds a value at fault in a refused input.
@@ -252,6 +268,32 @@ impl std::error::Error for Report {
             .as_deref()
             .map(|c| c as &(dyn std::error::Error + 'static))
     }
+}
+
+/// The run's report with the `warnings` raised in it: a report that is `Ok`
+/// becomes a warning (1.10 *The severity of an error*), the first warning's
+/// reason and message leading and every reason listed in the `warnings`
+/// metadata; a report that failed stays what it is. Each warning is also kept
+/// on the report, for what reads it. The one place a run's severity is
+/// decided where it raised warnings; each is logged where it is raised, so a
+/// run killed later has logged it.
+pub fn warned(mut report: Report, warnings: Vec<Report>) -> Report {
+    let Some(first) = warnings.first() else {
+        return report;
+    };
+    if report.outcome == Severity::Ok {
+        let mut leading = Report::warning(&first.reason, &first.message);
+        leading.metadata = std::mem::take(&mut report.metadata);
+        report = leading;
+    }
+    let reasons = warnings
+        .iter()
+        .map(|warning| warning.reason.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    report.metadata.insert("warnings".to_owned(), reasons);
+    report.warnings.extend(warnings);
+    report
 }
 
 /// The type a report that carries several failures takes: the one that most
@@ -340,6 +382,47 @@ mod tests {
     fn a_completed_run_exits_0_warnings_included() {
         assert_eq!(status(Report::ok()), 0);
         assert_eq!(status(Report::warning("SLOW_HOUR", "It was slow.")), 0);
+    }
+
+    #[test]
+    fn warnings_make_an_ok_report_a_warning_that_lists_them_and_exits_0() {
+        let first = Report::warning("FIRST", "One.").with_metadata("a", "1");
+        let second = Report::warning("SECOND", "Two.");
+        let report = warned(
+            Report::ok().with_metadata("hour", "10"),
+            vec![first.clone(), second.clone()],
+        );
+        assert_eq!(report.outcome, Severity::Warning);
+        assert_eq!(report.reason, "FIRST");
+        assert_eq!(report.metadata["hour"], "10");
+        assert_eq!(report.metadata["warnings"], "FIRST,SECOND");
+        assert_eq!(report.warnings, [first, second]);
+        assert_eq!(status(report), 0);
+    }
+
+    #[test]
+    fn warnings_leave_a_failed_report_as_it_failed() {
+        let fatal = Report::fatal(ErrorType::Unexpected, "BAD", "Bad.");
+        let report = warned(fatal, vec![Report::warning("W", "w")]);
+        assert_eq!(report.outcome, Severity::Fatal);
+        assert_eq!(report.reason, "BAD");
+        assert_eq!(status(report), 70);
+        let none = warned(Report::ok(), Vec::new());
+        assert_eq!(none, Report::ok());
+    }
+
+    #[test]
+    fn a_report_names_the_warnings_it_stands_for() {
+        let alone = Report::warning("W", "w");
+        assert_eq!(alone.raised(), std::slice::from_ref(&alone));
+        let carried = warned(Report::ok(), vec![alone.clone()]);
+        assert_eq!(carried.raised(), [alone]);
+        assert!(Report::ok().raised().is_empty());
+        assert!(
+            Report::error(ErrorType::Unexpected, "E", "e")
+                .raised()
+                .is_empty()
+        );
     }
 
     #[test]

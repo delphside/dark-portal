@@ -5,8 +5,8 @@
 #   dp-run SUBCOMMAND [ARGUMENT...]
 #   dp-run --help
 #
-# SUBCOMMAND is one of dp's (hourly, collect, items, transform, export, daily);
-# the arguments after it go to `dp`, not to docker.
+# SUBCOMMAND is one of dp's (hourly, collect, items, transform, export, daily,
+# probe); the arguments after it go to `dp`, not to docker.
 #
 # The environment is the caller's: the unit loads the environment's `.env`
 # with `EnvironmentFile=`, and this script passes the same file to the
@@ -66,7 +66,7 @@ case "${1:-}" in
         short_usage
         exit 64
         ;;
-    hourly | collect | items | transform | export | daily) ;;
+    hourly | collect | items | transform | export | daily | probe) ;;
     *)
         echo "dp-run: unknown subcommand $1" >&2
         short_usage

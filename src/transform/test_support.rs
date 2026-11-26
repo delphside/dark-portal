@@ -147,6 +147,12 @@ impl World {
 
     /// Writes bronze's file for hour `n` from the constructed listings.
     pub fn snapshot(&self, n: i64, listings: &[L]) -> &World {
+        self.snapshot_modified(n, listings, None)
+    }
+
+    /// As [`snapshot`](World::snapshot), its `last-modified` the time given
+    /// (RFC 3339) instead of the hour's start.
+    pub fn snapshot_modified(&self, n: i64, listings: &[L], modified: Option<&str>) -> &World {
         let file = bronze::path(&self.config.data_dir, h(n));
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(&file);
@@ -167,9 +173,12 @@ impl World {
         }
         let moment = h(n).start().unwrap();
         let ts = timestamp(moment);
+        let modified = modified.map_or(ts.clone(), |m| {
+            timestamp(m.parse::<chrono::DateTime<chrono::Utc>>().unwrap())
+        });
         connection
             .execute_batch(&format!(
-                "COPY (SELECT {ts} AS hour, {ts} AS last_modified, {ts} AS fetched_at, id, \
+                "COPY (SELECT {ts} AS hour, {modified} AS last_modified, {ts} AS fetched_at, id, \
                  item, quantity, unit_price, time_left FROM listing) TO '{}' (FORMAT PARQUET);",
                 file.to_string_lossy()
             ))

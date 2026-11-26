@@ -1252,7 +1252,7 @@ fn next_run_reprocesses_a_failed_hour() {
 
         // The next run processes it, giving what an uninterrupted run gives.
         let report = w.run();
-        assert_eq!(report.outcome, Severity::Ok, "{report:#?}");
+        assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:#?}");
         assert_eq!(report.metadata["hours"], "1");
         let clean = World::new(&format!("{name}-clean"));
         replay(&clean, &hours);
@@ -1336,22 +1336,14 @@ fn unreadable_bronze_hour_stops_the_transform_with_exit_70() {
 
 #[test]
 fn an_hour_that_is_not_what_its_file_says_is_refused() {
-    // A repeated ID would be joined twice; an unknown band has no lower bound.
-    for (name, listings, rows) in [
-        ("dup", vec![l(1, 100, 1), l(1, 100, 2)], "rows"),
-        (
-            "band",
-            vec![l(1, 100, 1).band("FOREVER")],
-            "rows_with_an_unknown_band",
-        ),
-    ] {
-        let w = World::new(&format!("invalid-{name}"));
-        w.snapshot(10, &listings);
-        let report = w.run();
-        assert_eq!(report.reason, "BRONZE_HOUR_INVALID", "{name}");
-        assert_ne!(report.metadata[rows], "0", "{name}");
-        assert!(processed(&w.open()).is_empty());
-    }
+    // A repeated ID would be joined twice.
+    let w = World::new("invalid-dup");
+    w.snapshot(10, &[l(1, 100, 1), l(1, 100, 2)]);
+    let report = w.run();
+    assert_eq!(report.reason, "BRONZE_HOUR_INVALID");
+    assert_ne!(report.metadata["rows"], "0");
+    assert_ne!(report.metadata["rows"], report.metadata["distinct_ids"]);
+    assert!(processed(&w.open()).is_empty());
 }
 
 #[test]
@@ -1871,7 +1863,13 @@ fn latest_hour_not_yet_collected_is_no_gap() {
     w.snapshot(13, &[l(1, 100, 1)]);
     w.clock.sleep(StdDuration::from_secs(3600));
     let found_at = w.clock.now();
-    assert_eq!(w.run().outcome, Severity::Ok);
+    let report = w.run();
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    assert_eq!(
+        warned_of(&report),
+        ["HOUR_MISSED", "REFRESH_INTERVAL_CHANGED"],
+        "the hour found missing, and the two hours between the last modified"
+    );
     let lake = w.open();
     assert_eq!(gaps(&lake), [h(12)]);
     assert_eq!(processed(&lake).last(), Some(&(h(13), Some(2))));
@@ -1964,7 +1962,240 @@ fn gap_is_written_in_the_later_hours_transaction() {
     assert_eq!(report.metadata["hours_processed"], "0");
 
     let report = w.run();
-    assert_eq!(report.outcome, Severity::Ok, "{report:#?}");
+    assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:#?}");
+    assert_eq!(report.reason, "HOUR_MISSED");
     assert_eq!(gaps(&w.open()), [h(11)]);
     assert_eq!(processed(&w.open()).len(), 2);
+}
+
+// When Blizzard's response changes (5.2.1, 5.2.2)
+
+/// The reasons of the warnings a run's report lists, in order.
+fn warned_of(report: &Report) -> Vec<&str> {
+    report.warnings.iter().map(|w| w.reason.as_str()).collect()
+}
+
+#[test]
+fn time_left_not_a_band_is_processed_kept_as_given_and_warned_with_the_value() {
+    let w = World::new("time-left-unknown");
+    w.snapshot(10, &[l(1, 100, 1).band("FOREVER"), l(2, 110, 1)]);
+    let (report, text) = logging(|| w.run());
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:?}");
+    assert_eq!(report.outcome, Severity::Warning);
+    assert_eq!(report.reason, "TIME_LEFT_UNKNOWN");
+    let [warning] = report.warnings.as_slice() else {
+        panic!("one warning: {report:?}");
+    };
+    assert_eq!(warning.metadata["hour"], "2026-11-20T10");
+    assert_eq!(warning.metadata["values"], "FOREVER");
+    assert_eq!(warning.metadata["listings"], "1");
+    assert!(text.contains("TIME_LEFT_UNKNOWN"), "{text}");
+    let lake = w.open();
+    assert_eq!(processed(&lake), [(h(10), None)], "the hour is held");
+    let held: Vec<(u64, String)> = live(&lake)
+        .into_iter()
+        .map(|l| (l.id, l.time_left))
+        .collect();
+    assert_eq!(
+        held,
+        [(1, "FOREVER".to_owned()), (2, "LONG".to_owned())],
+        "silver keeps the value as given"
+    );
+    assert_eq!(history(&lake, 1)[0].2, "FOREVER");
+}
+
+#[test]
+fn a_snapshot_of_known_bands_warns_of_no_time_left() {
+    let w = World::new("time-left-known");
+    w.snapshot(
+        10,
+        &[l(1, 100, 1).band("SHORT"), l(2, 110, 1).band("VERY_LONG")],
+    );
+    let report = w.run();
+    assert_eq!(report.outcome, Severity::Ok);
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn unknown_time_left_is_warned_once_an_hour_with_its_values_and_listings() {
+    let w = World::new("time-left-each-hour");
+    w.snapshot(
+        10,
+        &[
+            l(1, 100, 1).band("FOREVER"),
+            l(2, 110, 1).band("ODD"),
+            l(3, 120, 1).band("ODD"),
+            l(4, 130, 1),
+        ],
+    );
+    w.snapshot(11, &[l(1, 100, 1).band("FOREVER"), l(4, 130, 1)]);
+    let report = w.run();
+
+    assert_eq!(
+        warned_of(&report),
+        ["TIME_LEFT_UNKNOWN", "TIME_LEFT_UNKNOWN"]
+    );
+    let first = &report.warnings[0].metadata;
+    assert_eq!(
+        (
+            first["hour"].as_str(),
+            first["values"].as_str(),
+            first["listings"].as_str()
+        ),
+        ("2026-11-20T10", "FOREVER,ODD", "3")
+    );
+    let second = &report.warnings[1].metadata;
+    assert_eq!(
+        (
+            second["hour"].as_str(),
+            second["values"].as_str(),
+            second["listings"].as_str()
+        ),
+        ("2026-11-20T11", "FOREVER", "1")
+    );
+}
+
+#[test]
+fn gone_behind_an_intact_listing_expires_only_where_its_band_shows_it_could() {
+    // EV-5, posting hour unknown: a band's lower bound under the span expires
+    // it; a time left that is not a band has no bound, so it is cancelled.
+    for (name, band, kind) in [
+        ("short", "SHORT", EventKind::Expired),
+        ("long", "LONG", EventKind::Cancelled),
+        ("unknown", "FOREVER", EventKind::Cancelled),
+        ("unknown-shouting", "short", EventKind::Cancelled),
+    ] {
+        let w = World::new(&format!("ev5-{name}"));
+        w.snapshot(10, &[l(1, 100, 5), l(2, 200, 5).band(band)]);
+        w.snapshot(11, &[l(1, 100, 5)]);
+        w.run();
+        let lake = w.open();
+        let events = events(&lake);
+        let ended: Vec<EventKind> = events
+            .iter()
+            .filter(|e| e.id.0 == 2)
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(ended, [kind], "{name}");
+        let gold = item_hours(&lake);
+        let counted = gold
+            .iter()
+            .find(|g| g.hour == h(11))
+            .unwrap()
+            .flows
+            .unwrap();
+        assert_eq!(counted[1], 0, "{name}: nothing here is a certain sale");
+        assert_eq!(counted[2], 0, "{name}: nor an estimated one");
+    }
+}
+
+#[test]
+fn unknown_time_left_gone_from_the_front_is_the_estimate_and_never_the_floor() {
+    let w = World::new("ev3-unknown");
+    w.snapshot(10, &[l(1, 100, 5).band("FOREVER")]);
+    w.snapshot(11, &[l(9, 50, 1).item(2)]);
+    w.run();
+    let lake = w.open();
+    let found = events(&lake);
+    assert_eq!(find(&found, 1, EventKind::Sold).units, 5);
+    let flows = item_hours(&lake)
+        .into_iter()
+        .find(|g| g.item == 1 && g.hour == h(11))
+        .unwrap()
+        .flows
+        .unwrap();
+    // posted, sold floor, sold estimate, expired, cancelled
+    assert_eq!(flows, [0, 0, 5, 0, 0]);
+}
+
+#[test]
+fn each_hour_missed_is_warned_and_the_run_exits_0() {
+    let w = World::new("missed");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(13, &[l(1, 100, 1)]);
+    let report = w.run();
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    let missed: Vec<&str> = report
+        .warnings
+        .iter()
+        .filter(|w| w.reason == "HOUR_MISSED")
+        .map(|w| w.metadata["hour"].as_str())
+        .collect();
+    assert_eq!(missed, ["2026-11-20T11", "2026-11-20T12"]);
+    assert_eq!(gaps(&w.open()), [h(11), h(12)]);
+}
+
+#[test]
+fn hours_held_one_after_another_warn_of_no_missed_hour() {
+    let w = World::new("not-missed");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(11, &[l(1, 100, 1)]);
+    let report = w.run();
+    assert!(report.warnings.is_empty(), "{report:?}");
+}
+
+#[test]
+fn the_time_between_last_modified_not_about_an_hour_warns_the_refresh_interval_changed() {
+    // From 50 to 70 minutes, both included, is about an hour.
+    for (name, second, changed) in [
+        ("hour", "2026-11-20T11:31:40Z", None),
+        ("least", "2026-11-20T11:21:40Z", None),
+        ("most", "2026-11-20T11:41:40Z", None),
+        ("under", "2026-11-20T11:21:39Z", Some("49")),
+        ("over", "2026-11-20T11:41:41Z", Some("70")),
+        ("half-hourly", "2026-11-20T11:01:40Z", Some("30")),
+    ] {
+        let w = World::new(&format!("interval-{name}"));
+        // Hour 10 of the test world is 2026-11-20T10:00; its refresh :31:40.
+        w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
+        w.snapshot_modified(11, &[l(1, 100, 1)], Some(second));
+        let report = w.run();
+
+        assert_eq!(exit_status(&report), ExitStatus::Completed, "{name}");
+        match changed {
+            None => assert!(report.warnings.is_empty(), "{name}: {report:?}"),
+            Some(minutes) => {
+                assert_eq!(warned_of(&report), ["REFRESH_INTERVAL_CHANGED"], "{name}");
+                let warning = &report.warnings[0].metadata;
+                assert_eq!(warning["minutes"], minutes, "{name}");
+                assert_eq!(warning["hour"], "2026-11-20T11", "{name}");
+                assert_eq!(
+                    warning["previous_last_modified"],
+                    "2026-11-20T10:31:40+00:00"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_daily_refresh_shows_as_each_hour_missed_and_a_refresh_interval_changed() {
+    let w = World::new("daily-refresh");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
+    w.snapshot_modified(34, &[l(1, 100, 1)], Some("2026-11-21T10:31:40Z"));
+    let report = w.run();
+
+    let reasons = warned_of(&report);
+    assert_eq!(
+        reasons.iter().filter(|r| **r == "HOUR_MISSED").count(),
+        23,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|r| **r == "REFRESH_INTERVAL_CHANGED")
+            .count(),
+        1
+    );
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+}
+
+#[test]
+fn the_first_hour_collected_has_no_refresh_interval_to_judge() {
+    let w = World::new("interval-first");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T03:00:00Z"));
+    assert!(w.run().warnings.is_empty());
 }

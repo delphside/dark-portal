@@ -12,6 +12,7 @@ use dp::settings::collection::HOURLY_TIMER_START_MINUTE;
 use dp::settings::scheduling::{
     DAILY_AFTER_CLOSE_ALLOWANCE, DAILY_RETRIES_END_HOUR_UTC, DAILY_RUN_TIME_LIMIT,
     DAILY_TIMER_START_HOUR_UTC, DAILY_TIMER_START_MINUTE, DAY_CLOSE_BOUND, LOCK_WAIT,
+    PROBE_RUN_TIME_LIMIT, PROBE_TIMER_START_HOUR_UTC, PROBE_TIMER_START_MINUTE,
 };
 use dp::settings::transform::HOURLY_PROCESSING_BOUND;
 
@@ -148,4 +149,28 @@ fn units_have_restart_no_and_the_settings_run_time_limits() {
         minutes(&setting("dp-daily@.service", "RuntimeMaxSec")),
         DAILY_RUN_TIME_LIMIT
     );
+}
+
+#[test]
+fn probe_runs_daily_at_12_05_utc_not_persistent_with_the_settings_run_time_limit() {
+    assert_eq!(
+        (PROBE_TIMER_START_HOUR_UTC, PROBE_TIMER_START_MINUTE),
+        (12, 5)
+    );
+    assert_eq!(
+        setting("dp-probe@.timer", "OnCalendar"),
+        calendar(
+            &format!("{PROBE_TIMER_START_HOUR_UTC:02}"),
+            PROBE_TIMER_START_MINUTE
+        )
+    );
+    // Run late it would meet the refresh it is there to avoid.
+    assert_eq!(setting("dp-probe@.timer", "Persistent"), "false");
+    assert_eq!(setting("dp-probe@.service", "Restart"), "no");
+    assert_eq!(
+        minutes(&setting("dp-probe@.service", "RuntimeMaxSec")),
+        PROBE_RUN_TIME_LIMIT
+    );
+    // Well away from the hourly start, which meets the :31 refresh.
+    assert!(PROBE_TIMER_START_MINUTE.abs_diff(HOURLY_TIMER_START_MINUTE) >= 20);
 }

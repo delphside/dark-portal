@@ -16,6 +16,7 @@ pub mod export;
 pub mod hourly;
 pub mod items;
 pub mod lake;
+pub mod probe;
 pub mod settings;
 #[cfg(test)]
 mod test_support;

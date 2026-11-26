@@ -68,7 +68,7 @@ use crate::collect::failure::Failure;
 use crate::collect::lock::{self, Lock};
 use crate::collect::{Clock, Endpoints};
 use crate::config::Config;
-use crate::error::{ErrorType, ExitStatus, Report, Severity, exit_status, worst_type};
+use crate::error::{ErrorType, ExitStatus, Report, Severity, exit_status, warned, worst_type};
 use crate::export::{self, Writer};
 use crate::items::fetch_end;
 use crate::lake::{Backend, Lake};
@@ -322,7 +322,7 @@ impl Steps<'_> {
         bound::record(&mut report, self.clock, "items_retry", started);
 
         if errors.is_empty() {
-            return Ok(warned(report, &warnings));
+            return Ok(warned(report, warnings));
         }
         let mut failed = Report::error(
             worst_type(&errors),
@@ -508,27 +508,6 @@ fn close_over_bound(took: std::time::Duration) -> Report {
     )
     .with_metadata("seconds", bound::seconds(took))
     .with_metadata("bound_seconds", DAY_CLOSE_BOUND.as_secs().to_string())
-}
-
-/// The run's report where nothing failed: a warning whenever any warning was
-/// raised in the run (1.10 *The severity of an error*), the first one's
-/// reason leading and every reason listed; the report as it is where none was.
-/// The one place the run's severity is decided; each warning is logged where
-/// it is raised, so a run killed later has logged it.
-fn warned(report: Report, warnings: &[Report]) -> Report {
-    let Some(first) = warnings.first() else {
-        return report;
-    };
-    let mut warned = Report::warning(&first.reason, &first.message);
-    warned.metadata = report.metadata;
-    warned.with_metadata(
-        "warnings",
-        warnings
-            .iter()
-            .map(|warning| warning.reason.as_str())
-            .collect::<Vec<_>>()
-            .join(","),
-    )
 }
 
 /// A day that could be closed has no hour left to close it on.

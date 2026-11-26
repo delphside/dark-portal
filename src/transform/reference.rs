@@ -21,18 +21,35 @@ use std::path::Path;
 
 use crate::collect::failure::Failure;
 use crate::collect::snapshot::quoted;
+use crate::error::Report;
 use crate::items::{has_parquet, items_dir};
 use crate::lake::{Lake, lake_failure};
 
 /// What a rebuild found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
     /// The rows `reference.item` holds after it.
     pub items: u64,
     /// Whether the rebuild changed any: a rebuild that finds the table as it
     /// would make it writes nothing.
     pub changed: bool,
+    /// A warning `ITEM_FIELD_MISSING` for each path the body of a new or
+    /// changed answer lacks or has of another type, whose field is then null
+    /// (5.2.1 *When Blizzard's response changes*).
+    pub missing: Vec<Report>,
 }
+
+/// The paths read from an item's body, and whether each is a number.
+const PATHS: [(&str, bool); 5] = [
+    ("name", false),
+    ("item_class.name", false),
+    ("item_subclass.name", false),
+    ("sell_price", true),
+    ("purchase_price", true),
+];
+
+/// How many item IDs a warning names.
+const ITEMS_NAMED: usize = 5;
 
 /// Rebuilds `reference.item` from the item files under `data_dir`.
 ///
@@ -59,11 +76,15 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
         "CREATE OR REPLACE TEMP TABLE reference_next AS SELECT * FROM reference.item WHERE false;",
         doing,
     )?;
+    lake.execute(
+        "CREATE OR REPLACE TEMP TABLE reference_latest (item UINTEGER, fetched_at TIMESTAMPTZ, body VARCHAR);",
+        doing,
+    )?;
     if has_files {
         let glob = items_dir(data_dir).join("*.parquet");
         lake.execute(
             &format!(
-                "INSERT INTO reference_next
+                "INSERT INTO reference_latest
                  WITH answer AS (
                      SELECT item, fetched_at, CAST(body AS VARCHAR) AS body, filename
                      FROM read_parquet({}, filename = true)
@@ -74,21 +95,27 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
                          PARTITION BY item ORDER BY fetched_at DESC, filename DESC) AS recency
                      FROM answer
                  )
-                 SELECT
-                     item,
-                     json_extract_string(body, '$.name'),
-                     json_extract_string(body, '$.item_class.name'),
-                     json_extract_string(body, '$.item_subclass.name'),
-                     coalesce(TRY_CAST(json_extract_string(body, '$.sell_price') AS UBIGINT), 0),
-                     TRY_CAST(json_extract_string(body, '$.purchase_price') AS UBIGINT),
-                     CAST(NULL AS BOOLEAN),
-                     fetched_at
-                 FROM latest WHERE recency = 1;",
+                 SELECT item, fetched_at, body FROM latest WHERE recency = 1;",
                 quoted(&glob.to_string_lossy())
             ),
             doing,
         )?;
     }
+    lake.execute(
+        "INSERT INTO reference_next
+         SELECT
+             item,
+             json_extract_string(body, '$.name'),
+             json_extract_string(body, '$.item_class.name'),
+             json_extract_string(body, '$.item_subclass.name'),
+             coalesce(TRY_CAST(json_extract_string(body, '$.sell_price') AS UBIGINT), 0),
+             TRY_CAST(json_extract_string(body, '$.purchase_price') AS UBIGINT),
+             CAST(NULL AS BOOLEAN),
+             fetched_at
+         FROM reference_latest;",
+        doing,
+    )?;
+    let missing = missing_paths(lake)?;
     let differing: i64 = connection
         .query_row(
             "SELECT (SELECT count(*) FROM (SELECT * FROM reference_next EXCEPT \
@@ -119,7 +146,54 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
     Ok(Summary {
         items: u64::try_from(items).unwrap_or_default(),
         changed: differing != 0,
+        missing,
     })
+}
+
+/// The warnings for the paths that the answers new to `reference.item` lack:
+/// an answer already read warned once, so a rebuild that finds the table as it
+/// would make it warns of nothing.
+fn missing_paths(lake: &Lake) -> Result<Vec<Report>, Failure> {
+    let reading = "reading what the item answers lack";
+    let mut warnings = Vec::new();
+    for (path, number) in PATHS {
+        let extracted = format!("json_extract_string(l.body, '$.{path}')");
+        let lacking = if number {
+            format!("TRY_CAST({extracted} AS UBIGINT) IS NULL")
+        } else {
+            format!("{extracted} IS NULL")
+        };
+        let mut statement = lake
+            .connection()
+            .prepare(&format!(
+                "SELECT l.item FROM reference_latest l WHERE {lacking} AND NOT EXISTS \
+                 (SELECT 1 FROM reference.item r WHERE r.item = l.item \
+                  AND r.fetched_at = l.fetched_at) ORDER BY l.item"
+            ))
+            .map_err(|e| lake_failure(&e.to_string(), reading))?;
+        let items = statement
+            .query_map([], |row| row.get::<_, u32>(0))
+            .and_then(|found| found.collect::<Result<Vec<_>, _>>())
+            .map_err(|e| lake_failure(&e.to_string(), reading))?;
+        if items.is_empty() {
+            continue;
+        }
+        let named: Vec<String> = items
+            .iter()
+            .take(ITEMS_NAMED)
+            .map(ToString::to_string)
+            .collect();
+        warnings.push(
+            Report::warning(
+                "ITEM_FIELD_MISSING",
+                "An item response lacks a field the reference table reads, or has it of another type; the field is null.",
+            )
+            .with_metadata("path", path)
+            .with_metadata("items", items.len().to_string())
+            .with_metadata("first_items", named.join(",")),
+        );
+    }
+    Ok(warnings)
 }
 
 #[cfg(test)]
@@ -176,13 +250,7 @@ mod tests {
                 None
             )]
         );
-        assert_eq!(
-            summary,
-            Summary {
-                items: 1,
-                changed: true
-            }
-        );
+        assert_eq!((summary.items, summary.changed), (1, true));
     }
 
     /// Three items' bodies in one file: the purchase price absent, 0 and 55.
@@ -368,13 +436,7 @@ mod tests {
         );
         let (rows, summary) = rebuilt(&w);
         assert!(rows.is_empty());
-        assert_eq!(
-            summary,
-            Summary {
-                items: 0,
-                changed: false
-            }
-        );
+        assert_eq!((summary.items, summary.changed), (0, false));
     }
 
     #[test]
@@ -382,13 +444,7 @@ mod tests {
         let w = World::new("ref-none");
         let (rows, summary) = rebuilt(&w);
         assert!(rows.is_empty());
-        assert_eq!(
-            summary,
-            Summary {
-                items: 0,
-                changed: false
-            }
-        );
+        assert_eq!((summary.items, summary.changed), (0, false));
         let lake = w.open();
         lake.execute(
             "INSERT INTO reference.item VALUES (1, 'Stale', NULL, NULL, 0, NULL, NULL, now())",
@@ -430,13 +486,7 @@ mod tests {
         let lake = w.open();
         assert!(rebuild(&lake, &w.config.data_dir).unwrap().changed);
         let again = rebuild(&lake, &w.config.data_dir).unwrap();
-        assert_eq!(
-            again,
-            Summary {
-                items: 1,
-                changed: false
-            }
-        );
+        assert_eq!((again.items, again.changed), (1, false));
         // A new response changes it.
         let newer = body("Changed", "Consumable", "Potion", 10, None);
         item_file(
@@ -460,8 +510,9 @@ mod tests {
             &[(1, "2026-11-20 10:00:00+00", 200, Some(&good))],
         );
         let report = w.run();
-        assert_eq!(report.outcome, Severity::Ok, "{report:#?}");
         assert_eq!(report.metadata["hours"], "2");
+        assert_eq!(report.outcome, Severity::Warning, "{report:#?}");
+        assert_eq!(report.reason, "ITEM_FIELD_MISSING", "the body lacks a path");
         assert_eq!(report.metadata["reference_items"], "1");
         assert_eq!(reference(&w.open())[0].1, some("Reported"));
     }
@@ -514,5 +565,125 @@ mod tests {
         // The hour is whole: its silver and gold are committed.
         assert_eq!(processed(&lake).len(), 1);
         assert_eq!(item_hours(&lake).len(), 1);
+    }
+
+    /// The `path`s warned of, in the order of [`PATHS`].
+    fn missing_of(summary: &Summary) -> Vec<(&str, &str)> {
+        summary
+            .missing
+            .iter()
+            .map(|w| (w.metadata["path"].as_str(), w.metadata["items"].as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_body_with_every_field_warns_of_none() {
+        let w = World::new("ref-missing-none");
+        let full = body("Armour Kit", "Consumable", "Potion", 250, Some(1000));
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(7, "2026-11-20 10:00:00+00", 200, Some(&full))],
+        );
+        assert!(rebuilt(&w).1.missing.is_empty());
+    }
+
+    #[test]
+    fn a_field_the_body_lacks_is_warned_by_path_and_left_null_without_failing_the_item() {
+        let w = World::new("ref-missing-paths");
+        let no_price = body("Linen Cloth", "Tradeskill", "Cloth", 13, None);
+        let no_name =
+            r#"{"id":8,"item_class":{"name":"Consumable"},"sell_price":4,"purchase_price":9}"#;
+        let no_class = r#"{"id":9,"name":"Odd","item_subclass":{"name":"Potion"},"sell_price":4,"purchase_price":9}"#;
+        let no_sell = r#"{"id":10,"name":"Free","item_class":{"name":"A"},"item_subclass":{"name":"B"},"purchase_price":9}"#;
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[
+                (7, "2026-11-20 10:00:00+00", 200, Some(&no_price)),
+                (8, "2026-11-20 10:00:00+00", 200, Some(no_name)),
+                (9, "2026-11-20 10:00:00+00", 200, Some(no_class)),
+                (10, "2026-11-20 10:00:00+00", 200, Some(no_sell)),
+            ],
+        );
+        let (rows, summary) = rebuilt(&w);
+
+        assert_eq!(rows.len(), 4, "no item fails for a field it lacks");
+        assert_eq!(
+            missing_of(&summary),
+            [
+                ("name", "1"),
+                ("item_class.name", "1"),
+                ("item_subclass.name", "1"),
+                ("sell_price", "1"),
+                ("purchase_price", "1"),
+            ]
+        );
+        let name = &summary.missing[0];
+        assert_eq!(name.reason, "ITEM_FIELD_MISSING");
+        assert_eq!(name.metadata["first_items"], "8");
+        let row = |id: u32| rows.iter().find(|r| r.0 == id).unwrap().clone();
+        assert_eq!(row(8).1, None);
+        assert_eq!(row(9).2, None);
+        assert_eq!(row(10).4, 0, "no sell price is 0, as before");
+        assert_eq!(row(7).5, None);
+    }
+
+    #[test]
+    fn a_field_of_another_type_is_warned_as_missing() {
+        let w = World::new("ref-missing-type");
+        let text_price = r#"{"id":7,"name":"X","item_class":{"name":"A"},"item_subclass":{"name":"B"},"sell_price":"cheap","purchase_price":-5}"#;
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(7, "2026-11-20 10:00:00+00", 200, Some(text_price))],
+        );
+        let (rows, summary) = rebuilt(&w);
+        assert_eq!(
+            missing_of(&summary),
+            [("sell_price", "1"), ("purchase_price", "1")]
+        );
+        assert_eq!((rows[0].4, rows[0].5), (0, None));
+    }
+
+    #[test]
+    fn an_answer_is_warned_of_once_and_again_only_where_a_newer_one_lacks_the_field() {
+        let w = World::new("ref-missing-once");
+        let no_price = body("Linen Cloth", "Tradeskill", "Cloth", 13, None);
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(7, "2026-11-20 10:00:00+00", 200, Some(&no_price))],
+        );
+        let lake = w.open();
+        assert_eq!(rebuild(&lake, &w.config.data_dir).unwrap().missing.len(), 1);
+        assert!(
+            rebuild(&lake, &w.config.data_dir)
+                .unwrap()
+                .missing
+                .is_empty(),
+            "the rebuild that finds the table as it is has nothing new to warn of"
+        );
+        // A newer answer that still lacks it is a new answer.
+        item_file(
+            &w,
+            "2026-11-20T110000",
+            &[(7, "2026-11-20 11:00:00+00", 200, Some(&no_price))],
+        );
+        assert_eq!(rebuild(&lake, &w.config.data_dir).unwrap().missing.len(), 1);
+    }
+
+    #[test]
+    fn an_item_with_many_answers_lacking_a_field_names_the_first_few_and_all_in_the_count() {
+        let w = World::new("ref-missing-many");
+        let no_price = body("Linen Cloth", "Tradeskill", "Cloth", 13, None);
+        let rows: Vec<(u32, &str, u16, Option<&str>)> = (1..=8)
+            .map(|id| (id, "2026-11-20 10:00:00+00", 200, Some(no_price.as_str())))
+            .collect();
+        item_file(&w, "2026-11-20T100000", &rows);
+        let (_, summary) = rebuilt(&w);
+        let warning = &summary.missing[0];
+        assert_eq!(warning.metadata["items"], "8");
+        assert_eq!(warning.metadata["first_items"], "1,2,3,4,5");
     }
 }

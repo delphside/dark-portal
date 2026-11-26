@@ -63,6 +63,16 @@ pub struct SnapshotResponse {
     pub body: Box<dyn Read + Send>,
 }
 
+/// What Blizzard answered to a request for the snapshot's `last-modified`
+/// alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probed {
+    /// 304: the snapshot is not newer than the time given.
+    NotModified,
+    /// 200: the snapshot, last modified at this time; its body is not read.
+    Modified(DateTime<Utc>),
+}
+
 /// What Blizzard answered to an item lookup that is data and not a failure.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ItemAnswer {
@@ -252,6 +262,48 @@ impl Blizzard {
             last_modified,
             body: Box::new(response.into_body().into_reader()),
         })
+    }
+
+    /// Asks for the snapshot's `last-modified` and nothing else: a conditional
+    /// request, `If-Modified-Since` the time given, that Blizzard answers 304
+    /// where nothing is newer. An answer of 200 is read for its header and its
+    /// body dropped unread, so a server that ignores the condition costs a
+    /// connection, not a download. Every other answer is sorted as the
+    /// snapshot's are.
+    pub fn snapshot_probe(&self, token: &Token, since: DateTime<Utc>) -> Result<Probed, Failure> {
+        let url = format!(
+            "{}/data/wow/auctions/commodities?namespace={NAMESPACE}",
+            self.endpoints.api
+        );
+        let response = self
+            .other_agent
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token.expose()))
+            .header(
+                "If-Modified-Since",
+                since.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+            )
+            .call()
+            .map_err(|e| transport(&e))?;
+        let status = response.status().as_u16();
+        if status == 304 {
+            return Ok(Probed::NotModified);
+        }
+        if status != 200 {
+            return Err(status_failure(status, retry_after(&response), "snapshot"));
+        }
+        response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
+            .map(|d| Probed::Modified(d.to_utc()))
+            .ok_or_else(|| {
+                Failure::unexpected(
+                    "LAST_MODIFIED_UNUSABLE",
+                    "Blizzard's snapshot has no usable last-modified header.",
+                )
+            })
     }
 
     /// Asks for an item's data. A 200 gives its body unchanged, once it is

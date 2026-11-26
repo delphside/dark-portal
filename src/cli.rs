@@ -7,7 +7,7 @@ use crate::bound;
 use crate::collect::{self, Clock, Endpoints, SystemClock};
 use crate::config::Config;
 use crate::error::Report;
-use crate::{daily, export, hourly, items, transform};
+use crate::{daily, export, hourly, items, probe, transform};
 
 /// The exit statuses, for `--help` (1.10, *What a script's exit status
 /// means*).
@@ -45,6 +45,9 @@ pub enum Command {
     /// Close the day, push to the bucket, delete what is past its keep and
     /// retry items that answered 404.
     Daily,
+    /// Once a day, ask Blizzard when the snapshot was last refreshed and warn
+    /// where it is refreshed more often than hourly.
+    Probe,
 }
 
 impl Command {
@@ -57,6 +60,7 @@ impl Command {
             Command::Transform => "transform",
             Command::Export => "export",
             Command::Daily => "daily",
+            Command::Probe => "probe",
         }
     }
 }
@@ -82,6 +86,7 @@ fn run_with_settings(command: Command) -> Report {
             Command::Transform => transform::run(&config, &SystemClock),
             Command::Export => export::run(&config, &SystemClock),
             Command::Daily => daily::run(&config, &SystemClock, Endpoints::blizzard()),
+            Command::Probe => probe::run(&config, &SystemClock, Endpoints::blizzard()),
         },
         Err(report) => *report,
     }
@@ -108,6 +113,7 @@ mod tests {
             Command::Transform,
             Command::Export,
             Command::Daily,
+            Command::Probe,
         ] {
             let cli = Cli::try_parse_from(["dp", command.name()]).unwrap();
             assert_eq!(cli.command, command);
@@ -134,6 +140,7 @@ mod tests {
             Command::Transform,
             Command::Export,
             Command::Daily,
+            Command::Probe,
         ] {
             let report = run(command);
             assert!(

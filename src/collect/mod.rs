@@ -35,8 +35,10 @@ use failure::{Failure, io_failure};
 use session::Session;
 
 use crate::config::Config;
-use crate::error::{ErrorType, Report};
-use crate::settings::collection::{POLL_INTERVAL, REGION};
+use crate::error::{ErrorType, Report, warned};
+use crate::settings::collection::{
+    POLL_INTERVAL, REFRESH_WINDOW_END, REFRESH_WINDOW_START, REGION,
+};
 use crate::settings::scheduling::LOCK_WAIT;
 use crate::types::Hour;
 use lock::Lock;
@@ -101,8 +103,17 @@ pub(crate) fn bronze_dir(data_dir: &Path) -> PathBuf {
 enum Attempt {
     /// Blizzard has not refreshed yet.
     NotYet,
-    /// The hour's file is written under its temporary name.
-    Written,
+    /// The hour's file is written under its temporary name, from a snapshot
+    /// last modified at the time given.
+    Written(Written),
+}
+
+/// What a written attempt found, for the run's warnings.
+struct Written {
+    /// The served `last-modified`.
+    last_modified: DateTime<Utc>,
+    /// The listing field names the parser does not know.
+    unknown_fields: Vec<String>,
 }
 
 fn collect(
@@ -147,6 +158,7 @@ fn collect(
     // False where the temporary file was cleared by a run that collected the
     // hour first; the hour must then be in place once the lock is held.
     let mut written = true;
+    let mut found: Option<Written> = None;
     loop {
         let wait = match attempt(
             &mut session,
@@ -155,7 +167,10 @@ fn collect(
             &crate::lake::scratch_dir(&config.data_dir),
             clock,
         ) {
-            Ok(Attempt::Written) => break,
+            Ok(Attempt::Written(snapshot)) => {
+                found = Some(snapshot);
+                break;
+            }
             Err(Failure::Gone) => {
                 written = false;
                 break;
@@ -209,17 +224,75 @@ fn collect(
     // this run's is left by a run that was killed, or lost the race.
     clear_stale(&dir, &hour_label, &temporary);
     tracing::info!(hour = %hour_label, "collected the snapshot");
+    // Nothing failed, but each of these is for a person to look at: each is
+    // logged here and kept on the report.
+    let mut warnings = Vec::new();
+    let mut report = done("collected");
     if retries > 0 {
-        // A retry that cleared the blip: nothing failed, but it is for a
-        // person to look at.
-        return Ok(Report::warning(
-            "COLLECTED_AFTER_RETRIES",
-            "The hour was collected after retrying Blizzard.",
-        )
-        .with_metadata("hour", hour_label.clone())
-        .with_metadata("retries", retries.to_string()));
+        warnings.push(
+            Report::warning(
+                "COLLECTED_AFTER_RETRIES",
+                "The hour was collected after retrying Blizzard.",
+            )
+            .with_metadata("hour", hour_label.clone())
+            .with_metadata("retries", retries.to_string()),
+        );
+        report = report.with_metadata("retries", retries.to_string());
     }
-    Ok(done("collected"))
+    if let Some(snapshot) = found {
+        let past = refresh_past_hour(snapshot.last_modified);
+        report = report.with_metadata("refresh_past_hour", clock_text(past));
+        if !refresh_as_expected(past) {
+            warnings.push(refresh_time_moved(&hour_label, past));
+        }
+        if !snapshot.unknown_fields.is_empty() {
+            warnings.push(field_new(&hour_label, &snapshot.unknown_fields));
+        }
+    }
+    for warning in &warnings {
+        warning.log();
+    }
+    Ok(warned(report, warnings))
+}
+
+/// How long past its hour a `last-modified` is.
+fn refresh_past_hour(last_modified: DateTime<Utc>) -> std::time::Duration {
+    let hour = Hour::containing(last_modified);
+    (last_modified - hour.start().expect("an hour in range"))
+        .to_std()
+        .unwrap_or_default()
+}
+
+/// A time past the hour as `mm:ss`.
+pub(crate) fn clock_text(past: std::time::Duration) -> String {
+    format!("{:02}:{:02}", past.as_secs() / 60, past.as_secs() % 60)
+}
+
+/// Whether a refresh is inside the expected refresh window, its ends included.
+pub(crate) fn refresh_as_expected(past: std::time::Duration) -> bool {
+    (REFRESH_WINDOW_START..=REFRESH_WINDOW_END).contains(&past)
+}
+
+/// Blizzard refreshed the snapshot outside the expected window.
+fn refresh_time_moved(hour_label: &str, past: std::time::Duration) -> Report {
+    Report::warning(
+        "REFRESH_TIME_MOVED",
+        "Blizzard refreshed the snapshot at a minute past the hour outside the expected window.",
+    )
+    .with_metadata("hour", hour_label)
+    .with_metadata("refresh_past_hour", clock_text(past))
+    .with_metadata("window_start", clock_text(REFRESH_WINDOW_START))
+    .with_metadata("window_end", clock_text(REFRESH_WINDOW_END))
+}
+
+/// The snapshot has listing fields the parser does not know.
+fn field_new(hour_label: &str, fields: &[String]) -> Report {
+    Report::warning(
+        "SNAPSHOT_FIELD_NEW",
+        "A snapshot listing has a field dp does not know; it is ignored.",
+    )
+    .with_metadata("hour", hour_label)
+    .with_metadata("fields", fields.join(","))
 }
 
 /// What makes a name one run's own: its `pid`, which is not unique across
@@ -347,7 +420,10 @@ fn attempt(
     };
     let summary = snapshot::write_parquet(response.body, &meta, temporary, scratch)?;
     tracing::info!(rows = summary.rows, "parsed the snapshot");
-    Ok(Attempt::Written)
+    Ok(Attempt::Written(Written {
+        last_modified: response.last_modified,
+        unknown_fields: summary.unknown_fields.into_iter().collect(),
+    }))
 }
 
 #[cfg(test)]

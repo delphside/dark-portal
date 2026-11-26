@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
-use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use duckdb::{Connection, params};
@@ -20,7 +19,8 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 use super::failure::{Failure, io_failure, says_disk_full};
 use crate::error::{ErrorType, Report};
 use crate::lake::{Spill, job_limits};
-use crate::types::{AuctionId, Copper, ItemId, Listing, TimeLeft};
+use crate::settings::collection::TEXT_MAX_LENGTH;
+use crate::types::{AuctionId, Copper, ItemId, Listing};
 
 /// Why a body could not be turned into listings.
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +29,25 @@ pub enum ParseError {
     Read(String),
     /// The body is not what the parser can use.
     Format(String),
+    /// A field the parser needs is missing or of another type: Blizzard's
+    /// format has changed.
+    Shape {
+        /// The path that failed: a field, an `item` field as `item.id`, a
+        /// listing as `auctions[]`, the body as `$`.
+        field: String,
+        /// The listings read before it.
+        listings: u64,
+    },
+    /// A field has a value it cannot have: negative, decimal, out of its
+    /// column's range, zero where no listing has zero, or text too long.
+    Value {
+        /// The field.
+        field: String,
+        /// The value, cut at [`QUOTED_VALUE_MAX`] characters.
+        value: String,
+        /// The listings read before it.
+        listings: u64,
+    },
     /// The sink refused a listing.
     Sink(String),
 }
@@ -37,6 +56,17 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Read(m) | ParseError::Format(m) | ParseError::Sink(m) => f.write_str(m),
+            ParseError::Shape { field, listings } => {
+                write!(
+                    f,
+                    "{field} is missing or of another type after {listings} listings"
+                )
+            }
+            ParseError::Value {
+                field,
+                value,
+                listings,
+            } => write!(f, "{field} is {value:?} after {listings} listings"),
         }
     }
 }
@@ -46,28 +76,159 @@ impl fmt::Display for ParseError {
 pub struct ParseSummary {
     /// The listings handed to the sink.
     pub rows: u64,
-    /// The field names the parser does not know, each once.
+    /// The field names the parser does not know, each once. Logging them is
+    /// the caller's, as the warning `SNAPSHOT_FIELD_NEW`.
     pub unknown_fields: BTreeSet<String>,
 }
 
 type Sink<'a> = &'a mut dyn FnMut(Listing) -> Result<(), String>;
 
+/// What stops the parse as a change in Blizzard's format: the first found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Problem {
+    /// A field or a structure that is not as it was.
+    Shape(String),
+    /// A value the column cannot hold or that no listing has.
+    Value { field: String, value: String },
+}
+
 struct State<'a> {
     sink: Sink<'a>,
     summary: ParseSummary,
     sink_error: Option<String>,
+    /// The first change in format found.
+    problem: Option<Problem>,
     saw_auctions: bool,
 }
 
-impl State<'_> {
-    /// Logs a field the parser does not know, the first time it is met.
-    fn unknown(&mut self, name: &str) {
-        if self.summary.unknown_fields.insert(name.to_owned()) {
-            tracing::warn!(
-                field = name,
-                "a snapshot listing has a field dp does not know"
-            );
+/// A scalar as the body gave it, for sorting a value that is wrong in kind
+/// (a shape change) from one that is of the right kind and out of bounds.
+#[derive(Debug)]
+enum Scalar {
+    Unsigned(u64),
+    Negative(i64),
+    Decimal(f64),
+    Text(String),
+    /// A boolean, null, array or object where a scalar was needed.
+    Other,
+}
+
+impl<'de> de::Deserialize<'de> for Scalar {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Scalar, D::Error> {
+        struct Any;
+        impl<'de> Visitor<'de> for Any {
+            type Value = Scalar;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a value")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Scalar, E> {
+                Ok(Scalar::Unsigned(v))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Scalar, E> {
+                Ok(if v >= 0 {
+                    Scalar::Unsigned(v.unsigned_abs())
+                } else {
+                    Scalar::Negative(v)
+                })
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<Scalar, E> {
+                Ok(Scalar::Decimal(v))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Scalar, E> {
+                Ok(Scalar::Text(v.to_owned()))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_none<E>(self) -> Result<Scalar, E> {
+                Ok(Scalar::Other)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Scalar, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Scalar::Other)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Scalar, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Scalar::Other)
+            }
         }
+        deserializer.deserialize_any(Any)
+    }
+}
+
+/// The longest a value is quoted in a report.
+const QUOTED_VALUE_MAX: usize = 64;
+
+impl State<'_> {
+    /// Notes a field the parser does not know.
+    fn unknown(&mut self, name: &str) {
+        self.summary.unknown_fields.insert(name.to_owned());
+    }
+
+    /// Notes that the `path` is not as it was, the first time anything is.
+    fn misshapen(&mut self, path: &str) {
+        self.problem
+            .get_or_insert_with(|| Problem::Shape(path.to_owned()));
+    }
+
+    /// Notes a value the field cannot have, the first time anything is wrong.
+    fn unexpected_value<E: de::Error>(&mut self, field: &str, value: &str) -> E {
+        let value: String = value.chars().take(QUOTED_VALUE_MAX).collect();
+        self.problem.get_or_insert_with(|| Problem::Value {
+            field: field.to_owned(),
+            value,
+        });
+        E::custom("an unexpected value")
+    }
+
+    /// A whole number of the needed `field`, from `least` to `most`. Another
+    /// kind of value is a shape change, and a number of the right kind that
+    /// is negative, decimal or out of bounds is an unexpected value.
+    fn number<'de, A: MapAccess<'de>>(
+        &mut self,
+        map: &mut A,
+        field: &str,
+        least: u64,
+        most: u64,
+    ) -> Result<u64, A::Error> {
+        match map.next_value::<Scalar>()? {
+            Scalar::Unsigned(v) if (least..=most).contains(&v) => Ok(v),
+            Scalar::Unsigned(v) => Err(self.unexpected_value(field, &v.to_string())),
+            Scalar::Negative(v) => Err(self.unexpected_value(field, &v.to_string())),
+            Scalar::Decimal(v) => Err(self.unexpected_value(field, &v.to_string())),
+            Scalar::Text(_) | Scalar::Other => {
+                self.misshapen(field);
+                Err(de::Error::custom("not a number"))
+            }
+        }
+    }
+
+    /// The text of the needed `field`, of at most [`TEXT_MAX_LENGTH`] bytes.
+    fn text<'de, A: MapAccess<'de>>(
+        &mut self,
+        map: &mut A,
+        field: &str,
+    ) -> Result<String, A::Error> {
+        match map.next_value::<Scalar>()? {
+            Scalar::Text(v) if v.len() <= TEXT_MAX_LENGTH => Ok(v),
+            Scalar::Text(v) => Err(self.unexpected_value(field, &v)),
+            _ => {
+                self.misshapen(field);
+                Err(de::Error::custom("not text"))
+            }
+        }
+    }
+
+    /// The needed `field`, which is a shape change where it was not there.
+    fn needed<T, E: de::Error>(&mut self, value: Option<T>, field: &'static str) -> Result<T, E> {
+        value.ok_or_else(|| {
+            self.misshapen(field);
+            E::missing_field(field)
+        })
     }
 }
 
@@ -84,7 +245,8 @@ impl<'de> Visitor<'de> for RootVisitor<'_, '_> {
         while let Some(key) = map.next_key::<String>()? {
             if key == "auctions" {
                 self.0.saw_auctions = true;
-                map.next_value_seed(AuctionsSeed(&mut *self.0))?;
+                map.next_value_seed(AuctionsSeed(&mut *self.0))
+                    .inspect_err(|_| self.0.misshapen("auctions"))?;
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
@@ -111,7 +273,11 @@ impl<'de> Visitor<'de> for AuctionsSeed<'_, '_> {
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while seq.next_element_seed(ListingSeed(&mut *self.0))?.is_some() {}
+        while seq
+            .next_element_seed(ListingSeed(&mut *self.0))
+            .inspect_err(|_| self.0.misshapen("auctions[]"))?
+            .is_some()
+        {}
         Ok(())
     }
 }
@@ -138,14 +304,25 @@ impl<'de> Visitor<'de> for ListingSeed<'_, '_> {
             (None, None, None, None, None);
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "id" => id = Some(map.next_value::<u64>()?),
-                "item" => item = Some(map.next_value_seed(ItemSeed(&mut *self.0))?),
-                "quantity" => quantity = Some(map.next_value::<u32>()?),
-                "unit_price" => unit_price = Some(map.next_value::<u64>()?),
-                "time_left" => {
-                    let text = map.next_value::<String>()?;
-                    time_left = Some(TimeLeft::from_str(&text).map_err(de::Error::custom)?);
+                // A listing has a quantity and a price: a zero one is a value
+                // no listing has.
+                "id" => id = Some(self.0.number(&mut map, "id", 0, u64::MAX)?),
+                "item" => {
+                    item = Some(
+                        map.next_value_seed(ItemSeed(&mut *self.0))
+                            .inspect_err(|_| self.0.misshapen("item"))?,
+                    );
                 }
+                "quantity" => {
+                    let most = u64::from(u32::MAX);
+                    quantity = Some(self.0.number(&mut map, "quantity", 1, most)? as u32);
+                }
+                "unit_price" => {
+                    unit_price = Some(self.0.number(&mut map, "unit_price", 1, u64::MAX)?)
+                }
+                // Any text is kept as given: a value that is not a band is the
+                // transform's to warn of, not a reason to lose the hour.
+                "time_left" => time_left = Some(self.0.text(&mut map, "time_left")?),
                 other => {
                     self.0.unknown(other);
                     map.next_value::<IgnoredAny>()?;
@@ -153,11 +330,11 @@ impl<'de> Visitor<'de> for ListingSeed<'_, '_> {
             }
         }
         let listing = Listing {
-            id: AuctionId(id.ok_or_else(|| de::Error::missing_field("id"))?),
-            item: ItemId(item.ok_or_else(|| de::Error::missing_field("item"))?),
-            quantity: quantity.ok_or_else(|| de::Error::missing_field("quantity"))?,
-            unit_price: Copper(unit_price.ok_or_else(|| de::Error::missing_field("unit_price"))?),
-            time_left: time_left.ok_or_else(|| de::Error::missing_field("time_left"))?,
+            id: AuctionId(self.0.needed(id, "id")?),
+            item: ItemId(self.0.needed(item, "item")?),
+            quantity: self.0.needed(quantity, "quantity")?,
+            unit_price: Copper(self.0.needed(unit_price, "unit_price")?),
+            time_left: self.0.needed(time_left, "time_left")?,
         };
         (self.0.sink)(listing).map_err(|message| {
             self.0.sink_error = Some(message);
@@ -190,13 +367,13 @@ impl<'de> Visitor<'de> for ItemSeed<'_, '_> {
         let mut id = None;
         while let Some(key) = map.next_key::<String>()? {
             if key == "id" {
-                id = Some(map.next_value::<u32>()?);
+                id = Some(self.0.number(&mut map, "item.id", 0, u64::from(u32::MAX))? as u32);
             } else {
                 self.0.unknown(&format!("item.{key}"));
                 map.next_value::<IgnoredAny>()?;
             }
         }
-        id.ok_or_else(|| de::Error::missing_field("id"))
+        self.0.needed(id, "item.id")
     }
 }
 
@@ -210,6 +387,7 @@ pub fn parse_listings<R: Read>(
         sink,
         summary: ParseSummary::default(),
         sink_error: None,
+        problem: None,
         saw_auctions: false,
     };
     let mut deserializer =
@@ -220,7 +398,23 @@ pub fn parse_listings<R: Read>(
     if let Some(message) = state.sink_error {
         return Err(ParseError::Sink(message));
     }
+    let listings = state.summary.rows;
     if let Err(error) = result {
+        // Only a body that is well formed JSON can have changed its shape.
+        if error.classify() == serde_json::error::Category::Data {
+            return Err(match state.problem {
+                Some(Problem::Value { field, value }) => ParseError::Value {
+                    field,
+                    value,
+                    listings,
+                },
+                Some(Problem::Shape(field)) => ParseError::Shape { field, listings },
+                None => ParseError::Shape {
+                    field: "$".to_owned(),
+                    listings,
+                },
+            });
+        }
         return Err(if error.is_io() {
             ParseError::Read(error.to_string())
         } else {
@@ -228,7 +422,10 @@ pub fn parse_listings<R: Read>(
         });
     }
     if !state.saw_auctions {
-        return Err(ParseError::Format("the body has no auctions".to_owned()));
+        return Err(ParseError::Shape {
+            field: "auctions".to_owned(),
+            listings: 0,
+        });
     }
     Ok(state.summary)
 }
@@ -333,7 +530,7 @@ fn write_into<R: Read>(
                     l.item.0,
                     l.quantity,
                     l.unit_price.0,
-                    l.time_left.as_str()
+                    l.time_left
                 ])
                 .map_err(|e| e.to_string())
         };
@@ -349,6 +546,29 @@ fn write_into<R: Read>(
                     "SNAPSHOT_BODY_UNUSABLE",
                     "Blizzard's snapshot body is not in a form the parser can use.",
                 )
+            }
+            ParseError::Shape { field, listings } => {
+                tracing::error!(%field, listings, "the snapshot's shape has changed");
+                Failure::unexpected(
+                    "SNAPSHOT_SHAPE_CHANGED",
+                    "A field the parser needs is missing from Blizzard's snapshot or is of another type; the hour is a gap.",
+                )
+                .with_metadata("field", field)
+                .with_metadata("listings", listings.to_string())
+            }
+            ParseError::Value {
+                field,
+                value,
+                listings,
+            } => {
+                tracing::error!(%field, %value, listings, "a snapshot value is unexpected");
+                Failure::unexpected(
+                    "SNAPSHOT_VALUE_UNEXPECTED",
+                    "A value in Blizzard's snapshot is one the listing cannot have; the hour is a gap.",
+                )
+                .with_metadata("field", field)
+                .with_metadata("value", value)
+                .with_metadata("listings", listings.to_string())
             }
             ParseError::Sink(message) => duckdb_failure(&message),
         })?;
@@ -372,6 +592,25 @@ fn write_into<R: Read>(
     // The file is on disk before the rename that makes it the hour's.
     sync_file(temporary, "the snapshot file")?;
     Ok(summary)
+}
+
+/// The `last-modified` an hour's bronze file holds: `None` where the file is
+/// not there or cannot be read, since what asks never fails for it.
+pub(crate) fn last_modified_of(connection: &Connection, file: &Path) -> Option<DateTime<Utc>> {
+    if !file.exists() {
+        return None;
+    }
+    let millis: Option<i64> = connection
+        .query_row(
+            &format!(
+                "SELECT epoch_ms(min(last_modified)) FROM read_parquet({})",
+                quoted(&file.to_string_lossy())
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    DateTime::from_timestamp_millis(millis?)
 }
 
 /// Syncs a file, `what` being its description for a failure's report. One that
@@ -404,8 +643,6 @@ pub fn rename_into_place(temporary: &Path, file: &Path, what: &str) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use super::*;
 
     fn collect(body: &str) -> (Result<ParseSummary, ParseError>, Vec<Listing>) {
@@ -427,10 +664,10 @@ mod tests {
         assert_eq!(result.unwrap().rows, 2);
         assert_eq!(listings[0].id, AuctionId(1));
         assert_eq!(listings[0].item, ItemId(10));
-        assert_eq!(listings[0].time_left, TimeLeft::Short);
+        assert_eq!(listings[0].time_left, "SHORT");
         assert_eq!(listings[1].quantity, 4_000_000_000);
         assert_eq!(listings[1].unit_price, Copper(u64::MAX));
-        assert_eq!(listings[1].time_left, TimeLeft::VeryLong);
+        assert_eq!(listings[1].time_left, "VERY_LONG");
     }
 
     #[test]
@@ -442,16 +679,12 @@ mod tests {
 
     #[test]
     fn a_body_the_parser_cannot_use_is_a_format_error() {
+        // Not JSON at all: nothing says the format has changed.
         for body in [
             "",
-            "[]",
             "{not json",
-            r#"{"_links":{}}"#,
-            r#"{"auctions":[{"id":1}]}"#,
-            r#"{"auctions":[{"id":1,"item":{"id":1},"quantity":1,"unit_price":1,"time_left":"FOREVER"}]}"#,
-            r#"{"auctions":[{"id":-1,"item":{"id":1},"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#,
-            r#"{"auctions":[{"id":1,"item":{"id":1},"quantity":4294967296,"unit_price":1,"time_left":"LONG"}]}"#,
             r#"{"auctions":[]} trailing"#,
+            r#"{"auctions":["#,
         ] {
             let (result, _) = collect(body);
             assert!(
@@ -459,6 +692,167 @@ mod tests {
                 "{body}: {result:?}"
             );
         }
+    }
+
+    /// A listing with `field` as `json`, the rest as Blizzard has them.
+    fn listing_with(field: &str, json: &str) -> String {
+        let fields = [
+            ("id", "1"),
+            ("item", r#"{"id":1}"#),
+            ("quantity", "1"),
+            ("unit_price", "1"),
+            ("time_left", r#""LONG""#),
+        ];
+        let body: Vec<String> = fields
+            .iter()
+            .filter(|(name, _)| *name != field || !json.is_empty())
+            .map(|(name, value)| {
+                format!(r#""{name}":{}"#, if *name == field { json } else { value })
+            })
+            .collect();
+        format!(
+            r#"{{"auctions":[{{"id":9,"item":{{"id":9}},"quantity":1,"unit_price":1,"time_left":"LONG"}},{{{}}}]}}"#,
+            body.join(",")
+        )
+    }
+
+    #[test]
+    fn a_needed_field_missing_or_of_another_kind_is_a_shape_change_naming_its_path() {
+        // The listing before it was read: one.
+        let shape = |field: &str, listings| ParseError::Shape {
+            field: field.to_owned(),
+            listings,
+        };
+        for (field, json) in [
+            ("id", ""),
+            ("item", ""),
+            ("quantity", ""),
+            ("unit_price", ""),
+            ("time_left", ""),
+            ("id", r#""1""#),
+            ("quantity", "true"),
+            ("unit_price", "null"),
+            ("time_left", "5"),
+            ("time_left", r#"["LONG"]"#),
+            ("item", "[1]"),
+            ("item", "5"),
+        ] {
+            let (result, _) = collect(&listing_with(field, json));
+            assert_eq!(result, Err(shape(field, 1)), "{field} {json:?}");
+        }
+        // Within `item`, and where the structure moved.
+        let (result, _) = collect(
+            r#"{"auctions":[{"id":1,"item":{"identifier":3},"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#,
+        );
+        assert_eq!(result, Err(shape("item.id", 0)));
+        let (result, _) = collect(
+            r#"{"auctions":[{"id":1,"item":{"id":"3"},"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#,
+        );
+        assert_eq!(result, Err(shape("item.id", 0)));
+        // The listings are not a sequence, are not objects, or are renamed.
+        let (result, _) = collect(r#"{"auctions":{"a":1}}"#);
+        assert_eq!(result, Err(shape("auctions", 0)));
+        let (result, _) = collect(r#"{"auctions":[5]}"#);
+        assert_eq!(result, Err(shape("auctions[]", 0)));
+        let (result, _) = collect(r#"{"listings":[]}"#);
+        assert_eq!(result, Err(shape("auctions", 0)));
+        let (result, _) = collect("[]");
+        assert_eq!(result, Err(shape("$", 0)));
+    }
+
+    #[test]
+    fn a_value_the_column_cannot_hold_is_an_unexpected_value_with_the_field_and_count() {
+        let value = |field: &str, value: &str| ParseError::Value {
+            field: field.to_owned(),
+            value: value.to_owned(),
+            listings: 1,
+        };
+        for (field, json, shown) in [
+            ("quantity", "-1", "-1"),
+            ("quantity", "1.5", "1.5"),
+            ("quantity", "4294967296", "4294967296"),
+            ("quantity", "0", "0"),
+            ("unit_price", "-3", "-3"),
+            ("unit_price", "2.25", "2.25"),
+            ("unit_price", "18446744073709551616", "18446744073709552000"),
+            ("unit_price", "0", "0"),
+            ("id", "-1", "-1"),
+            ("id", "0.5", "0.5"),
+        ] {
+            let (result, _) = collect(&listing_with(field, json));
+            assert_eq!(result, Err(value(field, shown)), "{field} {json}");
+        }
+        let (result, _) = collect(
+            r#"{"auctions":[{"id":1,"item":{"id":-4},"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#,
+        );
+        assert_eq!(
+            result,
+            Err(ParseError::Value {
+                field: "item.id".to_owned(),
+                value: "-4".to_owned(),
+                listings: 0
+            })
+        );
+        // The edges are values: the most a column holds, and one.
+        let (result, listings) = collect(&listing_with("quantity", "4294967295"));
+        assert_eq!(result.unwrap().rows, 2);
+        assert_eq!(listings[1].quantity, u32::MAX);
+        let (result, _) = collect(&listing_with("unit_price", "18446744073709551615"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_time_left_that_is_not_a_band_is_kept_as_given_and_text_beyond_the_longest_is_not() {
+        let (result, listings) = collect(&listing_with("time_left", r#""FOREVER""#));
+        assert_eq!(result.unwrap().rows, 2);
+        assert_eq!(listings[1].time_left, "FOREVER");
+        // Case and spaces are Blizzard's: kept, not tidied.
+        let (_, listings) = collect(&listing_with("time_left", r#"" very long ""#));
+        assert_eq!(listings[1].time_left, " very long ");
+        // At the longest it is kept; one byte over is a value no band has.
+        let longest = "X".repeat(TEXT_MAX_LENGTH);
+        let (result, _) = collect(&listing_with("time_left", &format!("\"{longest}\"")));
+        assert!(result.is_ok());
+        let over = "X".repeat(TEXT_MAX_LENGTH + 1);
+        let (result, _) = collect(&listing_with("time_left", &format!("\"{over}\"")));
+        assert_eq!(
+            result,
+            Err(ParseError::Value {
+                field: "time_left".to_owned(),
+                value: over,
+                listings: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_long_value_is_quoted_cut_short() {
+        let over = "Y".repeat(500);
+        let (result, _) = collect(&listing_with("time_left", &format!("\"{over}\"")));
+        let Err(ParseError::Value { value, .. }) = result else {
+            panic!("expected an unexpected value");
+        };
+        assert_eq!(value.len(), QUOTED_VALUE_MAX);
+    }
+
+    #[test]
+    fn a_shape_change_counts_the_listings_read_before_it() {
+        let mut body = String::from(r#"{"auctions":["#);
+        for id in 1..=3 {
+            body.push_str(&format!(
+                r#"{{"id":{id},"item":{{"id":1}},"quantity":1,"unit_price":1,"time_left":"LONG"}},"#
+            ));
+        }
+        body.push_str(r#"{"id":4}]}"#);
+        let (result, listings) = collect(&body);
+        assert_eq!(listings.len(), 3);
+        assert_eq!(
+            result,
+            Err(ParseError::Shape {
+                field: "item".to_owned(),
+                listings: 3
+            })
+        );
     }
 
     #[test]
@@ -479,52 +873,22 @@ mod tests {
         assert_eq!(result, Err(ParseError::Sink("disk".to_owned())));
     }
 
-    #[derive(Clone)]
-    struct Logged(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Logged {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[test]
-    fn unknown_listing_field_is_logged_by_name() {
-        crate::test_support::listening();
+    fn unknown_listing_fields_are_gathered_by_name_once_each() {
         let body = r#"{"auctions":[
             {"id":1,"item":{"id":1,"bonus":[1]},"quantity":1,"unit_price":1,"time_left":"LONG","buyout":5},
             {"id":2,"item":{"id":1,"bonus":[2]},"quantity":1,"unit_price":1,"time_left":"LONG","buyout":6}]}"#;
-        let log = Logged(Arc::default());
-        let writer = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let (result, listings) = tracing::subscriber::with_default(subscriber, || collect(body));
+        let (result, listings) = collect(body);
 
         assert_eq!(listings.len(), 2);
         let fields: Vec<_> = result.unwrap().unknown_fields.into_iter().collect();
         assert_eq!(fields, ["buyout", "item.bonus"]);
-        let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(text.matches("buyout").count(), 1, "{text}");
-        assert_eq!(text.matches("item.bonus").count(), 1, "{text}");
-        assert!(text.contains("WARN"));
     }
 
     #[test]
-    fn known_fields_only_log_nothing() {
-        crate::test_support::listening();
-        let log = Logged(Arc::default());
-        let writer = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .finish();
-        let _ = tracing::subscriber::with_default(subscriber, || collect(TWO));
-        assert!(log.0.lock().unwrap().is_empty());
+    fn known_fields_only_gather_none() {
+        let (result, _) = collect(TWO);
+        assert!(result.unwrap().unknown_fields.is_empty());
     }
 
     fn at(rfc3339: &str) -> DateTime<Utc> {

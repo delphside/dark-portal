@@ -58,8 +58,10 @@ SELECT
         WHEN g.in_front THEN outcome_sold()
         WHEN d.hours IS NOT NULL THEN outcome_expired()
         -- EV-5, posting hour unknown: the last band's lower bound is under
-        -- span hours.
-        WHEN g.posted IS NULL AND b.lower_minutes < c.span * 60 THEN outcome_expired()
+        -- span hours. A time left that is not a band has no lower bound, so
+        -- this cannot hold and the listing is cancelled, never expired.
+        WHEN g.posted IS NULL AND b.lower_minutes IS NOT NULL
+             AND b.lower_minutes < c.span * 60 THEN outcome_expired()
         ELSE outcome_cancelled()
     END AS outcome,
     NOT g.in_front AND g.tie_candidate AS tie,

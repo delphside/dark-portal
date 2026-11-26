@@ -8,9 +8,11 @@
 
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
+
 use crate::collect::Clock;
 use crate::collect::failure::Failure;
-use crate::collect::snapshot::{quoted, timestamp};
+use crate::collect::snapshot::{last_modified_of, quoted, timestamp};
 use crate::lake::{Lake, lake_failure, out_of_memory, says_out_of_memory};
 use crate::transform::bronze;
 use crate::transform::vocabulary::HourWarning;
@@ -74,6 +76,10 @@ pub struct HourSummary {
     pub live: u64,
     /// Each listing the hour warned of, by warning.
     pub warnings: Vec<(HourWarning, u64)>,
+    /// Each `time_left` that is not a band, with the listings that had it.
+    pub unknown_time_left: Vec<(String, u64)>,
+    /// The snapshot's `last-modified`.
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 fn at(hour: Hour) -> String {
@@ -84,9 +90,17 @@ fn unexpected(reason: &str, message: &str, hour: Hour) -> Failure {
     Failure::unexpected(reason, message).with_metadata("hour", bronze::hour_name(hour))
 }
 
+/// What staging an hour found that is not a failure.
+struct Staged {
+    /// Each `time_left` that is not a band, with the listings that had it.
+    unknown_time_left: Vec<(String, u64)>,
+    last_modified: Option<DateTime<Utc>>,
+}
+
 /// Stages the hour's snapshot as `bronze_hour`, refusing one that is not what
 /// its name says: the transform trusts nothing about a file it did not write.
-fn stage(lake: &Lake, data_dir: &Path, hour: Hour) -> Result<(), Failure> {
+/// A `time_left` that is not a band is kept and reported, not refused.
+fn stage(lake: &Lake, data_dir: &Path, hour: Hour) -> Result<Staged, Failure> {
     let file = bronze::path(data_dir, hour);
     lake.connection()
         .execute_batch(&format!(
@@ -107,12 +121,11 @@ fn stage(lake: &Lake, data_dir: &Path, hour: Hour) -> Result<(), Failure> {
             )
             .with_metadata("detail", message)
         })?;
-    let (rows, ids, wrong_hour, wrong_band, nulls): (i64, i64, i64, i64, i64) = lake
+    let (rows, ids, wrong_hour, nulls): (i64, i64, i64, i64) = lake
         .connection()
         .query_row(
             &format!(
                 "SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE hour <> {}), \
-                 count(*) FILTER (WHERE time_left NOT IN (SELECT time_left FROM band)), \
                  count(*) FILTER (WHERE hour IS NULL OR last_modified IS NULL OR \
                     fetched_at IS NULL OR id IS NULL OR item IS NULL OR quantity IS NULL OR \
                     unit_price IS NULL OR time_left IS NULL) \
@@ -120,30 +133,39 @@ fn stage(lake: &Lake, data_dir: &Path, hour: Hour) -> Result<(), Failure> {
                 at(hour)
             ),
             [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|e| lake_failure(&e.to_string(), "checking the hour's bronze file"))?;
-    if rows != ids || wrong_hour != 0 || wrong_band != 0 || nulls != 0 {
+    if rows != ids || wrong_hour != 0 || nulls != 0 {
         return Err(unexpected(
             "BRONZE_HOUR_INVALID",
-            "The hour's bronze file holds a repeated ID, another hour, a time left that is not a band or a null.",
+            "The hour's bronze file holds a repeated ID, another hour or a null.",
             hour,
         )
         .with_metadata("rows", rows.to_string())
         .with_metadata("distinct_ids", ids.to_string())
         .with_metadata("rows_of_another_hour", wrong_hour.to_string())
-        .with_metadata("rows_with_an_unknown_band", wrong_band.to_string())
         .with_metadata("rows_with_a_null", nulls.to_string()));
     }
-    Ok(())
+    let reading = "reading the hour's time left values";
+    let mut statement = lake
+        .connection()
+        .prepare(
+            "SELECT time_left, count(*) FROM bronze_hour \
+             WHERE time_left NOT IN (SELECT time_left FROM band) GROUP BY time_left \
+             ORDER BY time_left",
+        )
+        .map_err(|e| lake_failure(&e.to_string(), reading))?;
+    let unknown_time_left = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })
+        .and_then(|found| found.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| lake_failure(&e.to_string(), reading))?;
+    Ok(Staged {
+        unknown_time_left,
+        last_modified: last_modified_of(lake.connection(), &file),
+    })
 }
 
 fn count(lake: &Lake, sql: &str) -> Result<u64, Failure> {
@@ -166,11 +188,15 @@ pub fn process(
     previous: Option<Hour>,
     hook: Hook,
 ) -> Result<HourSummary, Failure> {
-    stage(lake, data_dir, hour)?;
+    let staged = stage(lake, data_dir, hour)?;
     lake.begin()?;
     match write(lake, data_dir, clock, hour, previous, hook) {
         Ok(summary) => match lake.commit() {
-            Ok(()) => Ok(summary),
+            Ok(()) => Ok(HourSummary {
+                unknown_time_left: staged.unknown_time_left,
+                last_modified: staged.last_modified,
+                ..summary
+            }),
             Err(failure) => {
                 lake.rollback();
                 Err(failure.with_metadata("hour", bronze::hour_name(hour)))
@@ -266,5 +292,7 @@ fn write(
         ended: count(lake, "SELECT count(*) FROM ended")?,
         live: count(lake, "SELECT count(*) FROM next_live")?,
         warnings,
+        unknown_time_left: Vec::new(),
+        last_modified: None,
     })
 }

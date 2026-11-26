@@ -220,7 +220,7 @@ fixed_values! {
 }
 
 /// One listing as a snapshot shows it: the listing columns of a bronze row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Listing {
     /// The listing.
     pub id: AuctionId,
@@ -230,8 +230,10 @@ pub struct Listing {
     pub unit_price: Copper,
     /// Units in the listing at that hour.
     pub quantity: u32,
-    /// The listing's band at that hour.
-    pub time_left: TimeLeft,
+    /// The listing's time left at that hour, as Blizzard gave it: one of
+    /// [`TimeLeft`]'s values, unless Blizzard has added another, which bronze
+    /// keeps (`docs/5.2.2-listing-lifecycle-and-events.md`).
+    pub time_left: String,
 }
 
 /// An `event` row.

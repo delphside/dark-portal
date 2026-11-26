@@ -44,3 +44,21 @@ pub const ITEM_FETCH_RATE_PER_SECOND: u32 = 50;
 
 /// "item attempts": the requests an item gets in one run, 3.
 pub const ITEM_ATTEMPTS: u32 = 3;
+
+/// "expected refresh window": a snapshot refreshed from this long past the hour,
+/// 20 minutes, to [`REFRESH_WINDOW_END`], is refreshed as expected.
+pub const REFRESH_WINDOW_START: Duration = Duration::from_secs(20 * 60);
+
+/// "expected refresh window": the end, 45 minutes past the hour, included.
+pub const REFRESH_WINDOW_END: Duration = Duration::from_secs(45 * 60);
+
+/// "expected refresh interval": the shortest time between one hour's
+/// `last-modified` and the next's that is as expected, 50 minutes.
+pub const REFRESH_INTERVAL_LEAST: Duration = Duration::from_secs(50 * 60);
+
+/// "expected refresh interval": the longest, 70 minutes.
+pub const REFRESH_INTERVAL_MOST: Duration = Duration::from_secs(70 * 60);
+
+/// "longest text": the most bytes a text field of a snapshot listing may have,
+/// 32. `time_left`'s longest band is 9.
+pub const TEXT_MAX_LENGTH: usize = 32;
