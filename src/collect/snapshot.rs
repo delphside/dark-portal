@@ -245,6 +245,11 @@ impl<'de> Visitor<'de> for RootVisitor<'_, '_> {
                 map.next_value_seed(AuctionsSeed(&mut *self.0))
                     .inspect_err(|_| self.0.misshapen("auctions"))?;
             } else {
+                // Blizzard's own link block is known; any other field beside
+                // the listings is new, and is ignored whatever it holds.
+                if key != "_links" {
+                    self.0.unknown(&format!("$.{key}"));
+                }
                 map.next_value::<IgnoredAny>()?;
             }
         }
@@ -822,6 +827,267 @@ mod tests {
                 value: over,
                 listings: 1
             })
+        );
+    }
+
+    #[test]
+    fn a_number_written_with_a_fraction_or_an_exponent_is_a_decimal_and_minus_zero_is_negative() {
+        // 5.2.1 *What a number is*: each is an unexpected value, never kept.
+        for (field, json) in [
+            ("quantity", "2.0"),
+            ("quantity", "1e3"),
+            ("quantity", "-0"),
+            ("unit_price", "2.0"),
+            ("unit_price", "1e3"),
+            ("unit_price", "-0"),
+            ("id", "2.0"),
+            ("id", "-0"),
+        ] {
+            let (result, _) = collect(&listing_with(field, json));
+            assert!(
+                matches!(&result, Err(ParseError::Value { field: f, listings: 1, .. }) if f == field),
+                "{field} {json}: {result:?}"
+            );
+        }
+        let (result, _) = collect(
+            r#"{"auctions":[{"id":1,"item":{"id":1e3},"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#,
+        );
+        assert!(
+            matches!(&result, Err(ParseError::Value { field, .. }) if field == "item.id"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn every_needed_number_of_another_kind_is_a_shape_change() {
+        // D41.1-5: text, a boolean, null, an array and an object.
+        for field in ["id", "quantity", "unit_price"] {
+            for json in [r#""5""#, "true", "null", "[]", "{}"] {
+                let (result, _) = collect(&listing_with(field, json));
+                assert_eq!(
+                    result,
+                    Err(ParseError::Shape {
+                        field: field.to_owned(),
+                        listings: 1
+                    }),
+                    "{field} {json}"
+                );
+            }
+        }
+        for json in [r#""5""#, "true", "null", "[]", "{}"] {
+            let body = format!(
+                r#"{{"auctions":[{{"id":1,"item":{{"id":{json}}},"quantity":1,"unit_price":1,"time_left":"LONG"}}]}}"#
+            );
+            let (result, _) = collect(&body);
+            assert_eq!(
+                result,
+                Err(ParseError::Shape {
+                    field: "item.id".to_owned(),
+                    listings: 0
+                }),
+                "item.id {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_left_that_is_not_text_is_a_shape_change() {
+        // D39.9
+        for json in ["3", "true", "null", "[]", "{}"] {
+            let (result, _) = collect(&listing_with("time_left", json));
+            assert_eq!(
+                result,
+                Err(ParseError::Shape {
+                    field: "time_left".to_owned(),
+                    listings: 1
+                }),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_structure_is_a_shape_change_at_its_path() {
+        // D42.1-2, 4-7
+        let shape = |field: &str| {
+            Err(ParseError::Shape {
+                field: field.to_owned(),
+                listings: 0,
+            })
+        };
+        let item = |json: &str| {
+            format!(
+                r#"{{"auctions":[{{"id":1,"item":{json},"quantity":1,"unit_price":1,"time_left":"LONG"}}]}}"#
+            )
+        };
+        for json in ["[1]", r#""x""#, "7", "null"] {
+            assert_eq!(collect(&item(json)).0, shape("item"), "item {json}");
+        }
+        for body in ["{}", r#"{"auctions":null}"#, r#"{"auctions":5}"#] {
+            assert_eq!(collect(body).0, shape("auctions"), "{body}");
+        }
+        for listing in [r#""x""#, "5", "[1]", "null"] {
+            let body = format!(r#"{{"auctions":[{listing}]}}"#);
+            assert_eq!(collect(&body).0, shape("auctions[]"), "{body}");
+        }
+    }
+
+    #[test]
+    fn ids_are_kept_at_their_columns_edges_and_not_beyond() {
+        // D43.5-6: `UINTEGER` for `item.id`, `UBIGINT` for `id`.
+        let body = |id: &str, item: &str| {
+            format!(
+                r#"{{"auctions":[{{"id":{id},"item":{{"id":{item}}},"quantity":1,"unit_price":1,"time_left":"LONG"}}]}}"#
+            )
+        };
+        let (result, listings) = collect(&body("18446744073709551615", "4294967295"));
+        assert_eq!(result.unwrap().rows, 1);
+        assert_eq!(
+            (listings[0].id, listings[0].item),
+            (AuctionId(u64::MAX), ItemId(u32::MAX))
+        );
+        let (result, _) = collect(&body("1", "4294967296"));
+        assert!(
+            matches!(&result, Err(ParseError::Value { field, .. }) if field == "item.id"),
+            "{result:?}"
+        );
+        let (result, _) = collect(&body("18446744073709551616", "1"));
+        assert!(
+            matches!(&result, Err(ParseError::Value { field, .. }) if field == "id"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn an_id_or_an_item_id_of_zero_is_kept() {
+        let (result, listings) = collect(
+            r#"{"auctions":[{"id":0,"item":{"id":0},"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#,
+        );
+        assert_eq!(result.unwrap().rows, 1);
+        assert_eq!(
+            (listings[0].id, listings[0].item),
+            (AuctionId(0), ItemId(0))
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_json_but_not_an_object_is_a_shape_change_at_the_root() {
+        for body in ["[1]", "5", r#""text""#, "null", "true"] {
+            let (result, _) = collect(body);
+            assert_eq!(
+                result,
+                Err(ParseError::Shape {
+                    field: "$".to_owned(),
+                    listings: 0
+                }),
+                "{body}"
+            );
+        }
+        // Cut off mid-listing, or not JSON at all, is unusable and nothing more.
+        for body in [r#"{"auctions":[{"id":1,"item":{"id":1},"quan"#, "<html>"] {
+            let (result, _) = collect(body);
+            assert!(matches!(result, Err(ParseError::Format(_))), "{body}");
+        }
+    }
+
+    #[test]
+    fn text_where_a_number_is_needed_is_a_shape_change_whatever_its_length() {
+        let long = format!("\"{}\"", "Z".repeat(40));
+        for field in ["id", "quantity", "unit_price"] {
+            let (result, _) = collect(&listing_with(field, &long));
+            assert_eq!(
+                result,
+                Err(ParseError::Shape {
+                    field: field.to_owned(),
+                    listings: 1
+                }),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_longest_text_is_counted_in_bytes_and_a_value_is_quoted_up_to_64_characters() {
+        // 16 two-byte characters are 32 bytes; 11 three-byte ones are 33.
+        let kept = "é".repeat(16);
+        let (result, listings) = collect(&listing_with("time_left", &format!("\"{kept}\"")));
+        assert!(result.is_ok());
+        assert_eq!(listings[1].time_left, kept);
+        let over = "€".repeat(11);
+        let (result, _) = collect(&listing_with("time_left", &format!("\"{over}\"")));
+        assert_eq!(
+            result,
+            Err(ParseError::Value {
+                field: "time_left".to_owned(),
+                value: over,
+                listings: 1
+            })
+        );
+        // A 33-byte text is quoted whole; the quote is cut at 64 characters,
+        // counted in characters and not bytes.
+        for (text, shown) in [
+            ("A".repeat(33), "A".repeat(33)),
+            ("B".repeat(64), "B".repeat(64)),
+            ("C".repeat(65), "C".repeat(64)),
+            ("€".repeat(65), "€".repeat(64)),
+        ] {
+            let (result, _) = collect(&listing_with("time_left", &format!("\"{text}\"")));
+            let Err(ParseError::Value { value, .. }) = result else {
+                panic!("{text}: expected an unexpected value");
+            };
+            assert_eq!(value, shown);
+        }
+        // A 70-digit number is quoted as it is read, cut at 64 characters.
+        let digits = "9".repeat(70);
+        let (result, _) = collect(&listing_with("quantity", &digits));
+        let Err(ParseError::Value { value, .. }) = result else {
+            panic!("expected an unexpected value");
+        };
+        assert_eq!(value.chars().count(), QUOTED_VALUE_MAX);
+    }
+
+    #[test]
+    fn an_empty_time_left_is_kept_and_an_unknown_fields_value_is_not_bounded() {
+        let (result, listings) = collect(&listing_with("time_left", r#""""#));
+        assert_eq!(result.unwrap().rows, 2);
+        assert_eq!(listings[1].time_left, "");
+        // Text `dp` does not keep is not bounded: it is ignored whole.
+        let long = "Q".repeat(TEXT_MAX_LENGTH * 10);
+        let body = format!(
+            r#"{{"auctions":[{{"id":1,"item":{{"id":1,"note":"{long}"}},"quantity":1,"unit_price":1,"time_left":"LONG","memo":"{long}"}}]}}"#
+        );
+        let (result, listings) = collect(&body);
+        let summary = result.unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(
+            summary.unknown_fields.into_iter().collect::<Vec<_>>(),
+            ["item.note", "memo"]
+        );
+    }
+
+    #[test]
+    fn a_new_field_at_the_top_level_is_named_with_its_path_and_links_are_known() {
+        let body = r#"{"_links":{"self":{}},"version":2,"extra":{"a":1},"auctions":[]}"#;
+        let (result, _) = collect(body);
+        assert_eq!(
+            result
+                .unwrap()
+                .unknown_fields
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["$.extra", "$.version"]
+        );
+    }
+
+    #[test]
+    fn two_faults_in_one_body_report_the_first_in_stream_order() {
+        let body = r#"{"auctions":[
+            {"id":1,"item":{"id":1},"quantity":-1,"unit_price":1,"time_left":"LONG"},
+            {"id":2,"item":[1],"quantity":1,"unit_price":1,"time_left":"LONG"}]}"#;
+        let (result, _) = collect(body);
+        assert!(
+            matches!(&result, Err(ParseError::Value { field, listings: 0, .. }) if field == "quantity"),
+            "{result:?}"
         );
     }
 

@@ -1120,6 +1120,167 @@ fn unknown_listing_field_is_logged_by_name() {
 }
 
 #[test]
+fn a_new_field_beside_auctions_is_named_with_its_path_and_links_are_known() {
+    // D38.9, G47
+    let body = format!(
+        r#"{{"_links":{{}},"version":3,"auctions":[{}]}}"#,
+        listing(1)
+    );
+    let (w, report) = collecting("field-top-level", LM_11, &body);
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert!(w.bronze("2026-11-26T11.parquet").exists());
+    assert_eq!(warnings_of(&report), ["SNAPSHOT_FIELD_NEW"]);
+    assert_eq!(report.warnings[0].metadata["fields"], "$.version");
+}
+
+#[test]
+fn an_unknown_fields_long_text_is_ignored_and_the_hour_collected() {
+    // D38.8, G47: the 32-byte bound is for text `dp` keeps.
+    let long = "T".repeat(500);
+    let listing = listing(1).replace(r#""LONG""#, &format!(r#""LONG","note":"{long}""#));
+    let (w, report) = collecting("field-long-text", LM_11, &snapshot_of(&[listing]));
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert!(w.bronze("2026-11-26T11.parquet").exists());
+    assert_eq!(report.warnings[0].metadata["fields"], "note");
+}
+
+#[test]
+fn a_change_that_lasts_repeats_its_warning_every_hour() {
+    // D38.7, G50: each run reports what it sees; deduplicating is #2's.
+    for (name, at, modified, hour) in [
+        (
+            "lasting-11",
+            AT_1135,
+            "2026-11-26T11:50:00Z",
+            "2026-11-26T11",
+        ),
+        (
+            "lasting-12",
+            "2026-11-26T12:35:00Z",
+            "2026-11-26T12:50:00Z",
+            "2026-11-26T12",
+        ),
+    ] {
+        let w = World::at(name, at);
+        w.stub.token_ok(5);
+        let body = snapshot_of(&[listing_with_new_fields(1)]);
+        w.stub.snapshot_answer(ok(modified, &body), 5);
+        let report = w.go();
+        assert_eq!(
+            warnings_of(&report),
+            ["REFRESH_TIME_MOVED", "SNAPSHOT_FIELD_NEW"],
+            "{hour}"
+        );
+        assert_eq!(
+            report.warnings[0].metadata["hour"],
+            format!("{hour}.parquet")
+        );
+    }
+}
+
+#[test]
+fn collect_in_a_collected_hour_has_no_refresh_time_and_raises_no_warning() {
+    // D44.10, G56: nothing was read, so there is no refresh time to report.
+    let w = World::at("rerun-no-refresh", AT_1135);
+    fs::create_dir_all(bronze_dir(&w.config.data_dir)).unwrap();
+    fs::write(w.bronze("2026-11-26T11.parquet"), "already here").unwrap();
+
+    let report = w.go();
+
+    assert_eq!(exit(&report), 0);
+    assert!(report.warnings.is_empty());
+    assert!(!report.metadata.contains_key("refresh_past_hour"));
+}
+
+#[test]
+fn a_run_that_fails_reports_no_refresh_time() {
+    // G56: a failure before the snapshot is read carries none.
+    let w = World::at("failed-no-refresh", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(ResponseTemplate::new(500), 5);
+    let report = w.go();
+    assert_eq!(exit(&report), 70);
+    assert!(!report.metadata.contains_key("refresh_past_hour"));
+}
+
+#[test]
+fn a_decimal_or_minus_zero_in_a_listing_makes_the_hour_a_gap() {
+    // D43.7, G45
+    for (name, field, json) in [
+        ("fraction-quantity", "quantity", "2.0"),
+        ("exponent-price", "unit_price", "1e3"),
+        ("minus-zero-quantity", "quantity", "-0"),
+    ] {
+        let second = listing(2).replace(
+            &format!(
+                r#""{field}":{}"#,
+                if field == "quantity" { "5" } else { "123" }
+            ),
+            &format!(r#""{field}":{json}"#),
+        );
+        let (w, report) = collecting(name, LM_11, &snapshot_of(&[listing(1), second]));
+        assert_eq!(report.reason, "SNAPSHOT_VALUE_UNEXPECTED", "{name}");
+        assert_eq!(report.metadata["field"], field, "{name}");
+        assert_eq!(exit(&report), 70, "{name}");
+        assert!(!w.bronze("2026-11-26T11.parquet").exists(), "{name}");
+    }
+}
+
+#[test]
+fn an_id_or_item_id_of_zero_is_collected() {
+    // D43.8, G45
+    let body = snapshot_of(&[listing(0).replace(r#""id":10"#, r#""id":0"#)]);
+    let (w, report) = collecting("zero-ids", LM_11, &body);
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert!(w.bronze("2026-11-26T11.parquet").exists());
+}
+
+#[test]
+fn a_body_that_is_json_but_not_an_object_is_a_shape_change_at_the_root() {
+    // D42.8 against D42.9, G46: valid JSON is `$`; not JSON, or cut off, is
+    // unusable.
+    for (name, body, reason, field) in [
+        ("root-array", "[1]", "SNAPSHOT_SHAPE_CHANGED", Some("$")),
+        ("root-number", "5", "SNAPSHOT_SHAPE_CHANGED", Some("$")),
+        ("not-json", "<html>", "SNAPSHOT_BODY_UNUSABLE", None),
+        (
+            "cut-off",
+            r#"{"auctions":[{"id":1,"item":{"id":1},"quan"#,
+            "SNAPSHOT_BODY_UNUSABLE",
+            None,
+        ),
+    ] {
+        let (w, report) = collecting(name, LM_11, body);
+        assert_eq!(report.reason, reason, "{name}");
+        assert_eq!(exit(&report), 70, "{name}");
+        if let Some(field) = field {
+            assert_eq!(report.metadata["field"], field, "{name}");
+            assert_eq!(report.metadata["listings"], "0", "{name}");
+        }
+        assert!(!w.bronze("2026-11-26T11.parquet").exists(), "{name}");
+        assert!(w.temporaries().is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn text_beyond_the_longest_where_a_number_is_needed_is_a_shape_change() {
+    // D41.6
+    let second = listing(2).replace(
+        r#""quantity":5"#,
+        &format!(r#""quantity":"{}""#, "Z".repeat(40)),
+    );
+    let (_, report) = collecting(
+        "long-text-number",
+        LM_11,
+        &snapshot_of(&[listing(1), second]),
+    );
+    assert_eq!(report.reason, "SNAPSHOT_SHAPE_CHANGED");
+    assert_eq!(report.metadata["field"], "quantity");
+}
+
+#[test]
 fn known_fields_only_give_a_report_with_no_warning() {
     let (_, report) = collecting("fields-known", LM_11, BODY);
     assert_eq!(report.outcome, crate::error::Severity::Ok);
@@ -1263,6 +1424,13 @@ fn refresh_outside_the_expected_window_warns_with_the_time_past_the_hour() {
         ("refresh-early", "2026-11-26T11:19:59Z", "19:59", true),
         ("refresh-late", "2026-11-26T11:45:01Z", "45:01", true),
         ("refresh-on-the-hour", "2026-11-26T11:00:00Z", "00:00", true),
+        ("refresh-at-05-03", "2026-11-26T11:05:03Z", "05:03", true),
+        (
+            "refresh-at-the-last-second",
+            "2026-11-26T11:59:59Z",
+            "59:59",
+            true,
+        ),
     ] {
         let (w, report) = collecting(name, at, BODY);
         assert_eq!(exit(&report), 0, "{name}: {report:?}");

@@ -9,8 +9,9 @@
 //! **What is read from the body.** Blizzard's own JSON, unchanged in bronze:
 //! `name`, `item_class.name`, `item_subclass.name`, `sell_price` and
 //! `purchase_price` (`en_GB`, so the names are in British English as fetched).
-//! What a body lacks is null, except `sell_price`, which is then 0 (a vendor
-//! pays nothing). `purchase_price` is kept as given, 0 included: Blizzard sets
+//! What a body lacks, or has of another type (a price that is text, a decimal
+//! or negative), is null, except `sell_price`, which is then 0 (a vendor pays
+//! nothing). `purchase_price` is kept as given, 0 included: Blizzard sets
 //! it for items no vendor sells. `vendor_sells` is null (unknown) for every
 //! item; nothing here fills it.
 //!
@@ -100,17 +101,24 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
         )?;
     }
     lake.execute(
-        "INSERT INTO reference_next
+        &format!(
+            "INSERT INTO reference_next
          SELECT
              item,
-             json_extract_string(body, '$.name'),
-             json_extract_string(body, '$.item_class.name'),
-             json_extract_string(body, '$.item_subclass.name'),
-             coalesce(TRY_CAST(json_extract_string(body, '$.sell_price') AS UBIGINT), 0),
-             TRY_CAST(json_extract_string(body, '$.purchase_price') AS UBIGINT),
+             {name},
+             {class},
+             {subclass},
+             coalesce({sell}, 0),
+             {purchase},
              CAST(NULL AS BOOLEAN),
              fetched_at
          FROM reference_latest;",
+            name = text("body", "name"),
+            class = text("body", "item_class.name"),
+            subclass = text("body", "item_subclass.name"),
+            sell = whole_number("body", "sell_price"),
+            purchase = whole_number("body", "purchase_price"),
+        ),
         doing,
     )?;
     let missing = missing_paths(lake)?;
@@ -148,6 +156,25 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
     })
 }
 
+/// The SQL that reads the text at `$.path` of a `body`: null where it is
+/// missing or of another type (a number, an object such as a localised map).
+fn text(body: &str, path: &str) -> String {
+    format!(
+        "CASE WHEN json_type({body}, '$.{path}') = 'VARCHAR' \
+         THEN json_extract_string({body}, '$.{path}') END"
+    )
+}
+
+/// The SQL that reads the number at `$.path` of a `body`: a JSON integer that
+/// is not negative, and null where it is missing or of another type (text, a
+/// decimal, a negative, an object).
+fn whole_number(body: &str, path: &str) -> String {
+    format!(
+        "CASE WHEN json_type({body}, '$.{path}') IN ('UBIGINT', 'BIGINT') \
+         THEN TRY_CAST(json_extract_string({body}, '$.{path}') AS UBIGINT) END"
+    )
+}
+
 /// The warnings for the paths that the answers new to `reference.item` lack:
 /// an answer already read warned once, so a rebuild that finds the table as it
 /// would make it warns of nothing.
@@ -155,11 +182,10 @@ fn missing_paths(lake: &Lake) -> Result<Vec<Report>, Failure> {
     let reading = "reading what the item answers lack";
     let mut warnings = Vec::new();
     for (path, number) in PATHS {
-        let extracted = format!("json_extract_string(l.body, '$.{path}')");
         let lacking = if number {
-            format!("TRY_CAST({extracted} AS UBIGINT) IS NULL")
+            format!("{} IS NULL", whole_number("l.body", path))
         } else {
-            format!("{extracted} IS NULL")
+            format!("{} IS NULL", text("l.body", path))
         };
         let mut statement = lake
             .connection()
@@ -642,6 +668,99 @@ mod tests {
             [("sell_price", "1"), ("purchase_price", "1")]
         );
         assert_eq!((rows[0].4, rows[0].5), (0, None));
+    }
+
+    #[test]
+    fn each_path_of_another_type_is_null_and_warned_while_the_item_is_kept() {
+        // D50.2, G57: a localised map, a text where an object is, a number
+        // where text is, and a price that is text, a decimal or negative.
+        let w = World::new("ref-types");
+        let ok = |id: u32, name: &str, class: &str, sub: &str, sell: &str, buy: &str| {
+            format!(
+                r#"{{"id":{id},"name":{name},"item_class":{class},"item_subclass":{sub},"sell_price":{sell},"purchase_price":{buy}}}"#
+            )
+        };
+        let text = r#""x""#;
+        let object = r#"{"name":"x"}"#;
+        let bodies = [
+            ok(1, r#"{"en_GB":"Linen"}"#, object, object, "4", "9"),
+            ok(2, text, r#""Consumable""#, object, "4", "9"),
+            ok(3, text, object, r#"{"name":5}"#, "4", "9"),
+            ok(4, text, object, object, r#""50""#, "9"),
+            ok(5, text, object, object, "12.5", "-3"),
+            ok(6, text, object, object, "4", "9.0"),
+        ];
+        let rows: Vec<(u32, &str, u16, Option<&str>)> = bodies
+            .iter()
+            .zip(1u32..)
+            .map(|(b, id)| (id, "2026-11-20 10:00:00+00", 200, Some(b.as_str())))
+            .collect();
+        item_file(&w, "2026-11-20T100000", &rows);
+        let (kept, summary) = rebuilt(&w);
+
+        assert_eq!(kept.len(), 6, "no item fails for a field of another type");
+        assert_eq!(
+            missing_of(&summary),
+            [
+                ("name", "1"),
+                ("item_class.name", "1"),
+                ("item_subclass.name", "1"),
+                ("sell_price", "2"),
+                ("purchase_price", "2"),
+            ]
+        );
+        let row = |id: u32| kept.iter().find(|r| r.0 == id).unwrap().clone();
+        assert_eq!(row(1).1, None, "a map is not a name");
+        assert_eq!(row(2).2, None, "a text is not a class");
+        assert_eq!(row(3).3, None, "a number is not a name");
+        assert_eq!((row(4).4, row(5).4, row(5).5), (0, 0, None));
+        assert_eq!(row(6).5, None, "9.0 is a decimal");
+    }
+
+    #[test]
+    fn an_item_lacking_two_paths_is_warned_once_for_each_path() {
+        // D50.4
+        let w = World::new("ref-two-paths");
+        let two = r#"{"id":11,"item_class":{"name":"A"},"item_subclass":{"name":"B"},"purchase_price":9}"#;
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(11, "2026-11-20 10:00:00+00", 200, Some(two))],
+        );
+        let (rows, summary) = rebuilt(&w);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(missing_of(&summary), [("name", "1"), ("sell_price", "1")]);
+        assert_eq!(summary.missing[0].metadata["first_items"], "11");
+        assert_eq!(summary.missing[1].metadata["first_items"], "11");
+    }
+
+    #[test]
+    fn a_404_is_no_answer_and_raises_no_missing_field() {
+        // D50.6
+        let w = World::new("ref-404-no-warning");
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(12, "2026-11-20 10:00:00+00", 404, Some(NOT_FOUND))],
+        );
+        let (rows, summary) = rebuilt(&w);
+        assert!(rows.is_empty());
+        assert!(summary.missing.is_empty());
+    }
+
+    #[test]
+    fn the_five_lowest_item_ids_are_named_whatever_the_order_they_came_in() {
+        // G49
+        let w = World::new("ref-lowest-five");
+        let none = r#"{"id":1}"#;
+        let rows: Vec<(u32, &str, u16, Option<&str>)> = [9, 3, 7, 1, 8, 2, 6]
+            .iter()
+            .map(|id| (*id, "2026-11-20 10:00:00+00", 200, Some(none)))
+            .collect();
+        item_file(&w, "2026-11-20T100000", &rows);
+        let (_, summary) = rebuilt(&w);
+        assert_eq!(summary.missing[0].metadata["items"], "7");
+        assert_eq!(summary.missing[0].metadata["first_items"], "1,2,3,6,7");
     }
 
     #[test]

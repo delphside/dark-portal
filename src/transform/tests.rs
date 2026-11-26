@@ -2162,6 +2162,10 @@ fn the_time_between_last_modified_not_about_an_hour_warns_the_refresh_interval_c
                 let warning = &report.warnings[0].metadata;
                 assert_eq!(warning["interval_seconds"], seconds, "{name}");
                 assert_eq!(warning["hour"], "2026-11-20T11", "{name}");
+                assert!(
+                    warning["last_modified"].starts_with(&second[..19]),
+                    "{name}: {warning:?}"
+                );
                 assert_eq!(
                     warning["previous_last_modified"],
                     "2026-11-20T10:31:40+00:00"
@@ -2188,4 +2192,161 @@ fn the_first_hour_collected_has_no_refresh_interval_to_judge() {
     let w = World::new("interval-first");
     w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T03:00:00Z"));
     assert!(w.run().warnings.is_empty());
+}
+
+// Decision 13, the cases the test design adds (5.2.1, 5.2.2)
+
+#[test]
+fn unknown_time_left_with_no_posting_hour_is_cancelled_where_very_long_expires() {
+    // D39.10: no lower bound, so never expired by band, at span 1 or 13.
+    for (band, span, kind) in [
+        ("EXTRA_LONG", 1, EventKind::Cancelled),
+        ("EXTRA_LONG", 13, EventKind::Cancelled),
+        ("VERY_LONG", 13, EventKind::Expired),
+    ] {
+        let seed = Seed {
+            listing: l(401, 300, 1).band(band),
+            first_seen: 0,
+            posted: None,
+        };
+        let name = format!("unknown-unposted-{band}-{span}");
+        let (event, _) = gone_behind_intact(&name, 30 - span, 30, seed);
+        assert_eq!(event.kind, kind, "{band} at span {span}");
+    }
+}
+
+#[test]
+fn unknown_time_left_with_a_posting_hour_expires_by_its_duration() {
+    // D39.11: the duration test reads no band: posted h0, gone at h12.
+    let (event, record) = gone_behind_intact("unknown-posted", 11, 12, posted_at_0("EXTRA_LONG"));
+    assert_eq!(event.kind, EventKind::Expired);
+    assert_eq!(record.duration, Some(Duration::H12));
+}
+
+#[test]
+fn unknown_time_left_reduced_is_a_partial_sale() {
+    // D39.13: reduced by 1 behind an intact listing.
+    let w = World::new("unknown-partly");
+    w.snapshot(9, &[l(103, 110, 4), l(104, 120, 2).band("FOREVER")]);
+    w.snapshot(10, &[l(103, 110, 4), l(104, 120, 1).band("FOREVER")]);
+    w.run();
+    let sale = only(&events_at(&w.open(), 10), 104);
+    assert_eq!((sale.kind, sale.units), (EventKind::PartlySold, 1));
+}
+
+#[test]
+fn time_left_in_another_case_is_not_a_band() {
+    // D39.5
+    let w = World::new("band-case");
+    w.snapshot(10, &[l(1, 100, 1).band("short"), l(2, 110, 1)]);
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["TIME_LEFT_UNKNOWN"]);
+    assert_eq!(report.warnings[0].metadata["values"], "short");
+}
+
+#[test]
+fn an_empty_time_left_is_not_a_band_and_is_kept_and_warned() {
+    // D39.16
+    let w = World::new("empty-band");
+    w.snapshot(10, &[l(1, 100, 1).band(""), l(2, 110, 1)]);
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["TIME_LEFT_UNKNOWN"]);
+    assert_eq!(report.warnings[0].metadata["values"], "");
+    assert_eq!(report.warnings[0].metadata["listings"], "1");
+    assert_eq!(history(&w.open(), 1)[0].2, "");
+}
+
+#[test]
+fn time_left_values_are_distinct_and_sorted_and_listings_is_a_count() {
+    // G49: two listings with one value and one with another.
+    let w = World::new("values-sorted");
+    w.snapshot(
+        10,
+        &[
+            l(1, 100, 1).band("ZETA"),
+            l(2, 110, 1).band("ALPHA"),
+            l(3, 120, 1).band("ZETA"),
+        ],
+    );
+    let metadata = &w.run().warnings[0].metadata;
+    assert_eq!(metadata["values"], "ALPHA,ZETA");
+    assert_eq!(metadata["listings"], "3");
+}
+
+#[test]
+fn interval_of_one_second_between_consecutive_hours_warns() {
+    // D45.6
+    let w = World::new("interval-one-second");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:59:59Z"));
+    w.snapshot_modified(11, &[l(1, 100, 1)], Some("2026-11-20T11:00:00Z"));
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["REFRESH_INTERVAL_CHANGED"]);
+    assert_eq!(report.warnings[0].metadata["interval_seconds"], "1");
+}
+
+#[test]
+fn interval_is_not_judged_across_a_missed_hour() {
+    // D45.8: h10 and h13 held, h11 and h12 missed; h13 follows h10 by 3 h.
+    let w = World::new("interval-across-gap");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
+    w.snapshot_modified(13, &[l(1, 100, 1)], Some("2026-11-20T13:31:40Z"));
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["HOUR_MISSED", "HOUR_MISSED"]);
+}
+
+#[test]
+fn a_rerun_after_the_gap_is_recorded_raises_no_hour_missed_again() {
+    // D46.5
+    let w = World::new("missed-once");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(12, &[l(1, 100, 1)]);
+    assert_eq!(warned_of(&w.run()), ["HOUR_MISSED"]);
+    let again = w.run();
+    assert!(again.warnings.is_empty(), "{again:?}");
+    assert_eq!(again.outcome, Severity::Ok);
+}
+
+#[test]
+fn an_item_field_missing_leaves_the_transform_exit_0_and_the_hours_committed() {
+    // D50.7
+    let w = World::new("item-missing-exit");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    item_file(
+        &w,
+        "2026-11-20T100000",
+        &[(1, "2026-11-20 10:00:00+00", 200, Some(r#"{"id":1}"#))],
+    );
+    let report = w.run();
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:?}");
+    assert_eq!(warned_of(&report)[0], "ITEM_FIELD_MISSING");
+    assert_eq!(processed(&w.open()), [(h(10), None)]);
+    assert_eq!(reference(&w.open()).len(), 1, "the item is kept");
+}
+
+#[test]
+fn a_rebuild_raises_the_hour_warnings_again_for_every_hour_it_processes() {
+    // G55: the lake rebuilt from bronze reads each hour as new.
+    let w = World::new("rebuild-warns");
+    w.snapshot_modified(
+        10,
+        &[l(1, 100, 1).band("FOREVER")],
+        Some("2026-11-20T10:31:40Z"),
+    );
+    w.snapshot_modified(12, &[l(1, 100, 1)], Some("2026-11-20T12:31:40Z"));
+    let first = warned_of(&w.run()).join(",");
+    assert_eq!(first, "TIME_LEFT_UNKNOWN,HOUR_MISSED");
+    assert!(w.run().warnings.is_empty());
+
+    for entry in std::fs::read_dir(&w.dir).unwrap().flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lake.duckdb")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let again = warned_of(&w.run()).join(",");
+    assert_eq!(again, first);
 }

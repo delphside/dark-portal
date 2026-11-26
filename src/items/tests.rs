@@ -989,6 +989,23 @@ fn a_body_that_cannot_be_read_waits_for_the_next_run() {
 }
 
 #[test]
+fn a_json_object_is_kept_whole_whatever_its_fields() {
+    let w = World::at("any-object", START);
+    w.snapshot("2026-11-26T11", &[10]);
+    w.stub.token_ok(5);
+    w.stub.item_answer(
+        10,
+        ResponseTemplate::new(200).set_body_string(r#"{"surprise":[1,2]}"#),
+        100,
+    );
+
+    let report = w.go();
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert_eq!(w.item_files().len(), 1);
+}
+
+#[test]
 fn every_error_is_logged_with_its_type() {
     let w = World::at("logged", START);
     w.snapshot("2026-11-26T11", &[10]);

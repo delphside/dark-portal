@@ -272,9 +272,9 @@ impl std::error::Error for Report {
 
 /// The run's report with the `warnings` raised in it: a report that is `Ok`
 /// becomes a warning (1.10 *The severity of an error*), the first warning's
-/// reason and message leading and every reason listed in the `warnings`
-/// metadata; a report that failed stays what it is. Each warning is also kept
-/// on the report, for what reads it. The one place a run's severity is
+/// reason and message leading and every code listed once, in the order raised,
+/// in the `warnings` metadata; a report that failed stays what it is. Each
+/// warning is also kept on the report, for what reads it. The one place a run's severity is
 /// decided where it raised warnings; each is logged where it is raised, so a
 /// run killed later has logged it.
 pub fn warned(mut report: Report, warnings: Vec<Report>) -> Report {
@@ -286,11 +286,13 @@ pub fn warned(mut report: Report, warnings: Vec<Report>) -> Report {
         leading.metadata = std::mem::take(&mut report.metadata);
         report = leading;
     }
-    let reasons = warnings
-        .iter()
-        .map(|warning| warning.reason.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut codes: Vec<&str> = Vec::new();
+    for warning in &warnings {
+        if !codes.contains(&warning.reason.as_str()) {
+            codes.push(&warning.reason);
+        }
+    }
+    let reasons = codes.join(",");
     report.metadata.insert("warnings".to_owned(), reasons);
     report.warnings.extend(warnings);
     report
@@ -398,6 +400,20 @@ mod tests {
         assert_eq!(report.metadata["warnings"], "FIRST,SECOND");
         assert_eq!(report.warnings, [first, second]);
         assert_eq!(status(report), 0);
+    }
+
+    #[test]
+    fn a_code_raised_twice_is_named_once_and_each_warning_is_kept() {
+        let report = warned(
+            Report::ok(),
+            vec![
+                Report::warning("HOUR_MISSED", "m").with_metadata("hour", "10"),
+                Report::warning("OTHER", "o"),
+                Report::warning("HOUR_MISSED", "m").with_metadata("hour", "11"),
+            ],
+        );
+        assert_eq!(report.metadata["warnings"], "HOUR_MISSED,OTHER");
+        assert_eq!(report.warnings.len(), 3);
     }
 
     #[test]

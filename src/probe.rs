@@ -129,6 +129,7 @@ fn refreshed_more_often(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::blizzard::Timeouts;
     use crate::collect::clock::FakeClock;
     use crate::collect::lock;
     use crate::collect::test_support::{SECRET, Stub, TOKEN, http_date};
@@ -260,6 +261,9 @@ mod tests {
             ("under", COLLECTED, "2026-11-20T12:21:39Z", true),
             ("least", COLLECTED, "2026-11-20T12:21:40Z", false),
             ("an-hour", COLLECTED, "2026-11-20T12:31:40Z", false),
+            // The day an hourly refresh moves to :02, the hour before's was
+            // :31:40: it warns once, and the next day's does not (below).
+            ("day-of-the-move", COLLECTED, "2026-11-20T12:02:00Z", true),
             // An hourly refresh that has moved to :02 is the next hour's.
             (
                 "moved-to-02",
@@ -410,6 +414,132 @@ mod tests {
         assert!(clock.slept().is_empty(), "it waits for nothing");
         assert_eq!(bronze_files(&w), before, "no bronze file written");
         assert!(!w.config.data_dir.join("state/blizzard-token.json").exists());
+    }
+
+    #[test]
+    fn the_probes_requests_take_the_other_timeout_and_never_the_snapshots() {
+        // 5.4.1: the snapshot's 60 s is the hourly poll's; the probe's two
+        // requests are cut at the other HTTP timeout.
+        assert_eq!(Timeouts::SETTINGS.other, Duration::from_secs(10));
+        let (w, stub) = world("other-timeout");
+        mount(
+            &stub,
+            modified("2026-11-20T12:01:10Z").set_delay(Duration::from_millis(600)),
+        );
+        let blizzard = Blizzard::with_timeouts(
+            stub.endpoints(),
+            Timeouts {
+                snapshot: Duration::from_secs(5),
+                other: Duration::from_millis(100),
+            },
+        );
+        let report = run_with(&w.config, &FakeClock::at(AT_1205), &blizzard);
+        assert_eq!(report.reason, "PROBE_FAILED");
+        assert_eq!(report.warnings[0].metadata["cause"], "BLIZZARD_TIMEOUT");
+    }
+
+    #[test]
+    fn a_failed_request_is_not_retried_and_a_blip_is_the_same_warning() {
+        // G51: one request, whatever the answer.
+        for (name, status) in [("once-503", 503), ("once-429", 429), ("once-500", 500)] {
+            let (w, stub) = world(name);
+            mount(&stub, ResponseTemplate::new(status));
+            let clock = FakeClock::at(AT_1205);
+            let report = run(&w.config, &clock, stub.endpoints());
+            assert_eq!(report.reason, "PROBE_FAILED", "{name}");
+            assert_eq!(stub.requests("GET"), 1, "{name}");
+            assert!(clock.slept().is_empty(), "{name}: no backoff");
+        }
+    }
+
+    #[test]
+    fn a_200_whose_body_never_ends_is_dropped_unread_and_the_probe_completes() {
+        // D47.8: the header is read and the body never is.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nlast-modified: {}\r\ncontent-length: 10000000000\r\n\r\n{{\"auctions\":[",
+                http_date("2026-11-20T12:01:10Z")
+            );
+            socket.write_all(head.as_bytes()).unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let (w, stub) = world("endless");
+        let endpoints = Endpoints {
+            oauth: stub.endpoints().oauth,
+            api: format!("http://{address}"),
+        };
+        let started = std::time::Instant::now();
+
+        let report = run(&w.config, &FakeClock::at(AT_1205), endpoints);
+
+        assert!(started.elapsed() < Duration::from_secs(3), "body was read");
+        assert_eq!(report.reason, "REFRESH_MORE_OFTEN", "{report:?}");
+    }
+
+    #[test]
+    fn a_200_with_no_last_modified_is_a_failed_probe() {
+        // G51, D47.10
+        let (w, stub) = world("no-last-modified");
+        mount(&stub, ResponseTemplate::new(200).set_body_string("{}"));
+        let report = probe_at(&w, &stub);
+        assert_eq!(report.reason, "PROBE_FAILED");
+        assert_eq!(
+            report.warnings[0].metadata["cause"],
+            "LAST_MODIFIED_UNUSABLE"
+        );
+        assert_eq!(exit_status(&report), ExitStatus::Completed);
+    }
+
+    #[test]
+    fn the_probe_carries_nothing_but_its_own_warnings_and_names_each_code_once() {
+        let (w, stub) = world("one-warning");
+        mount(&stub, modified("2026-11-20T12:01:10Z"));
+        let report = probe_at(&w, &stub);
+        assert_eq!(report.metadata["warnings"], "REFRESH_MORE_OFTEN");
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].metadata["hour"], "2026-11-20T11.parquet");
+    }
+
+    #[test]
+    fn a_cached_token_is_neither_used_nor_changed_and_the_data_folder_is_untouched() {
+        // D48.6, D48.7: the probe takes a token of its own.
+        let (w, stub) = world("cached");
+        mount(&stub, modified("2026-11-20T12:01:10Z"));
+        let cache = w.config.data_dir.join("state/blizzard-token.json");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "a cached token").unwrap();
+        let before = everything(&w.config.data_dir);
+
+        let report = probe_at(&w, &stub);
+
+        assert_eq!(report.reason, "REFRESH_MORE_OFTEN", "{report:?}");
+        assert_eq!(std::fs::read(&cache).unwrap(), b"a cached token");
+        assert_eq!(everything(&w.config.data_dir), before);
+        assert_eq!(stub.requests("POST"), 1, "a token of its own");
+    }
+
+    /// Every file under `dir`, with its size.
+    fn everything(dir: &std::path::Path) -> Vec<(String, u64)> {
+        fn walk(dir: &std::path::Path, found: &mut Vec<(String, u64)>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk(&entry.path(), found);
+                } else {
+                    found.push((entry.path().display().to_string(), meta.len()));
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(dir, &mut found);
+        found.sort();
+        found
     }
 
     fn bronze_files(w: &World) -> Vec<String> {
