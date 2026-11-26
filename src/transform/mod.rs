@@ -226,18 +226,30 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
         }
         Ok(())
     })();
-    // The reference table is rebuilt whatever the hours did; an hour's failure
-    // is the one reported.
-    let reference = reference::rebuild(lake, data_dir);
+    // The reference table is rebuilt whatever the hours did, unless they
+    // stopped on a fundamental failure (a full disk, no memory): that would
+    // only fail again. An hour's failure is the one reported.
+    let reference = match &result {
+        Err(failure) if is_fundamental(failure) => None,
+        _ => Some(reference::rebuild(lake, data_dir)),
+    };
     match (result, reference) {
-        (Err(failure), _) | (Ok(()), Err(failure)) => {
+        (Err(failure), _) | (Ok(()), Some(Err(failure))) => {
             outcome.failure = Some(fatal(
                 failure.with_metadata("hours_processed", outcome.hours.len().to_string()),
             ));
         }
-        (Ok(()), Ok(summary)) => outcome.reference = Some(summary),
+        (Ok(()), Some(Ok(summary))) => outcome.reference = Some(summary),
+        (Ok(()), None) => {}
     }
     outcome
+}
+
+/// Whether a failure is *technical, fundamental*: the operator's to fix, and
+/// so one that more work in the same run would meet again.
+fn is_fundamental(failure: &Failure) -> bool {
+    matches!(failure, Failure::Stop(report)
+        if report.error_type == Some(ErrorType::TechnicalFundamental))
 }
 
 /// The report of a run that stopped on nothing. A slow hour was already

@@ -20,7 +20,7 @@ use std::path::Path;
 
 use crate::collect::failure::Failure;
 use crate::collect::snapshot::quoted;
-use crate::items::items_dir;
+use crate::items::{has_parquet, items_dir};
 use crate::lake::{Lake, lake_failure};
 
 /// What a rebuild found.
@@ -51,11 +51,9 @@ pub fn rebuild(lake: &Lake, data_dir: &Path) -> Result<Summary, Failure> {
     let doing = "rebuilding the reference table";
     let connection = lake.connection();
     let fail = |e: duckdb::Error| lake_failure(&e.to_string(), doing);
-    let has_files = std::fs::read_dir(items_dir(data_dir)).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
-    });
+    // A folder that is not there holds no files; one that cannot be read is
+    // a failure, never an empty table to replace the held one with.
+    let has_files = has_parquet(&items_dir(data_dir))?;
     lake.execute(
         "CREATE OR REPLACE TEMP TABLE reference_next AS SELECT * FROM reference.item WHERE false;",
         doing,
@@ -354,6 +352,25 @@ mod tests {
     }
 
     #[test]
+    fn an_item_folder_that_cannot_be_read_fails_and_keeps_the_table() {
+        let w = World::new("ref-unreadable");
+        let good = body("Kept", "Consumable", "Potion", 10, None);
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(5, "2026-11-20 10:00:00+00", 200, Some(&good))],
+        );
+        let lake = w.open();
+        rebuild(&lake, &w.config.data_dir).unwrap();
+        // A file where the folder should be.
+        let dir = w.config.data_dir.join("bronze/items");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a folder").unwrap();
+        assert!(rebuild(&lake, &w.config.data_dir).is_err());
+        assert_eq!(reference(&lake).len(), 1);
+    }
+
+    #[test]
     fn a_rebuild_that_finds_nothing_new_writes_nothing() {
         let w = World::new("ref-same");
         let good = body("Same", "Consumable", "Potion", 10, None);
@@ -399,6 +416,40 @@ mod tests {
         assert_eq!(report.metadata["hours"], "2");
         assert_eq!(report.metadata["reference_items"], "1");
         assert_eq!(reference(&w.open())[0].1, some("Reported"));
+    }
+
+    #[test]
+    fn the_run_skips_the_rebuild_after_a_fundamental_failure_and_not_after_another() {
+        use crate::collect::failure::Failure;
+        use crate::lake::out_of_memory;
+        for (fundamental, rebuilt) in [(true, false), (false, true)] {
+            let w = World::new(&format!("ref-skip-{fundamental}"));
+            w.snapshot(10, &[l(1, 100, 1)]);
+            let good = body("Fresh", "Consumable", "Potion", 10, None);
+            item_file(
+                &w,
+                "2026-11-20T100000",
+                &[(1, "2026-11-20 10:00:00+00", 200, Some(&good))],
+            );
+            let lake = w.open();
+            let fail = |_: crate::types::Hour, at: crate::transform::Step| {
+                if at != crate::transform::Step::Apply {
+                    Ok(())
+                } else if fundamental {
+                    Err(out_of_memory("Out of Memory Error", "injected"))
+                } else {
+                    Err(Failure::unexpected("INJECTED", "x"))
+                }
+            };
+            let outcome =
+                crate::transform::process_hours(&lake, &w.config.data_dir, &w.clock, &fail);
+            assert!(outcome.failure.is_some());
+            assert_eq!(
+                !reference(&lake).is_empty(),
+                rebuilt,
+                "fundamental: {fundamental}"
+            );
+        }
     }
 
     #[test]

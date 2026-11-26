@@ -29,7 +29,7 @@ fn snapshots_dir(data_dir: &Path) -> PathBuf {
 /// Whether `dir` holds a finished Parquet file: a temporary file does not end
 /// in `.parquet`. A folder that is not there holds none; one that cannot be
 /// read is *technical, fundamental*.
-fn has_parquet(dir: &Path) -> Result<bool, Failure> {
+pub(crate) fn has_parquet(dir: &Path) -> Result<bool, Failure> {
     match std::fs::read_dir(dir) {
         Ok(entries) => Ok(entries
             .flatten()

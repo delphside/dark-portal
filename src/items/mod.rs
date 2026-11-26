@@ -30,6 +30,7 @@
 mod pacer;
 mod store;
 
+pub(crate) use store::has_parquet;
 pub use store::items_dir;
 #[cfg(test)]
 mod tests;

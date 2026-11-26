@@ -35,11 +35,11 @@ GROUP BY hour;
 -- The average unit price of the cheapest n_units units listed at at_hour, held
 -- to two decimal places of copper and rounded half away from zero, with the
 -- units it covers: fewer than n_units where fewer are listed. Null where none
--- are listed. An n_units below 1 is refused. The rounding is integer
+-- are listed. An n_units below 1, or not a whole number, is refused. The rounding is integer
 -- arithmetic, so a half is never at the mercy of a float.
 CREATE OR REPLACE TEMP MACRO fill_price(item_id, at_hour, n_units) AS (
     WITH asked AS (
-        SELECT CAST(n_units AS HUGEINT) AS n
+        SELECT CAST(n_units AS HUGEINT) AS n, n_units = CAST(n_units AS HUGEINT) AS whole
     ),
     levels AS (
         SELECT lvl.unit_price, lvl.units, sum(lvl.units) OVER (ORDER BY lvl.unit_price) AS up_to
@@ -56,6 +56,7 @@ CREATE OR REPLACE TEMP MACRO fill_price(item_id, at_hour, n_units) AS (
     )
     SELECT CASE
         WHEN want.n < 1 THEN error('fill_price: N must be at least 1')
+        WHEN NOT want.whole THEN error('fill_price: N must be a whole number of units')
         WHEN filled.units > 0 THEN struct_pack(
             price := CAST(
                 CAST((2 * 100 * filled.cost + filled.units) // (2 * filled.units) AS BIGINT) * 0.01

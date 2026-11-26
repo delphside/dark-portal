@@ -337,6 +337,28 @@ mod tests {
     }
 
     #[test]
+    fn fill_price_refuses_an_n_that_is_not_a_whole_number() {
+        let (lake, _dir) = lake("fill-whole");
+        td_j(&lake);
+        let at = at(0);
+        let ask = |want: &str| -> Result<Option<u64>, String> {
+            lake.connection()
+                .query_row(
+                    &format!("SELECT struct_extract(fill_price(1, {at}, {want}), 'units')"),
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())
+        };
+        for want in ["1.5", "CAST(2.5 AS DOUBLE)", "CAST(1.5 AS DECIMAL(4, 1))"] {
+            assert!(ask(want).unwrap_err().contains("whole number"), "{want}");
+        }
+        // A whole N in another type is fine.
+        assert_eq!(ask("CAST(4 AS DOUBLE)"), Ok(Some(4)));
+        assert_eq!(ask("CAST(4.0 AS DECIMAL(4, 1))"), Ok(Some(4)));
+    }
+
+    #[test]
     fn fill_price_works_over_each_item_and_hour_of_a_query() {
         // As the profile uses it: correlated, once for each row.
         let (lake, _dir) = lake("fill-rows");
