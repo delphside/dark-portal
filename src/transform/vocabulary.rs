@@ -7,14 +7,15 @@
 //!
 //! - a macro for each value: `kind_*`, `outcome_*`, `tier_*`, `rule_*` and
 //!   `warning_*`, named for the value in lower case with `-` as `_`;
-//! - `hour_number(hour)`, the hours since the epoch, since the build has no ICU;
+//! - `hour_number(hour)`, the hours since the epoch, the one place an hour
+//!   becomes a number in SQL (the build has no ICU);
 //! - `duration(hours, text)` and `band(time_left, lower_minutes)`, the two
 //!   fixed-value types a rule reads as data.
 
 use crate::collect::failure::Failure;
 use crate::collect::snapshot::quoted;
 use crate::lake::Lake;
-use crate::types::{Duration, EventKind, Outcome, Rule, Tier, TimeLeft};
+use crate::types::{Duration, EventKind, Outcome, Rule, SECONDS_PER_HOUR, Tier, TimeLeft};
 
 /// The warnings an hour can log, each for a listing: the reason code is the
 /// SQL's macro and the log's `error.reason`.
@@ -109,9 +110,10 @@ pub fn sql() -> String {
     // The build has no ICU extension, so a TIMESTAMPTZ has no arithmetic, no
     // `epoch` and no `date_diff`: an hour is compared as its number, the hours
     // since the epoch, which `epoch_ms` gives without it.
-    sql.push_str(
-        "CREATE OR REPLACE TEMP MACRO hour_number(x) AS CAST(epoch_ms(x) // 3600000 AS BIGINT);\n",
-    );
+    sql.push_str(&format!(
+        "CREATE OR REPLACE TEMP MACRO hour_number(x) AS CAST(epoch_ms(x) // {} AS BIGINT);\n",
+        SECONDS_PER_HOUR * 1000
+    ));
     sql.push_str("CREATE OR REPLACE TEMP TABLE duration (hours INTEGER, text VARCHAR);\n");
     for duration in Duration::ALL {
         sql.push_str(&format!(

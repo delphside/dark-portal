@@ -102,7 +102,9 @@ pub struct AuctionId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hour(pub i64);
 
-const SECONDS_PER_HOUR: i64 = 3600;
+/// Seconds in an hour: the one place the conversion between an hour's number
+/// and a time is written.
+pub const SECONDS_PER_HOUR: i64 = 3600;
 
 impl Hour {
     /// The hour a moment falls in: the timestamp truncated to the hour.

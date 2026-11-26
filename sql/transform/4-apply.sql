@@ -44,8 +44,7 @@ SELECT
     CASE WHEN c.span = 1 THEN a.position END,
     CASE WHEN c.span = 1 THEN a.units_ahead END,
     CASE WHEN c.span = 1 THEN a.units_at_or_below END
-FROM arrivals a CROSS JOIN current_hour c
-WHERE NOT a.reappeared;
+FROM arrivals a CROSS JOIN current_hour c;
 
 DELETE FROM silver.live_listing;
 INSERT INTO silver.live_listing SELECT * FROM next_live;
@@ -58,4 +57,4 @@ SELECT n.id, n.last_seen, n.quantity, n.time_left, p.position, p.units_ahead,
 FROM next_live n JOIN snapshot_place p ON p.id = n.id;
 
 -- The hour's gold rows (`item_hour`, `price_level_hour`) are written here, once
--- the events are in: a later increment.
+-- the events are in (#7).

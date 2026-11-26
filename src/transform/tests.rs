@@ -19,6 +19,7 @@ use crate::types::{
     AuctionId, Copper, Duration, Event, EventKind, ListingRecord, Outcome as Result_, QueuePlace,
     Rule, Tier,
 };
+use duckdb::Connection;
 
 /// The listing every world keeps in item 2, so no snapshot is empty and the
 /// queue of item 1 is judged by itself.
@@ -244,14 +245,29 @@ fn ended_id_reappearing_is_logged_and_left_out() {
     let before = records(&w.open());
     assert_eq!(before.len(), 1);
 
-    w.snapshot(11, &with_anchor(vec![l(103, 110, 4), l(104, 120, 2)]));
+    // 105 is new, behind both: 104 is left out of the queue, so 105 is
+    // second, with 103's 4 units ahead of it and not 104's 2 as well.
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(103, 110, 4), l(104, 120, 2), l(105, 130, 1)]),
+    );
     let outcome = w.process();
     assert!(outcome.failure.is_none());
     assert_eq!(outcome.warnings, [(HourWarning::IdReappeared, 104)]);
     let lake = w.open();
-    assert!(events_at(&lake, 11).is_empty());
-    assert_eq!(live_ids(&lake), [50, 103]);
+    assert_eq!(
+        events_at(&lake, 11)
+            .iter()
+            .map(|e| e.id.0)
+            .collect::<Vec<_>>(),
+        [105]
+    );
+    assert_eq!(live_ids(&lake), [50, 103, 105]);
     assert_eq!(records(&lake), before);
+    assert_eq!(
+        history(&lake, 105),
+        [(h(11), 1, "LONG".to_owned(), 2, 4, 5)]
+    );
 }
 
 // ---------------------------------------------------------------------- EV-2
@@ -1311,6 +1327,39 @@ fn an_hour_that_is_not_what_its_file_says_is_refused() {
 }
 
 #[test]
+fn a_null_in_any_bronze_column_is_refused() {
+    for column in [
+        "hour",
+        "last_modified",
+        "fetched_at",
+        "id",
+        "item",
+        "quantity",
+        "unit_price",
+        "time_left",
+    ] {
+        let w = World::new(&format!("null-{column}"));
+        w.snapshot(10, &[l(1, 100, 1), l(2, 110, 1)]);
+        let file = bronze::path(&w.config.data_dir, h(10));
+        let rewritten = file.with_extension("rewritten");
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT * REPLACE (CASE WHEN id = 1 THEN NULL ELSE {column} END AS {column}) \
+                 FROM read_parquet('{}')) TO '{}' (FORMAT PARQUET);",
+                file.to_string_lossy(),
+                rewritten.to_string_lossy()
+            ))
+            .unwrap();
+        std::fs::rename(&rewritten, &file).unwrap();
+        let report = w.run();
+        assert_eq!(report.reason, "BRONZE_HOUR_INVALID", "{column}");
+        assert_eq!(report.metadata["rows_with_a_null"], "1", "{column}");
+        assert!(processed(&w.open()).is_empty());
+    }
+}
+
+#[test]
 fn a_file_of_another_hour_than_its_name_is_refused() {
     let w = World::new("invalid-hour");
     w.snapshot(10, &[l(1, 100, 1)]);
@@ -1409,31 +1458,49 @@ fn a_lock_held_past_the_wait_stops_the_run_with_a_blip_and_changes_nothing() {
 
 // ------------------------------------------------------------------- bound
 
-fn run_taking(seconds: u64, name: &str) -> Report {
+/// The hours that took longer than the bound, where the one hour's Apply step
+/// takes `seconds`.
+fn over_bound_after(seconds: u64, name: &str) -> Vec<(Hour, StdDuration)> {
     let w = World::new(name);
     w.snapshot(10, &[l(1, 100, 1)]);
-    run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+    let lake = w.open();
+    let outcome = process_hours(&lake, &w.config.data_dir, &w.clock, &|_, at| {
         if at == Step::Apply {
             w.clock.sleep(StdDuration::from_secs(seconds));
         }
         Ok(())
-    })
+    });
+    assert!(outcome.failure.is_none());
+    outcome.over_bound
 }
 
 #[test]
 fn hour_processed_over_5_minutes_is_logged_as_a_warning() {
-    let report = run_taking(301, "bound-over");
-    assert_eq!(report.outcome, Severity::Warning);
-    assert_eq!(report.reason, "HOUR_PROCESSING_OVER_BOUND");
-    assert_eq!(report.metadata["hour"], "2026-11-20T10");
-    assert_eq!(report.metadata["seconds"], "301.0");
-    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    assert_eq!(
+        over_bound_after(301, "bound-over"),
+        [(h(10), StdDuration::from_secs(301))]
+    );
 }
 
 #[test]
 fn hour_processed_in_5_minutes_or_less_logs_no_warning() {
-    assert_eq!(run_taking(300, "bound-exact").outcome, Severity::Ok);
-    assert_eq!(run_taking(0, "bound-none").outcome, Severity::Ok);
+    assert!(over_bound_after(300, "bound-exact").is_empty());
+    assert!(over_bound_after(0, "bound-none").is_empty());
+}
+
+#[test]
+fn a_slow_hour_is_warned_of_as_it_finishes_and_the_run_still_completes() {
+    let w = World::new("bound-run");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let report = run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+        if at == Step::Apply {
+            w.clock.sleep(StdDuration::from_secs(301));
+        }
+        Ok(())
+    });
+    assert_eq!(report.outcome, Severity::Ok);
+    assert_eq!(report.metadata["hours_over_bound"], "1");
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
 }
 
 // ------------------------------------------------------------ DuckLake's limits
@@ -1453,7 +1520,10 @@ fn the_transform_sql_uses_only_what_ducklake_supports() {
             .collect::<Vec<_>>()
             .join("\n")
             .to_uppercase();
-        for banned in [
+        // What DuckLake does not support, and what is avoided by choice: a
+        // whole replace and an insert are simpler than `UPDATE` or `MERGE`,
+        // which DuckLake does support.
+        let unsupported = [
             "PRIMARY KEY",
             "UNIQUE",
             "CHECK",
@@ -1461,10 +1531,10 @@ fn the_transform_sql_uses_only_what_ducklake_supports() {
             " ENUM",
             "CREATE INDEX",
             "CREATE SEQUENCE",
-            "MERGE INTO",
             "ON CONFLICT",
-            "UPDATE ",
-        ] {
+        ];
+        let avoided = ["MERGE INTO", "UPDATE "];
+        for banned in unsupported.iter().chain(&avoided) {
             assert!(!code.contains(banned), "{banned} in the transform SQL");
         }
     }

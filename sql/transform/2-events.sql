@@ -3,30 +3,17 @@
 -- warnings they log.
 --
 -- Reads:   step 1's tables, current_hour (hour, hour_number, span), silver.live_listing,
---          silver.listing_record, the vocabulary (kind_*(), tier_*(),
+--          the vocabulary (kind_*(), tier_*(),
 --          rule_*(), outcome_*(), warning_*(), duration, band).
 -- Makes:   arrivals, ended, hour_event, warning.
 
--- The IDs in C that are not live. An ID whose record is written has ended
--- before and reappears: it is left out (EV-1). The record lookup is limited
--- to IDs from the lowest arrival up, so the files of old records are skipped
--- by their statistics.
+-- The IDs in C that are not live, other than those that reappeared.
 CREATE OR REPLACE TEMP TABLE arrivals AS
-WITH new_listing AS (
-    SELECT p.* FROM snapshot_place p
-    ANTI JOIN silver.live_listing l ON l.id = p.id
-),
-seen_before AS (
-    SELECT DISTINCT r.id FROM silver.listing_record r
-    WHERE r.id >= (SELECT min(id) FROM new_listing)
-      AND r.id IN (SELECT id FROM new_listing)
-)
 SELECT
-    n.*,
-    s.id IS NOT NULL AS reappeared,
-    coalesce(n.id <= (SELECT max(id) FROM silver.live_listing), false) AS below_highest
-FROM new_listing n
-LEFT JOIN seen_before s ON s.id = n.id;
+    p.*,
+    coalesce(p.id <= (SELECT max(id) FROM silver.live_listing), false) AS below_highest
+FROM snapshot_place p
+ANTI JOIN silver.live_listing l ON l.id = p.id;
 
 -- The gone listings, each decided: sold in the front (EV-3), otherwise unsold
 -- (EV-4), and then expired (EV-5) or cancelled (EV-6).
@@ -92,7 +79,7 @@ SELECT c.hour AS hour, a.id, kind_posted() AS kind, a.item, a.quantity AS units,
        a.unit_price, tier_certain() AS tier, rule_ev_1() AS rule, false AS tie,
        CAST(c.span AS USMALLINT) AS span
 FROM arrivals a CROSS JOIN current_hour c
-WHERE NOT a.reappeared AND c.span IS NOT NULL
+WHERE c.span IS NOT NULL
 UNION ALL
 -- EV-2: a quantity drop is a partial sale of the drop.
 SELECT c.hour, j.id, kind_partly_sold(), j.item, j.quantity - j.new_quantity,
@@ -121,9 +108,9 @@ CREATE OR REPLACE TEMP TABLE warning (reason VARCHAR, id UBIGINT);
 -- EV-1: an ID at or below the highest live ID is posted all the same.
 INSERT INTO warning
 SELECT warning_id_not_above_highest(), a.id FROM arrivals a CROSS JOIN current_hour c
-WHERE a.below_highest AND NOT a.reappeared AND c.span IS NOT NULL;
+WHERE a.below_highest AND c.span IS NOT NULL;
 -- EV-1: an ID that ended and reappears is left out.
-INSERT INTO warning SELECT warning_id_reappeared(), id FROM arrivals WHERE reappeared;
+INSERT INTO warning SELECT warning_id_reappeared(), id FROM reappeared;
 -- EV-2: buyers take from the head, so a drop behind an intact listing is odd.
 INSERT INTO warning
 SELECT warning_sale_behind_intact(), id FROM judged

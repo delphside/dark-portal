@@ -51,6 +51,9 @@ pub struct Lake {
 /// A failure of the lake's own: the lake could not be used, which is not the
 /// fault of the hour in hand.
 pub(crate) fn lake_failure(message: &str, doing: &str) -> Failure {
+    if says_out_of_memory(message) {
+        return out_of_memory(message, doing);
+    }
     if says_disk_full(message) {
         return io_failure(
             &std::io::Error::from(std::io::ErrorKind::StorageFull),
@@ -62,6 +65,27 @@ pub(crate) fn lake_failure(message: &str, doing: &str) -> Failure {
             ErrorType::Unexpected,
             "LAKE_FAILED",
             "DuckDB could not complete a statement on the lake.",
+        )
+        .with_metadata("doing", doing)
+        .with_metadata("detail", message),
+    ))
+}
+
+/// Whether a message from DuckDB says the job ran out of memory. DuckDB 1.4.5
+/// builds it from the exception type's name, `Out of Memory`, and `Error: `
+/// (`exception.cpp`, `OutOfMemoryException`).
+pub(crate) fn says_out_of_memory(message: &str) -> bool {
+    message.contains("Out of Memory Error")
+}
+
+/// The job hit its `memory_limit`: a limit the operator sets, so *technical,
+/// fundamental*.
+pub(crate) fn out_of_memory(message: &str, doing: &str) -> Failure {
+    Failure::Stop(Box::new(
+        Report::fatal(
+            ErrorType::TechnicalFundamental,
+            "OUT_OF_MEMORY",
+            "DuckDB ran out of memory under the job's memory limit; the hour is more than the limit holds.",
         )
         .with_metadata("doing", doing)
         .with_metadata("detail", message),
@@ -87,8 +111,7 @@ fn lake_data_dir(data_dir: &Path) -> PathBuf {
 /// The `ATTACH` that makes the backend the catalog `lake`.
 ///
 /// DuckLake's `sqlite:` prefix names the catalog's kind: without it DuckLake
-/// takes the file for a DuckDB catalog. (The work package's text gave the
-/// string without it; E5 is where it is first run.)
+/// takes the file for a DuckDB catalog. E5 is where it is first run.
 pub(crate) fn attach_statement(backend: &Backend) -> String {
     match backend {
         Backend::DuckLake { data_dir } => format!(
@@ -224,6 +247,23 @@ mod tests {
         };
         assert_eq!(other.reason, "LAKE_FAILED");
         assert_eq!(exit_status(&other), ExitStatus::Unexpected);
+    }
+
+    #[test]
+    fn duckdbs_out_of_memory_message_is_recognised_and_is_fundamental() {
+        let message =
+            "Out of Memory Error: failed to pin block of size 256.0 KiB (953.6 MiB/953.6 MiB used)";
+        assert!(says_out_of_memory(message));
+        assert!(!says_out_of_memory(
+            "IO Error: Could not write file: Permission denied"
+        ));
+        assert!(!says_out_of_memory("Binder Error: out of range"));
+        let Failure::Stop(report) = lake_failure(message, "comparing") else {
+            panic!("expected a stop");
+        };
+        assert_eq!(report.reason, "OUT_OF_MEMORY");
+        assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+        assert_eq!(report.metadata["doing"], "comparing");
     }
 
     #[test]

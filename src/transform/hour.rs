@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::collect::Clock;
 use crate::collect::failure::Failure;
 use crate::collect::snapshot::{quoted, timestamp};
-use crate::lake::{Lake, lake_failure};
+use crate::lake::{Lake, lake_failure, out_of_memory, says_out_of_memory};
 use crate::transform::bronze;
 use crate::transform::vocabulary::HourWarning;
 use crate::types::{Hour, Market};
@@ -87,41 +87,58 @@ fn stage(lake: &Lake, data_dir: &Path, hour: Hour) -> Result<(), Failure> {
     let file = bronze::path(data_dir, hour);
     lake.connection()
         .execute_batch(&format!(
-            "CREATE OR REPLACE TEMP TABLE bronze_hour AS SELECT hour, id, item, quantity, \
-             unit_price, time_left FROM read_parquet({});",
+            "CREATE OR REPLACE TEMP TABLE bronze_hour AS SELECT hour, last_modified, \
+             fetched_at, id, item, quantity, unit_price, time_left FROM read_parquet({});",
             quoted(&file.to_string_lossy())
         ))
         .map_err(|e| {
+            let message = e.to_string();
+            if says_out_of_memory(&message) {
+                return out_of_memory(&message, "reading the hour's bronze file")
+                    .with_metadata("hour", bronze::hour_name(hour));
+            }
             unexpected(
                 "BRONZE_HOUR_UNREADABLE",
                 "DuckDB could not read the hour's bronze file.",
                 hour,
             )
-            .with_metadata("detail", e.to_string())
+            .with_metadata("detail", message)
         })?;
-    let (rows, ids, wrong_hour, wrong_band): (i64, i64, i64, i64) = lake
+    let (rows, ids, wrong_hour, wrong_band, nulls): (i64, i64, i64, i64, i64) = lake
         .connection()
         .query_row(
             &format!(
                 "SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE hour <> {}), \
-                 count(*) FILTER (WHERE time_left NOT IN (SELECT time_left FROM band)) \
+                 count(*) FILTER (WHERE time_left NOT IN (SELECT time_left FROM band)), \
+                 count(*) FILTER (WHERE hour IS NULL OR last_modified IS NULL OR \
+                    fetched_at IS NULL OR id IS NULL OR item IS NULL OR quantity IS NULL OR \
+                    unit_price IS NULL OR time_left IS NULL) \
                  FROM bronze_hour",
                 at(hour)
             ),
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .map_err(|e| lake_failure(&e.to_string(), "checking the hour's bronze file"))?;
-    if rows != ids || wrong_hour != 0 || wrong_band != 0 {
+    if rows != ids || wrong_hour != 0 || wrong_band != 0 || nulls != 0 {
         return Err(unexpected(
             "BRONZE_HOUR_INVALID",
-            "The hour's bronze file holds a repeated ID, another hour or a time left that is not a band.",
+            "The hour's bronze file holds a repeated ID, another hour, a time left that is not a band or a null.",
             hour,
         )
         .with_metadata("rows", rows.to_string())
         .with_metadata("distinct_ids", ids.to_string())
         .with_metadata("rows_of_another_hour", wrong_hour.to_string())
-        .with_metadata("rows_with_an_unknown_band", wrong_band.to_string()));
+        .with_metadata("rows_with_an_unknown_band", wrong_band.to_string())
+        .with_metadata("rows_with_a_null", nulls.to_string()));
     }
     Ok(())
 }

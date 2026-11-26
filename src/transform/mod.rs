@@ -17,7 +17,7 @@
 //! span is the hours since the previous held.
 //!
 //! **The lock.** The VM-wide lock is held from before the lake is opened to
-//! the end. `dp hourly` will hold it across its steps and call
+//! the end. `dp hourly` (#7) holds it across its steps and calls
 //! [`process_hours`] itself.
 //!
 //! **Errors.** After the pivot an hour's failure is an error to `dp hourly`
@@ -28,8 +28,8 @@
 //! against its bound, come from the [`Clock`] (G19: the documents name no
 //! clock seam, so this is the collection's).
 //!
-//! Gold's hour rows, which 5.2.2's matrix writes at *hour closed*, are a later
-//! increment; the place for them is the end of `sql/transform/4-apply.sql`.
+//! Gold's hour rows, which 5.2.2's matrix writes at *hour closed*, go at the
+//! end of `sql/transform/4-apply.sql` (#7).
 
 mod bronze;
 mod hour;
@@ -56,8 +56,7 @@ pub use vocabulary::HourWarning;
 
 /// Runs `dp transform` on the production lake. The report is the run's
 /// result: `Ok` where every hour after the mark is processed (nothing to do
-/// included), a warning where an hour ran past the hourly processing bound,
-/// and a fatal, by its type, where an hour or the lake failed.
+/// included), and a fatal, by its type, where an hour or the lake failed.
 pub fn run(config: &Config, clock: &dyn Clock) -> Report {
     run_with(
         config,
@@ -136,8 +135,9 @@ pub struct Outcome {
     pub hours: Vec<HourSummary>,
     /// Each listing warned of, across the hours.
     pub warnings: Vec<(HourWarning, u64)>,
-    /// The longest an hour took, and which.
-    pub slowest: Option<(Hour, Duration)>,
+    /// Each hour that took longer than the hourly processing bound, with its
+    /// time. Each was logged as a warning when it finished.
+    pub over_bound: Vec<(Hour, Duration)>,
     /// What stopped the run, as a fatal report.
     pub failure: Option<Report>,
 }
@@ -148,20 +148,21 @@ pub fn catch_up(lake: &Lake, data_dir: &Path, clock: &dyn Clock) -> Outcome {
     process_hours(lake, data_dir, clock, &|_, _| Ok(()))
 }
 
-/// The high-water mark: the latest hour processed for the market.
+/// The high-water mark: the latest hour processed for the market. The
+/// vocabulary must be installed on the connection, which `hour_number` is in.
 pub fn high_water_mark(lake: &Lake) -> Result<Option<Hour>, Failure> {
-    let millis: Option<i64> = lake
+    let number: Option<i64> = lake
         .connection()
         .query_row(
             &format!(
-                "SELECT epoch_ms(max(hour)) FROM meta.processed WHERE market = {}",
+                "SELECT hour_number(max(hour)) FROM meta.processed WHERE market = {}",
                 crate::collect::snapshot::quoted(MARKET.as_str())
             ),
             [],
             |row| row.get(0),
         )
         .map_err(|e| lake_failure(&e.to_string(), "reading the high-water mark"))?;
-    Ok(millis.map(|ms| Hour(ms / 3_600_000)))
+    Ok(number.map(Hour))
 }
 
 /// Processes every bronze hour after the high-water mark, in order, each as
@@ -171,7 +172,7 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
     let mut outcome = Outcome {
         hours: Vec::new(),
         warnings: Vec::new(),
-        slowest: None,
+        over_bound: Vec::new(),
         failure: None,
     };
     let result = (|| -> Result<(), Failure> {
@@ -193,8 +194,19 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
                 seconds = took.as_secs_f64(),
                 "processed the hour"
             );
-            if outcome.slowest.is_none_or(|(_, slowest)| took > slowest) {
-                outcome.slowest = Some((hour, took));
+            if took > HOURLY_PROCESSING_BOUND {
+                Report::warning(
+                    "HOUR_PROCESSING_OVER_BOUND",
+                    "An hour took longer to transform than the hourly processing bound.",
+                )
+                .with_metadata("hour", bronze::hour_name(hour))
+                .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
+                .with_metadata(
+                    "bound_seconds",
+                    HOURLY_PROCESSING_BOUND.as_secs().to_string(),
+                )
+                .log();
+                outcome.over_bound.push((hour, took));
             }
             outcome.warnings.extend(summary.warnings.iter().copied());
             outcome.hours.push(summary);
@@ -210,21 +222,10 @@ pub fn process_hours(lake: &Lake, data_dir: &Path, clock: &dyn Clock, hook: hour
     outcome
 }
 
-/// The report of a run that stopped on nothing: a warning where an hour ran
-/// past the bound (5.4.1 *hourly processing bound*), otherwise `Ok`.
+/// The report of a run that stopped on nothing. A slow hour was already
+/// logged as it finished, so it is a count here.
 fn finished(outcome: &Outcome) -> Report {
-    let report = match outcome.slowest {
-        Some((hour, took)) if took > HOURLY_PROCESSING_BOUND => Report::warning(
-            "HOUR_PROCESSING_OVER_BOUND",
-            "An hour took longer to transform than the hourly processing bound.",
-        )
-        .with_metadata("hour", bronze::hour_name(hour))
-        .with_metadata("seconds", format!("{:.1}", took.as_secs_f64()))
-        .with_metadata(
-            "bound_seconds",
-            HOURLY_PROCESSING_BOUND.as_secs().to_string(),
-        ),
-        _ => Report::ok(),
-    };
-    report.with_metadata("hours", outcome.hours.len().to_string())
+    Report::ok()
+        .with_metadata("hours", outcome.hours.len().to_string())
+        .with_metadata("hours_over_bound", outcome.over_bound.len().to_string())
 }

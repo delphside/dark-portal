@@ -17,7 +17,7 @@ pub fn hour_of(name: &str) -> Option<Hour> {
     let stem = name.strip_suffix(".parquet")?;
     let start =
         NaiveDateTime::parse_from_str(&format!("{stem}:00:00"), "%Y-%m-%dT%H:%M:%S").ok()?;
-    let hour = Hour(start.and_utc().timestamp().div_euclid(3600));
+    let hour = Hour::containing(start.and_utc());
     (file_name(hour) == name).then_some(hour)
 }
 

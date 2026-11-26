@@ -155,6 +155,7 @@ impl World {
     pub fn open(&self) -> Lake {
         let lake = Lake::open(&self.backend(), &self.dir.join("tmp")).unwrap();
         lake.migrate(chrono::Utc::now()).unwrap();
+        super::vocabulary::install(&lake).unwrap();
         lake
     }
 
@@ -207,7 +208,7 @@ fn hour_of(seconds: i64) -> Hour {
 pub fn events(lake: &Lake) -> Vec<Event> {
     lake.connection()
         .prepare(
-            "SELECT CAST(epoch_ms(hour) / 3600000 AS BIGINT), id, item, kind, units, unit_price, tier, \
+            "SELECT hour_number(hour), id, item, kind, units, unit_price, tier, \
              rule, tie, span FROM silver.event ORDER BY hour, id, kind",
         )
         .unwrap()
@@ -282,10 +283,10 @@ pub fn records(lake: &Lake) -> Vec<ListingRecord> {
     };
     lake.connection()
         .prepare(
-            "SELECT id, item, unit_price, quantity, CAST(epoch_ms(first_seen) / 3600000 AS BIGINT), \
-             CAST(epoch_ms(last_seen) / 3600000 AS BIGINT), CAST(epoch_ms(posted) / 3600000 AS BIGINT), \
+            "SELECT id, item, unit_price, quantity, hour_number(first_seen), \
+             hour_number(last_seen), hour_number(posted), \
              duration, posting_lowest, posting_position, posting_units_ahead, \
-             posting_units_at_or_below, CAST(epoch_ms(ended) / 3600000 AS BIGINT), outcome, \
+             posting_units_at_or_below, hour_number(ended), outcome, \
              outcome_tier, tie, units_sold, end_lowest, end_position, end_units_ahead, \
              end_units_at_or_below, end_units_undercut FROM silver.listing_record ORDER BY id",
         )
@@ -342,8 +343,8 @@ pub fn live(lake: &Lake) -> Vec<Live> {
     lake.connection()
         .prepare(
             "SELECT id, item, unit_price, quantity, time_left, \
-             CAST(epoch_ms(first_seen) / 3600000 AS BIGINT), CAST(epoch_ms(last_seen) / 3600000 AS BIGINT), \
-             CAST(epoch_ms(posted) / 3600000 AS BIGINT), posting_lowest, posting_position, \
+             hour_number(first_seen), hour_number(last_seen), \
+             hour_number(posted), posting_lowest, posting_position, \
              posting_units_ahead, posting_units_at_or_below FROM silver.live_listing ORDER BY id",
         )
         .unwrap()
@@ -384,7 +385,7 @@ pub type History = (Hour, u32, String, u32, u64, u64);
 pub fn history(lake: &Lake, id: u64) -> Vec<History> {
     lake.connection()
         .prepare(
-            "SELECT CAST(epoch_ms(hour) / 3600000 AS BIGINT), quantity, time_left, position, \
+            "SELECT hour_number(hour), quantity, time_left, position, \
              units_ahead, units_at_or_below FROM silver.listing_hour WHERE id = ? ORDER BY hour",
         )
         .unwrap()
@@ -406,9 +407,7 @@ pub fn history(lake: &Lake, id: u64) -> Vec<History> {
 /// `meta.processed`: hour, span.
 pub fn processed(lake: &Lake) -> Vec<(Hour, Option<u16>)> {
     lake.connection()
-        .prepare(
-            "SELECT CAST(epoch_ms(hour) / 3600000 AS BIGINT), span FROM meta.processed ORDER BY hour",
-        )
+        .prepare("SELECT hour_number(hour), span FROM meta.processed ORDER BY hour")
         .unwrap()
         .query_map([], |r| Ok((hour_of(r.get(0)?), r.get(1)?)))
         .unwrap()
@@ -418,7 +417,7 @@ pub fn processed(lake: &Lake) -> Vec<(Hour, Option<u16>)> {
 
 pub fn gaps(lake: &Lake) -> Vec<Hour> {
     lake.connection()
-        .prepare("SELECT CAST(epoch_ms(hour) / 3600000 AS BIGINT) FROM meta.gap ORDER BY hour")
+        .prepare("SELECT hour_number(hour) FROM meta.gap ORDER BY hour")
         .unwrap()
         .query_map([], |r| Ok(hour_of(r.get(0)?)))
         .unwrap()
