@@ -502,6 +502,34 @@ fn the_bound_is_judged_on_transform_and_export_together() {
         [(h(10), Duration::from_secs(400))],
         "the sum is over the bound"
     );
+    // The export, the last step, judged it and counted the hour.
+    assert_eq!(report.metadata["hours_over_bound"], "1");
+}
+
+#[test]
+fn the_runs_own_work_counts_against_the_hour_it_processed() {
+    // H10, TT3: no hour's own step is slow; rewriting the files that are not
+    // an hour's takes 301 s, which the hour carries.
+    let w = World::new("hourly-bound-run-level");
+    w.snapshot(10, &[l(1, 100, 5)]);
+    item_file(
+        &w,
+        "2026-11-20T093500",
+        &[(
+            1,
+            "2026-11-20 09:35:00+00",
+            200,
+            Some(r#"{"name":"Flask","sell_price":5}"#),
+        )],
+    );
+    let clock = crate::transform::test_support::SlowOnceWritten::new(
+        "2026-11-20T10:40:00Z",
+        crate::export::export_dir(&w.config.data_dir).join("item_day.parquet"),
+        Duration::from_secs(301),
+    );
+    let report = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "1");
 }
 
 #[test]

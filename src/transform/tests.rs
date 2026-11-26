@@ -1480,14 +1480,12 @@ fn over_bound_after(seconds: u64, name: &str) -> Vec<(Hour, StdDuration)> {
     );
     assert!(outcome.failure.is_none());
     let times = crate::bound::HourTimes::default();
-    for (hour, took) in outcome.took {
-        times.add(hour, took);
-    }
+    times.add_run(&outcome.took, StdDuration::ZERO);
     times.over_bound()
 }
 
 #[test]
-fn hour_processed_over_5_minutes_is_logged_as_a_warning() {
+fn an_hour_that_took_over_5_minutes_is_over_the_bound() {
     assert_eq!(
         over_bound_after(301, "bound-over"),
         [(h(10), StdDuration::from_secs(301))]
@@ -1495,13 +1493,13 @@ fn hour_processed_over_5_minutes_is_logged_as_a_warning() {
 }
 
 #[test]
-fn hour_processed_in_5_minutes_or_less_logs_no_warning() {
+fn an_hour_that_took_5_minutes_or_less_is_not_over_the_bound() {
     assert!(over_bound_after(300, "bound-exact").is_empty());
     assert!(over_bound_after(0, "bound-none").is_empty());
 }
 
 #[test]
-fn a_slow_hour_is_warned_of_as_it_finishes_and_the_run_still_completes() {
+fn a_slow_hour_run_alone_is_judged_over_the_bound_and_the_run_still_completes() {
     let w = World::new("bound-run");
     w.snapshot(10, &[l(1, 100, 1)]);
     let report = run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
@@ -1513,6 +1511,57 @@ fn a_slow_hour_is_warned_of_as_it_finishes_and_the_run_still_completes() {
     assert_eq!(report.outcome, Severity::Ok);
     assert_eq!(report.metadata["hours_over_bound"], "1");
     assert_eq!(exit_status(&report), ExitStatus::Completed);
+}
+
+#[test]
+fn the_time_to_open_the_lake_counts_against_the_hour_it_then_processes() {
+    // H10, TT3: the hour's own steps take no time; opening and migrating the
+    // lake, which no hook reaches, takes 301 s, and the run is shared out to
+    // the hour.
+    let w = World::new("bound-open");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let clock = SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        w.dir.join("lake.duckdb"),
+        StdDuration::from_secs(301),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "1");
+}
+
+#[test]
+fn a_run_with_no_hour_to_process_counts_nothing_against_the_bound() {
+    let w = World::new("bound-no-hour");
+    let clock = SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        w.dir.join("lake.duckdb"),
+        StdDuration::from_secs(301),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "0");
+}
+
+#[test]
+fn a_lock_on_another_file_is_refused_before_the_lake_is_opened() {
+    let w = World::new("lock-other-file");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let other = w.dir.join("other.lock");
+    let lent = lock::acquire(&other, StdDuration::ZERO, &w.clock).unwrap();
+    let report = run_locked(
+        &w.config,
+        &w.clock,
+        &w.backend(),
+        &|_, _| Ok(()),
+        &lent,
+        &crate::bound::HourTimes::default(),
+    );
+    assert_eq!(report.reason, "LOCK_NOT_THE_LOCK_FILE");
+    assert!(
+        !w.dir.join("lake.duckdb").exists(),
+        "the lake was not opened"
+    );
 }
 
 // ------------------------------------------------------------ DuckLake's limits

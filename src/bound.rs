@@ -1,6 +1,8 @@
 //! The hourly processing bound (5.4.1, `docs/5.4.1-configuration.md`): one
 //! bound on an hour's `transform` and `export` together. Each step adds the
-//! time it spent on each hour to one [`HourTimes`], and the bound is judged on
+//! whole of its run to one [`HourTimes`] ([`HourTimes::add_run`]): the time it
+//! spent on each hour, and the run's own work shared across the hours it
+//! processed. The bound is judged on
 //! the sum, once, where the steps are done: after `export` under `dp hourly`,
 //! after the step itself where `dp transform` or `dp export` runs alone, so a
 //! step alone is judged against the whole bound.
@@ -25,6 +27,22 @@ impl HourTimes {
     /// Adds `took` to the hour's time.
     pub(crate) fn add(&self, hour: Hour, took: Duration) {
         *self.took.borrow_mut().entry(hour).or_default() += took;
+    }
+
+    /// Adds one step's run: each hour it processed with its own time (`hours`),
+    /// and the rest of the run's time (`whole`, less those times: opening and
+    /// migrating the lake, the vocabulary, the reference table, the files that
+    /// are not an hour's) shared evenly across those hours, which is the one
+    /// hour in steady state. A run that processed no hour adds nothing.
+    pub(crate) fn add_run(&self, hours: &[(Hour, Duration)], whole: Duration) {
+        let Ok(count @ 1..) = u32::try_from(hours.len()) else {
+            return;
+        };
+        let timed: Duration = hours.iter().map(|(_, took)| *took).sum();
+        let share = whole.saturating_sub(timed) / count;
+        for (hour, took) in hours {
+            self.add(*hour, *took + share);
+        }
     }
 
     /// The hours whose time is longer than the bound, with their times, in
@@ -110,6 +128,23 @@ mod tests {
         assert_eq!(warning.reason, "HOUR_OVER_BOUND");
         assert_eq!(warning.metadata["hour"], hour_name(Hour(10)));
         assert_eq!(exit_status(&warning), ExitStatus::Completed);
+    }
+
+    #[test]
+    fn a_runs_own_time_is_shared_evenly_across_the_hours_it_processed() {
+        let times = HourTimes::default();
+        let sec = Duration::from_secs;
+        // 10 + 20 s timed of 100 s: 70 s of the run's own, 35 s to each.
+        times.add_run(&[(Hour(10), sec(10)), (Hour(11), sec(20))], sec(100));
+        assert_eq!(times.took.borrow()[&Hour(10)], sec(45));
+        assert_eq!(times.took.borrow()[&Hour(11)], sec(55));
+    }
+
+    #[test]
+    fn a_run_that_processed_no_hour_adds_nothing() {
+        let times = HourTimes::default();
+        times.add_run(&[], BOUND * 2);
+        assert!(times.took.borrow().is_empty());
     }
 
     #[test]

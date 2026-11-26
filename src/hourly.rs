@@ -121,6 +121,10 @@ fn finish(results: Vec<(&str, Report)>) -> Report {
         .iter()
         .map(|(step, report)| ((*step).to_owned(), report.reason.clone()))
         .collect();
+    // The step that judged the bound counted the hours over it.
+    let over_bound = results
+        .iter()
+        .find_map(|(_, report)| report.metadata.get("hours_over_bound").cloned());
     let mut results = results.into_iter();
     let (_, collected) = results.next().expect("collect always runs");
     let later: Vec<(&str, Report)> = results.collect();
@@ -164,6 +168,9 @@ fn finish(results: Vec<(&str, Report)>) -> Report {
         }
     };
     report.errors.append(&mut errors);
+    if let Some(over) = over_bound {
+        report.metadata.insert("hours_over_bound".to_owned(), over);
+    }
     for (step, reason) in summary {
         report.metadata.insert(format!("step_{step}"), reason);
     }

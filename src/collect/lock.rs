@@ -56,13 +56,24 @@ impl<'a> Holding<'a> {
     ) -> Result<Proof<'a>, Failure> {
         match self {
             Holding::Take => acquire(path, wait, clock).map(Proof::Taken),
-            Holding::Held(lock) if lock.path == path => Ok(Proof::Lent(lock)),
-            Holding::Held(_) => Err(Failure::Stop(Box::new(Report::fatal(
-                ErrorType::Unexpected,
-                "LOCK_NOT_THE_LOCK_FILE",
-                "The lock lent to the step is on another file than the lock file.",
-            )))),
+            Holding::Held(lock) => lock.require_on(path).map(|()| Proof::Lent(lock)),
         }
+    }
+}
+
+impl Lock {
+    /// Whether this lock is on `path`, the configured lock file: another
+    /// file's lock proves nothing about it, and is an *unexpected* failure.
+    /// Every step lent a lock checks it, through [`Holding::proof`] or itself.
+    pub(crate) fn require_on(&self, path: &Path) -> Result<(), Failure> {
+        if self.path == path {
+            return Ok(());
+        }
+        Err(Failure::Stop(Box::new(Report::fatal(
+            ErrorType::Unexpected,
+            "LOCK_NOT_THE_LOCK_FILE",
+            "The lock lent to the step is on another file than the lock file.",
+        ))))
     }
 }
 

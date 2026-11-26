@@ -4,7 +4,7 @@
 //! *When it fails* (`docs/5.2.1-collection.md`).
 //!
 //! The lock is the caller's: [`run`] takes it, `dp hourly` holds it and calls
-//! [`run_locked`], and [`export`] takes the held [`Lock`] as proof.
+//! [`run_locked`], and [`export_with`] takes the held [`Lock`] as proof.
 
 #[cfg(test)]
 mod tests;
@@ -69,8 +69,8 @@ pub(crate) fn run_with(config: &Config, clock: &dyn Clock, backend: &Backend) ->
 }
 
 /// As [`run_with`], for a caller that holds the VM-wide lock already (`dp
-/// hourly`). The time each hour's files took is added to `times`; the caller
-/// judges the hourly processing bound on it.
+/// hourly`). The time of the whole run, shared across the hours it wrote, is
+/// added to `times`; the caller judges the hourly processing bound on it.
 pub(crate) fn run_locked(
     config: &Config,
     clock: &dyn Clock,
@@ -90,6 +90,10 @@ pub(crate) fn run_locked_with(
     times: &HourTimes,
     write: Writer<'_>,
 ) -> Report {
+    if let Err(failure) = held.require_on(&config.lock_file) {
+        return fatal(failure);
+    }
+    let started = clock.now();
     let lake = match Lake::open(backend, &config.data_dir.join("state/duckdb-tmp"))
         .and_then(|lake| lake.migrate(clock.now()).map(|_| lake))
     {
@@ -97,19 +101,20 @@ pub(crate) fn run_locked_with(
         Err(failure) => return fatal(failure),
     };
     let outcome = export_with(&lake, &config.data_dir, clock, held, write);
-    for (hour, took) in &outcome.took {
-        times.add(*hour, *took);
-    }
+    // The whole run counts against the bound: opening the lake and the files
+    // that are not an hour's are shared out across the hours.
+    times.add_run(&outcome.took, bound::since(clock, started));
     outcome.into_report()
 }
 
-/// What [`export`] did.
+/// What [`export_with`] did.
 #[derive(Debug, Default)]
 pub(crate) struct Outcome {
     /// Each hour that got at least one file, in order.
     pub hours: Vec<Hour>,
-    /// The time each hour's files took, in order. The hourly processing bound
-    /// is judged on it with the transform's ([`crate::bound`]).
+    /// The time each hour's own files took, in order. The run adds it, with
+    /// the rest of its time, to the hourly processing bound's, which is judged
+    /// with the transform's ([`crate::bound`]).
     pub took: Vec<(Hour, Duration)>,
     /// Each of `item_day.parquet`, `item.parquet` and `profiles.sql` that was
     /// rewritten.
@@ -162,18 +167,13 @@ pub(crate) fn past_keep(hour: Hour, now: DateTime<Utc>) -> bool {
     chrono::Duration::from_std(keep).is_ok_and(|keep| start + keep < now)
 }
 
-/// Writes what the export lacks or has stale. The lake is open and migrated
-/// and `_held` is the caller's proof that it holds the lock.
-#[cfg(test)]
-pub(crate) fn export(lake: &Lake, data_dir: &Path, clock: &dyn Clock, held: &Lock) -> Outcome {
-    export_with(lake, data_dir, clock, held, &publish)
-}
-
 /// Writes one hour file: `publish`, or a test's stand-in for a write that
 /// fails.
 pub(crate) type Writer<'a> = &'a dyn Fn(&Lake, &Path, &str) -> Result<(), Failure>;
 
-/// [`export`], writing each hour file with `write`.
+/// Writes what the export lacks or has stale, each hour file with `write`.
+/// The lake is open and migrated and `_held` is the caller's proof that it
+/// holds the lock.
 fn export_with(
     lake: &Lake,
     data_dir: &Path,

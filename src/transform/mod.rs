@@ -109,6 +109,9 @@ pub(crate) fn run_locked(
     held: &Lock,
     times: &HourTimes,
 ) -> Report {
+    if let Err(failure) = held.require_on(&config.lock_file) {
+        return fatal(failure);
+    }
     match open_and_process(config, clock, backend, hook, held, times) {
         Ok(report) => report,
         Err(report) => *report,
@@ -123,13 +126,14 @@ fn open_and_process(
     held: &Lock,
     times: &HourTimes,
 ) -> Result<Report, Box<Report>> {
+    let started = clock.now();
     let lake =
         Lake::open(backend, &config.data_dir.join("state/duckdb-tmp")).map_err(into_fatal)?;
     lake.migrate(clock.now()).map_err(into_fatal)?;
     let outcome = process_hours(&lake, &config.data_dir, clock, hook, held);
-    for (hour, took) in &outcome.took {
-        times.add(*hour, *took);
-    }
+    // The whole run counts against the bound: opening the lake, the
+    // vocabulary and the reference table are shared out across the hours.
+    times.add_run(&outcome.took, bound::since(clock, started));
     for (warning, id) in &outcome.warnings {
         Report::warning(warning.code(), warning.message())
             .with_metadata("id", id.to_string())
@@ -167,8 +171,9 @@ pub struct Outcome {
     pub hours: Vec<HourSummary>,
     /// Each listing warned of, across the hours.
     pub warnings: Vec<(HourWarning, u64)>,
-    /// The time each hour took, in order. The hourly processing bound is
-    /// judged on it with the export's ([`crate::bound`]).
+    /// The time each hour's own processing took, in order. The run adds it,
+    /// with the rest of its time, to the hourly processing bound's, which is
+    /// judged with the export's ([`crate::bound`]).
     pub took: Vec<(Hour, Duration)>,
     /// What the rebuild of the reference table found; `None` where it did not
     /// run or failed.
@@ -271,8 +276,8 @@ pub(crate) fn is_fundamental(failure: &Failure) -> bool {
         if report.error_type == Some(ErrorType::TechnicalFundamental))
 }
 
-/// The report of a run that stopped on nothing. A slow hour was already
-/// logged as it finished, so it is a count here.
+/// The report of a run that stopped on nothing. The bound is judged by the
+/// caller, on the hours' times, once the steps are done.
 fn finished(outcome: &Outcome) -> Report {
     Report::ok()
         .with_metadata("hours", outcome.hours.len().to_string())

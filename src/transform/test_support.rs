@@ -10,6 +10,7 @@ use std::str::FromStr;
 use duckdb::Connection;
 
 use super::{Outcome, bronze, high_water_mark, process_hours, run_with};
+use crate::collect::Clock;
 use crate::collect::clock::FakeClock;
 use crate::collect::snapshot::timestamp;
 use crate::config::{Config, Secret};
@@ -27,6 +28,42 @@ const BASE: i64 = 498_648;
 /// The n-th hour of the test day; negative n is the day before.
 pub fn h(n: i64) -> Hour {
     Hour(BASE + n)
+}
+
+/// A clock that moves on by `jump`, once, the first time it is read after
+/// `file` exists: a test's way to make the work that writes `file` slow, where
+/// no hook reaches it (opening the lake, the reference table, the files that
+/// are not an hour's). Reads before that are the fake clock's.
+pub struct SlowOnceWritten {
+    pub inner: FakeClock,
+    pub file: PathBuf,
+    pub jump: std::time::Duration,
+    jumped: std::cell::Cell<bool>,
+}
+
+impl SlowOnceWritten {
+    pub fn new(rfc3339: &str, file: PathBuf, jump: std::time::Duration) -> SlowOnceWritten {
+        SlowOnceWritten {
+            inner: FakeClock::at(rfc3339),
+            file,
+            jump,
+            jumped: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl Clock for SlowOnceWritten {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        if !self.jumped.get() && self.file.exists() {
+            self.jumped.set(true);
+            self.inner.sleep(self.jump);
+        }
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        self.inner.sleep(duration);
+    }
 }
 
 /// A listing as a snapshot shows it.

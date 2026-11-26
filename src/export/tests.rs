@@ -501,13 +501,87 @@ fn exported_profiles_sql_gives_the_same_profile_as_the_lake() {
 #[test]
 fn the_time_each_hour_took_is_kept_for_the_bound_to_judge() {
     // D30.1 to D30.3: the bound is judged on the transform's and the export's
-    // time together (`bound`), so the export keeps its own per hour.
+    // time together (`bound`), so the export keeps its own per hour: two files
+    // of 7 s each.
     let w = world("export-took");
     let lake = w.open();
     let held = w.lock();
-    let outcome = export(&lake, &w.config.data_dir, &w.clock, &held);
-    let hours: Vec<Hour> = outcome.took.iter().map(|(hour, _)| *hour).collect();
-    assert_eq!(hours, [h(10), h(11), h(12)]);
+    let outcome = export_with(
+        &lake,
+        &w.config.data_dir,
+        &w.clock,
+        &held,
+        &|lake, file, select| {
+            w.clock.sleep(Duration::from_secs(7));
+            publish(lake, file, select)
+        },
+    );
+    let took = Duration::from_secs(14);
+    assert_eq!(outcome.took, [(h(10), took), (h(11), took), (h(12), took)]);
+}
+
+#[test]
+fn an_export_run_alone_is_judged_against_the_whole_bound() {
+    // H10, TT3: an hour's files take 301 s, so the run counts the hour over.
+    let w = world("export-alone-over");
+    let clock = crate::transform::test_support::SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        hour_file(&w.config.data_dir, "item_hour", h(10)),
+        Duration::from_secs(301),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "1");
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+}
+
+#[test]
+fn the_runs_own_work_is_shared_across_the_hours_it_wrote() {
+    // H10, TT3: no hour's file is slow; rewriting `item_day.parquet` and the
+    // files after it takes 903 s, 301 s to each of the three hours.
+    let w = world("export-run-level");
+    let clock = crate::transform::test_support::SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        export_folder(&w).join("item_day.parquet"),
+        Duration::from_secs(903),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "3");
+}
+
+#[test]
+fn a_run_that_wrote_no_hour_counts_nothing_against_the_bound() {
+    let w = world("export-no-hour");
+    assert_eq!(export_it(&w).outcome, Severity::Ok);
+    // Every hour is written; the second run rewrites one file, slowly.
+    let day = export_folder(&w).join("item_day.parquet");
+    std::fs::remove_file(&day).unwrap();
+    let clock = crate::transform::test_support::SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        day,
+        Duration::from_secs(903),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.metadata["hours_over_bound"], "0");
+}
+
+#[test]
+fn a_lock_on_another_file_is_refused_before_the_lake_is_opened() {
+    let w = World::new("export-other-lock");
+    let lent = lock::acquire(&w.dir.join("other.lock"), Duration::ZERO, &w.clock).unwrap();
+    let report = run_locked(
+        &w.config,
+        &w.clock,
+        &w.backend(),
+        &lent,
+        &HourTimes::default(),
+    );
+    assert_eq!(report.reason, "LOCK_NOT_THE_LOCK_FILE");
+    assert!(
+        !w.dir.join("lake.duckdb").exists(),
+        "the lake was not opened"
+    );
 }
 
 // ----------------------------------------------------------- the hour loop
