@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_held_past_the_wait_is_a_blip_exit_75() {
+    fn writing_subcommand_waits_for_the_lock_up_to_10_minutes() {
         let path = temp("held");
         let clock = FakeClock::at("2026-11-26T11:40:00Z");
         let _held = acquire(&path, Duration::from_secs(600), &clock).unwrap();

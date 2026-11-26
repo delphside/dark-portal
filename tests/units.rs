@@ -47,15 +47,16 @@ fn calendar(hour: &str, minute: u32) -> String {
 }
 
 #[test]
-fn the_hourly_timer_starts_at_the_setting() {
+fn timers_start_at_35_and_00_50_utc_and_are_persistent() {
+    assert_eq!(HOURLY_TIMER_START_MINUTE, 35);
+    assert_eq!(
+        (DAILY_TIMER_START_HOUR_UTC, DAILY_TIMER_START_MINUTE),
+        (0, 50)
+    );
     assert_eq!(
         setting("dp-hourly@.timer", "OnCalendar"),
         calendar("*", HOURLY_TIMER_START_MINUTE)
     );
-}
-
-#[test]
-fn the_daily_timer_starts_at_the_setting() {
     assert_eq!(
         setting("dp-daily@.timer", "OnCalendar"),
         calendar(
@@ -63,6 +64,10 @@ fn the_daily_timer_starts_at_the_setting() {
             DAILY_TIMER_START_MINUTE
         )
     );
+    // A run missed while the host was down starts when it is back.
+    for timer in ["dp-hourly@.timer", "dp-daily@.timer"] {
+        assert_eq!(setting(timer, "Persistent"), "true", "{timer}");
+    }
 }
 
 /// A time of day on one fixed day.
@@ -129,9 +134,18 @@ fn no_job_lives_longer_than_the_daily_limit() {
 }
 
 #[test]
-fn no_unit_restarts_its_job() {
+fn units_have_restart_no_and_the_settings_run_time_limits() {
     // `dp daily` retries itself, and the next hourly timer is the hourly retry.
     for unit in ["dp-hourly@.service", "dp-daily@.service"] {
         assert_eq!(setting(unit, "Restart"), "no", "{unit}");
     }
+    // And each is cut off at the run time limit the settings give it.
+    assert_eq!(
+        minutes(&setting("dp-hourly@.service", "RuntimeMaxSec")),
+        hourly_limit()
+    );
+    assert_eq!(
+        minutes(&setting("dp-daily@.service", "RuntimeMaxSec")),
+        DAILY_RUN_TIME_LIMIT
+    );
 }

@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lake_that_closed_days_before_the_day_closed_migration_counts_them_closed() {
+    fn migration_5_records_the_days_item_day_holds_as_closed() {
         let (lake, _dir) = open("backfill");
         lake.migrate_with(&MIGRATIONS[..4], now()).unwrap();
         lake.connection()

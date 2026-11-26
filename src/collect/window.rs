@@ -56,7 +56,7 @@ mod tests {
     }
 
     #[test]
-    fn the_window_boundary_belongs_to_the_new_hour() {
+    fn run_after_the_previous_hours_retry_window_collects_its_own_hour() {
         assert_eq!(hour_of("2026-11-26T11:24:59Z"), "2026-11-26T10.parquet");
         assert_eq!(hour_of("2026-11-26T11:25:00Z"), "2026-11-26T11.parquet");
     }

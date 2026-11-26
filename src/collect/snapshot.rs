@@ -282,6 +282,15 @@ pub fn write_parquet<R: Read>(
     temporary: &Path,
     scratch: &Path,
 ) -> Result<ParseSummary, Failure> {
+    reserving(temporary, || write_into(body, meta, temporary, scratch))
+}
+
+/// Reserves `temporary` and runs `write` to fill it, removing it where the
+/// write fails.
+fn reserving(
+    temporary: &Path,
+    write: impl FnOnce() -> Result<ParseSummary, Failure>,
+) -> Result<ParseSummary, Failure> {
     // The name is the run's own, so a file already there is a clash, which is
     // refused and not shared.
     std::fs::OpenOptions::new()
@@ -289,7 +298,7 @@ pub fn write_parquet<R: Read>(
         .create_new(true)
         .open(temporary)
         .map_err(|e| io_failure(&e, "reserving the temporary file"))?;
-    let result = write_into(body, meta, temporary, scratch);
+    let result = write();
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
@@ -484,7 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_field_is_warned_once_by_name() {
+    fn unknown_listing_field_is_logged_by_name() {
+        crate::test_support::listening();
         let body = r#"{"auctions":[
             {"id":1,"item":{"id":1,"bonus":[1]},"quantity":1,"unit_price":1,"time_left":"LONG","buyout":5},
             {"id":2,"item":{"id":1,"bonus":[2]},"quantity":1,"unit_price":1,"time_left":"LONG","buyout":6}]}"#;
@@ -507,6 +517,7 @@ mod tests {
 
     #[test]
     fn known_fields_only_log_nothing() {
+        crate::test_support::listening();
         let log = Logged(Arc::default());
         let writer = log.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -654,6 +665,29 @@ mod tests {
         };
         assert_eq!(report.reason, "SNAPSHOT_BODY_UNUSABLE");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn full_disk_exits_2_and_leaves_no_partial_file() {
+        // X3, X6: the temporary file is reserved as a run does, then stands for
+        // the device that is always full (a link to it, as a real disk cannot
+        // be filled here): DuckDB's write fails with the disk full, the run's
+        // failure is the fundamental `DISK_FULL`, exit 2, and the reserved
+        // name is removed, so no partial file stays. `write_parquet` is this
+        // reservation around `write_into`.
+        let temporary = temp("full");
+        let dir = temporary.parent().unwrap().to_owned();
+        let Err(Failure::Stop(report)) = reserving(&temporary, || {
+            std::fs::remove_file(&temporary).unwrap();
+            std::os::unix::fs::symlink("/dev/full", &temporary).unwrap();
+            write_into(TWO.as_bytes(), &meta(), &temporary, &dir)
+        }) else {
+            panic!("expected a stop");
+        };
+        assert_eq!(report.reason, "DISK_FULL", "{report:?}");
+        assert_eq!(crate::error::exit_status(&report).code(), 2);
+        assert!(temporary.symlink_metadata().is_err(), "the name is removed");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left");
     }
 
     #[test]

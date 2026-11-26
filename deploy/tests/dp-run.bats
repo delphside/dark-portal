@@ -46,7 +46,7 @@ dp_run() {
     [ -f "$FAKE_LOG" ]
 }
 
-@test "a run of the same job live already exits 75 and does not run" {
+@test "dp_run_by_hand_while_its_job_is_live_exits_75" {
     FAKE_RUNNING=$'dp-other-test\ndp-hourly-test\n' dp_run hourly
     [ "$status" -eq 75 ]
     [[ "$output" == *"live already"* ]]
@@ -59,7 +59,7 @@ dp_run() {
     [ -f "$FAKE_LOG" ]
 }
 
-@test "docker unable to list its containers exits 75" {
+@test "dp_run_with_docker_ps_failing_exits_75" {
     FAKE_PS_STATUS=1 dp_run hourly
     [ "$status" -eq 75 ]
     [ ! -f "$FAKE_LOG" ]

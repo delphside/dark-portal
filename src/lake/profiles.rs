@@ -321,6 +321,30 @@ mod tests {
     }
 
     #[test]
+    fn fill_price_with_nothing_listed_has_null_units_too() {
+        // P3: where none are listed both the price and the units are null, not
+        // a price over no units. (`fill` pairs the two, so reads them apart.)
+        let (lake, _dir) = lake("fill-null-units");
+        td_j(&lake);
+        for (item, n) in [(1, 1), (2, 0)] {
+            let (price, units): (Option<String>, Option<u64>) = lake
+                .connection()
+                .query_row(
+                    &format!(
+                        "SELECT CAST(struct_extract(f, 'price') AS VARCHAR), \
+                         struct_extract(f, 'units') \
+                         FROM (SELECT fill_price({item}, {}, 5) AS f)",
+                        at(n)
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((price, units), (None, None), "item {item} at hour {n}");
+        }
+    }
+
+    #[test]
     fn fill_price_refuses_n_below_one() {
         let (lake, _dir) = lake("fill-refused");
         td_j(&lake);
@@ -337,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_price_refuses_an_n_that_is_not_a_whole_number() {
+    fn fill_price_refuses_n_that_is_not_whole() {
         let (lake, _dir) = lake("fill-whole");
         td_j(&lake);
         let at = at(0);
@@ -471,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn default_n_leaves_out_hours_that_were_missed() {
+    fn held_hour_is_an_hour_where_any_item_has_a_row() {
         // D20.5: of 168 hours, 20 missed (no row for any item): the median of
         // the 148 held. 74 of 1 then 74 of 9; the middle two are 1 and 9, so 5
         // where the missed hours counted as zero would give 1.
@@ -529,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn an_item_with_no_row_in_a_held_hour_sold_nothing_in_it() {
+    fn item_with_no_row_in_a_held_hour_counts_as_0_in_the_default_n_median() {
         // Item 2 holds the hours 0 to 19. Item 1 sold 4 in each of the first 10
         // and has no row in the other 10: ten 4s and ten 0s, the median 2.
         let (lake, _dir) = lake("dn-absent");
@@ -587,6 +611,19 @@ mod tests {
     }
 
     #[test]
+    fn depth_ladder_hours_are_null_for_no_sales_seen() {
+        // P6: an item with no row in any hour of the window (item 2 holds the
+        // hours) has no sales seen: every level's hours are null, not 0 or an
+        // infinite wait.
+        let (lake, _dir) = lake("ladder-null");
+        insert_levels(&lake, 1, 23, &[(100, 3), (110, 4)]);
+        insert_hours(&lake, &series(2, 0..24, 3));
+        let rows = ladder(&lake, 1, 23);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.3.is_none()), "{rows:?}");
+    }
+
+    #[test]
     fn depth_ladder_shows_the_first_price_reaching_48_hours_and_stops() {
         // TD-J2: cumulative units 3, 7, 12, 15 at 0.25 sold an hour (6 over the
         // 24 hours held): 12, 28 and 48 hours. The 48 row is shown and 15 is not.
@@ -641,6 +678,23 @@ mod tests {
         // 19 + 1 = 20 hours held, the first four of the window missed.
         let hours: Vec<Option<f64>> = ladder(&lake, 1, 23).iter().map(|r| r.3).collect();
         assert_eq!(hours, [Some(12.0), Some(28.0), Some(48.0)]);
+    }
+
+    #[test]
+    fn item_with_no_row_in_a_held_hour_counts_as_0_in_the_ladders_mean() {
+        // P14, P6: item 2 holds the hours 0 to 19, so each is held. Item 1 sold
+        // 4 in each of the first 10 and has no row in the other 10: 40 over 20
+        // held hours is 2 an hour, so 3 units last 1.5 hours and 7 last 3.5.
+        // Averaged over the 10 hours it has rows in, it would be 4 an hour.
+        let (lake, _dir) = lake("ladder-absent");
+        let mut rows = series(1, 0..10, 4);
+        rows.extend(series(2, 0..20, 0));
+        insert_hours(&lake, &rows);
+        insert_levels(&lake, 1, 19, &[(100, 3), (110, 4)]);
+        assert_eq!(
+            ladder(&lake, 1, 19),
+            [(100, 3, 3, Some(1.5)), (110, 4, 7, Some(3.5))]
+        );
     }
 
     #[test]
@@ -808,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_carries_the_vendor_sell_price_and_leaves_the_buy_price_out() {
+    fn profile_shows_the_vendor_sell_price_and_neither_purchase_price_nor_vendor_sells() {
         // D23: `purchase_price` and `vendor_sells` stay in `reference.item`.
         let (lake, _dir) = lake("profile-vendor");
         insert_hours(&lake, &series(1, 0..3, 1));
@@ -836,6 +890,28 @@ mod tests {
                 .iter()
                 .any(|c| c == "purchase_price" || c == "vendor_sells")
         );
+    }
+
+    #[test]
+    fn turnover_per_hour_is_shown_as_the_sold_floor_beside_the_estimate() {
+        // P7, R7: each hour posts 1, sells a floor of 2 and an estimate of 5;
+        // the profile's totals over the 24 hour turnover window show the floor
+        // and the estimate side by side, and the posted units as well.
+        let (lake, _dir) = lake("profile-turnover");
+        let rows: Vec<HourRow> = (0..31)
+            .map(|n| (1, n, Some(1), Some([1, 2, 5, 0, 0])))
+            .collect();
+        insert_hours(&lake, &rows);
+        insert_levels(&lake, 1, 30, &[(100, 3)]);
+        let (posted, floor, estimate): (u64, u64, u64) = lake
+            .connection()
+            .query_row(
+                "SELECT posted_units, sold_floor_units, sold_estimate_units FROM profile",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((posted, floor, estimate), (24, 48, 120));
     }
 
     #[test]
@@ -886,6 +962,31 @@ mod tests {
     }
 
     #[test]
+    fn profile_shows_the_item_id_until_its_response_arrives() {
+        // P11: the name is the ID, and class and subclass are null, until the
+        // item has a reference row; then they are the response's.
+        let (lake, _dir) = lake("profile-id");
+        insert_hours(&lake, &series(7, 0..3, 1));
+        let row = |lake: &Lake| -> (String, Option<String>, Option<String>) {
+            lake.connection()
+                .query_row("SELECT name, class, subclass FROM profile", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap()
+        };
+        assert_eq!(row(&lake), ("7".to_owned(), None, None));
+        reference_row(&lake, 7, "Flask");
+        assert_eq!(
+            row(&lake),
+            (
+                "Flask".to_owned(),
+                Some("Consumable".to_owned()),
+                Some("Potion".to_owned())
+            )
+        );
+    }
+
+    #[test]
     fn items_filter_by_name_class_and_subclass() {
         // P1: the profile has a column each for the name, the class and the
         // subclass, and a client's filter on each finds the right items; an
@@ -930,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn the_histories_name_an_item_by_its_id_until_it_has_a_reference() {
+    fn hourly_history_and_daily_summary_carry_the_item_name() {
         let (lake, _dir) = lake("histories");
         insert_hours(&lake, &series(1, 0..2, 1));
         insert_hours(&lake, &series(2, 0..1, 1));

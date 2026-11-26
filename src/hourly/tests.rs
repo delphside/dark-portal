@@ -187,19 +187,36 @@ fn hourly_runs_items_transform_and_export_after_any_collect_result() {
 }
 
 #[test]
-fn hourly_exits_with_collects_status_where_it_is_not_0_else_3_where_a_later_step_failed_else_0() {
-    // O53: every combination of collect's exit and the later steps' results.
+fn hourly_exits_with_collects_status_where_it_is_not_0() {
+    // O53, H0: whatever the later steps gave.
     for (name, collect, collect_exit) in collects() {
-        for (case, later, later_failed) in laters() {
-            let w = World::new("hourly-exit");
+        if collect_exit == 0 {
+            continue;
+        }
+        for (case, later, _) in laters() {
+            let w = World::new("hourly-exit-collect");
             let (_, report) = run_stubs(&w, collect.clone(), &later);
-            let expected = if collect_exit != 0 {
-                collect_exit
-            } else if later_failed {
-                3
-            } else {
-                0
-            };
+            assert_eq!(
+                code(&report),
+                collect_exit,
+                "collect {name}, {case}: {report:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hourly_exits_3_where_collect_succeeded_and_a_later_step_failed() {
+    // O53, H0: collect gave 0, or 0 with warnings: 3 where any later step
+    // failed, else 0.
+    for (name, collect, collect_exit) in collects() {
+        if collect_exit != 0 {
+            continue;
+        }
+        for (case, later, later_failed) in laters() {
+            let w = World::new("hourly-exit-later");
+            let (_, report) = run_stubs(&w, collect.clone(), &later);
+            let expected = if later_failed { 3 } else { 0 };
             assert_eq!(
                 code(&report),
                 expected,
@@ -268,7 +285,7 @@ fn refused(w: &World) -> bool {
 }
 
 #[test]
-fn where_collect_took_no_lock_a_second_taker_is_refused_through_every_later_step() {
+fn hourly_takes_the_lock_for_items_where_collect_took_none() {
     // O59, D16.7, X-c7: collect holds no lock across its work; where it took
     // none (step 1, or a failure first), hourly takes it for items and holds it
     // through transform and export.
@@ -421,7 +438,7 @@ fn items_is_lent_the_lock_and_takes_none_of_its_own_for_a_new_item() {
 }
 
 #[test]
-fn a_lock_held_past_the_wait_is_a_blip_where_collect_succeeded_and_nothing_after_runs() {
+fn hourly_skips_later_steps_and_exits_75_where_the_lock_is_held_past_the_wait() {
     let w = World::new("hourly-lock-blip");
     let held = lock::acquire(&w.config.lock_file, Duration::ZERO, &w.clock).unwrap();
     let (order, report) = run_stubs(
@@ -438,7 +455,7 @@ fn a_lock_held_past_the_wait_is_a_blip_where_collect_succeeded_and_nothing_after
 }
 
 #[test]
-fn a_lock_held_past_the_wait_leaves_collects_exit_and_is_carried_as_an_error() {
+fn hourly_exits_collects_status_where_the_lock_is_held_and_collect_failed() {
     let w = World::new("hourly-lock-collect-failed");
     let _held = lock::acquire(&w.config.lock_file, Duration::ZERO, &w.clock).unwrap();
     let (order, report) = run_stubs(
@@ -498,7 +515,7 @@ fn the_real_steps_take_the_lock_once_and_run_one_hour_through() {
 }
 
 #[test]
-fn the_bound_is_judged_on_transform_and_export_together() {
+fn transform_and_export_of_an_hour_are_judged_together_against_5_minutes() {
     // H10, TT3: each step is inside the bound for the hour, the two are not.
     let w = World::new("hourly-bound-sum");
     w.snapshot(10, &[l(1, 100, 5)]);
@@ -548,7 +565,7 @@ fn the_bound_is_judged_on_transform_and_export_together() {
 }
 
 #[test]
-fn the_runs_own_work_counts_against_the_hour_it_processed() {
+fn runs_own_work_counts_against_the_bound_shared_across_its_hours() {
     // H10, TT3: no hour's own step is slow; rewriting the files that are not
     // an hour's takes 301 s, which the hour carries.
     let w = World::new("hourly-bound-run-level");
@@ -594,6 +611,70 @@ fn a_rerun_of_the_real_steps_does_nothing_and_exits_0() {
     );
     let second = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
     assert_eq!(code(&second), 0, "{second:?}");
+}
+
+#[test]
+fn failed_transform_hour_rolls_back_whole_and_hourly_exits_3() {
+    // H0, H3: under `dp hourly` the transform fails in its hour: that hour is
+    // rolled back whole, the export still runs, and the exit is 3. The next
+    // run processes the hour.
+    let w = World::new("hourly-failed-hour");
+    w.snapshot(10, &[l(1, 100, 5)]);
+    item_file(
+        &w,
+        "2026-11-20T093500",
+        &[(
+            1,
+            "2026-11-20 09:35:00+00",
+            200,
+            Some(r#"{"name":"Flask","sell_price":5}"#),
+        )],
+    );
+    let clock = FakeClock::at("2026-11-20T10:40:00Z");
+    // The hours' tables: the reference table is rebuilt after the hours, not in one.
+    let hours_dump = |lake: &crate::lake::Lake| {
+        let text = crate::transform::test_support::dump(lake);
+        let end = text
+            .find("FROM reference.item t")
+            .expect("the reference part");
+        text[..end].to_owned()
+    };
+    let before = hours_dump(&w.open());
+    let times = crate::bound::HourTimes::default();
+    let report = run_hooked(
+        &w.config,
+        &clock,
+        Endpoints::blizzard,
+        &w.backend(),
+        &|_, at| {
+            if at == crate::transform::Step::Gold {
+                Err(Failure::unexpected("INJECTED", "A failure mid-hour."))
+            } else {
+                Ok(())
+            }
+        },
+        &crate::export::publish,
+        &times,
+    );
+    assert_eq!(code(&report), 3, "{report:?}");
+    assert_eq!(report.metadata["step_collect"], "OK");
+    assert_eq!(report.metadata["step_export"], "OK", "export still ran");
+    let lake = w.open();
+    assert_eq!(crate::transform::high_water_mark(&lake).unwrap(), None);
+    assert!(crate::transform::test_support::processed(&lake).is_empty());
+    assert_eq!(
+        hours_dump(&lake),
+        before,
+        "nothing of the hour is visible: silver, gold and meta as before"
+    );
+    drop(lake);
+
+    let report = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
+    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(
+        crate::transform::high_water_mark(&w.open()).unwrap(),
+        Some(h(10))
+    );
 }
 
 #[test]

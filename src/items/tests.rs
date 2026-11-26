@@ -84,6 +84,7 @@ struct World {
 
 impl World {
     fn at(name: &str, start: &str) -> World {
+        crate::test_support::listening();
         let dir = std::env::temp_dir().join(format!("dp-items-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -245,7 +246,7 @@ fn waits(w: &World) -> Vec<Duration> {
 // Which items, and the file
 
 #[test]
-fn only_items_without_a_response_are_fetched_and_written_as_one_file() {
+fn items_new_to_bronze_are_fetched_raw_once() {
     let w = World::at("which", START);
     w.snapshot("2026-11-26T10", &[10, 20, 30]);
     w.snapshot("2026-11-26T11", &[30, 40]);
@@ -310,7 +311,7 @@ fn the_file_is_named_for_the_runs_start_in_utc() {
 }
 
 #[test]
-fn a_rerun_with_nothing_new_fetches_nothing_and_writes_no_file() {
+fn item_whose_latest_response_is_404_is_not_asked_again_hourly() {
     let w = World::at("rerun", START);
     w.snapshot("2026-11-26T11", &[10, 20]);
     w.stub.token_ok(5);
@@ -368,7 +369,7 @@ fn the_largest_item_id_is_fetched_and_kept() {
 }
 
 #[test]
-fn a_snapshot_file_bronze_cannot_read_stops_the_step_unexpected() {
+fn items_run_alone_with_unreadable_bronze_stops_before_its_first_request() {
     let w = World::at("corrupt", START);
     let dir = w.config.data_dir.join("bronze/commodities/eu");
     fs::create_dir_all(&dir).unwrap();
@@ -378,6 +379,12 @@ fn a_snapshot_file_bronze_cannot_read_stops_the_step_unexpected() {
 
     assert_eq!(report.reason, "BRONZE_READ_FAILED");
     assert_eq!(exit_status(&report), ExitStatus::Unexpected);
+    assert_eq!(exit(&report), 70);
+    assert_eq!(
+        w.stub.requests("GET") + w.stub.requests("POST"),
+        0,
+        "stopped before its first request"
+    );
 }
 
 #[test]
@@ -482,7 +489,7 @@ fn n_items_and_the_token_request_take_at_least_one_interval_each_but_the_first()
 }
 
 #[test]
-fn thousands_of_items_are_fetched_and_written_at_the_rate() {
+fn item_fetch_is_paced_at_50_a_second() {
     let w = World::at("many", START);
     let ids: Vec<u32> = (1..=2_000).collect();
     w.snapshot("2026-11-26T11", &ids);
@@ -568,7 +575,7 @@ fn a_retry_after_of_zero_is_not_a_hot_loop() {
 }
 
 #[test]
-fn an_item_that_meets_a_blip_every_time_gets_three_attempts_then_waits_for_the_next_run() {
+fn item_is_asked_at_most_three_times_in_a_run() {
     for status in [429, 502, 503, 504] {
         let w = World::at(&format!("lasting-{status}"), START);
         w.snapshot("2026-11-26T11", &[10]);
@@ -655,7 +662,7 @@ fn a_failing_low_id_does_not_starve_the_higher_ones_and_the_backoff_resets_on_su
 }
 
 #[test]
-fn a_blip_pauses_the_whole_fetch_not_only_the_item() {
+fn item_blip_pauses_the_whole_fetch_and_sends_the_item_to_the_back() {
     let w = World::at("pause-all", START);
     w.snapshot("2026-11-26T11", &[10, 20]);
     w.stub.token_ok(5);
@@ -705,7 +712,7 @@ fn the_fetch_ends_the_lock_wait_before_the_next_hourly_run() {
 }
 
 #[test]
-fn items_the_end_of_the_fetch_leaves_are_counted_and_no_request_starts_past_it() {
+fn item_fetch_starts_no_request_that_could_end_after_25_past() {
     // The last moment a request can still time out before the fetch ends is
     // 12:24:50: the pacer's 20 ms spacing runs the clock out after three
     // requests, the token's the first.
@@ -765,7 +772,7 @@ fn the_next_hourly_start_is_the_timer_minute_ahead() {
 }
 
 #[test]
-fn a_refused_cached_token_is_replaced_once_and_the_item_asked_again() {
+fn item_lookup_401_takes_a_new_token_once_and_asks_again() {
     let w = World::at("401", START);
     w.snapshot("2026-11-26T11", &[10, 20]);
     cache_token(&w.config.data_dir, "tok-stale", "2026-11-27T11:36:00Z");
@@ -828,7 +835,7 @@ fn a_token_endpoint_that_refuses_the_secret_leaves_every_item_for_the_next_run()
 }
 
 #[test]
-fn a_cached_token_refused_and_the_new_one_refused_too_is_the_client_secret() {
+fn item_lookup_refused_new_token_exits_3_and_is_fetched_next_run() {
     let w = World::at("401-both", START);
     w.snapshot("2026-11-26T11", &[10, 20]);
     cache_token(&w.config.data_dir, "tok-stale", "2026-11-27T11:36:00Z");
@@ -859,7 +866,7 @@ fn a_cached_token_refused_and_the_new_one_refused_too_is_the_client_secret() {
 }
 
 #[test]
-fn a_404_is_recorded_with_no_body_logged_as_a_warning_and_is_exit_0() {
+fn item_404_is_recorded_with_its_status_and_logged_as_a_warning() {
     let w = World::at("404", START);
     w.snapshot("2026-11-26T11", &[10, 20]);
     w.stub.token_ok(5);
@@ -895,10 +902,11 @@ fn a_404_beside_a_failure_is_still_written_and_the_step_exits_3() {
 }
 
 #[test]
-fn a_status_that_waits_for_the_next_run_is_one_error_per_item_with_its_type() {
+fn item_lookup_400_403_408_500_or_unreadable_is_fetched_next_run() {
     for (status, error_type) in [
         (400, ErrorType::Unexpected),
         (403, ErrorType::TechnicalFundamental),
+        (408, ErrorType::Unexpected),
         (500, ErrorType::Unexpected),
         (418, ErrorType::Unexpected),
     ] {
@@ -926,6 +934,36 @@ fn a_status_that_waits_for_the_next_run_is_one_error_per_item_with_its_type() {
             [20]
         );
     }
+}
+
+#[test]
+fn failed_item_lookup_exits_3_and_is_retried_next_run() {
+    // C6, X5: a lookup that failed gives exit 3 and no response; the item has
+    // none, so the next run asks for it again, and for no other.
+    let w = World::at("retried", START);
+    w.snapshot("2026-11-26T11", &[10, 20]);
+    w.stub.token_ok(5);
+    w.stub.item_ok(10);
+    w.stub.item_answer(20, ResponseTemplate::new(500), 1);
+    w.stub.item_ok(20);
+
+    let first = w.go();
+
+    assert_eq!(exit(&first), 3, "{first:?}");
+    assert_eq!(w.item_files().len(), 1);
+    assert_eq!(w.stub.item_requests(20), 1);
+    w.clock.sleep(Duration::from_secs(3600));
+
+    let second = w.go();
+
+    assert_eq!(exit(&second), 0, "{second:?}");
+    assert_eq!(w.stub.item_requests(20), 2, "asked again");
+    assert_eq!(
+        w.stub.item_requests(10),
+        1,
+        "the item with a response is not"
+    );
+    assert_eq!(w.item_files().len(), 2);
 }
 
 #[test]

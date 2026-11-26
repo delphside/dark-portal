@@ -185,11 +185,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn purchase_price_is_kept_as_blizzard_gives_it_and_vendor_sells_is_unknown() {
-        // D23.1, D23.2: present as given, 0 kept as 0, null only where the
-        // body lacks it; nothing fills `vendor_sells`.
-        let w = World::new("ref-buy");
+    /// Three items' bodies in one file: the purchase price absent, 0 and 55.
+    fn three_purchase_prices(name: &str) -> Vec<Reference> {
+        let w = World::new(name);
         let none = body("Linen Cloth", "Tradeskill", "Cloth", 13, None);
         let zero = body("Wool Cloth", "Tradeskill", "Cloth", 25, Some(0));
         let some_price = body("Linen Cloth", "Tradeskill", "Cloth", 5, Some(55));
@@ -202,17 +200,61 @@ mod tests {
                 (3, "2026-11-20 10:00:00+00", 200, Some(&some_price)),
             ],
         );
-        let (rows, _) = rebuilt(&w);
+        rebuilt(&w).0
+    }
+
+    #[test]
+    fn purchase_price_is_kept_as_blizzard_gives_it() {
+        // D23.1: present as given.
+        let rows = three_purchase_prices("ref-buy");
+        assert_eq!(rows[2].5, Some(55));
+    }
+
+    #[test]
+    fn purchase_price_zero_is_kept_as_zero() {
+        // D23.1: a 0 is a price, not an absence.
+        let rows = three_purchase_prices("ref-buy-zero");
+        assert_eq!(rows[1].5, Some(0));
+    }
+
+    #[test]
+    fn purchase_price_is_null_only_where_the_body_lacks_it() {
+        // D23.1: the item whose body has none is the only null.
+        let rows = three_purchase_prices("ref-buy-null");
         assert_eq!(
             rows.iter().map(|r| r.5).collect::<Vec<_>>(),
             [None, Some(0), Some(55)]
         );
+    }
+
+    #[test]
+    fn vendor_sells_is_null_for_every_item() {
+        // D23.2, G35: nothing fills `vendor_sells` until its setter is built.
+        let rows = three_purchase_prices("ref-vendor-sells");
+        assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|r| r.6.is_none()));
     }
 
     #[test]
-    fn a_body_that_lacks_a_field_gives_null_and_a_sell_price_of_nothing() {
-        let w = World::new("ref-sparse");
+    fn name_class_and_subclass_are_null_where_the_body_lacks_them() {
+        let w = World::new("ref-sparse-names");
+        item_file(
+            &w,
+            "2026-11-20T100000",
+            &[(
+                9,
+                "2026-11-20 10:00:00+00",
+                200,
+                Some(r#"{"id":9,"sell_price":7}"#),
+            )],
+        );
+        let (rows, _) = rebuilt(&w);
+        assert_eq!(rows, [(9, None, None, None, 7, None, None)]);
+    }
+
+    #[test]
+    fn vendor_sell_price_is_zero_where_the_body_gives_none() {
+        let w = World::new("ref-sparse-sell");
         item_file(
             &w,
             "2026-11-20T100000",
@@ -228,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn the_latest_200_response_wins() {
+    fn latest_200_item_response_wins_in_reference() {
         let w = World::new("ref-latest");
         let old = body("Old Name", "Consumable", "Potion", 100, None);
         let new = body("New Name", "Consumable", "Elixir", 120, Some(900));
@@ -298,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn an_item_that_answered_200_and_then_404_keeps_the_200() {
+    fn reference_keeps_the_200_after_a_later_404() {
         let w = World::new("ref-200-404");
         let good = body("Kept", "Consumable", "Potion", 10, None);
         item_file(
@@ -317,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn an_item_with_only_404s_has_no_row() {
+    fn reference_item_with_only_404s_has_no_row() {
         let w = World::new("ref-404");
         item_file(
             &w,
@@ -377,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rebuild_that_finds_nothing_new_writes_nothing() {
+    fn reference_rebuild_writes_nothing_where_the_table_is_equal() {
         let w = World::new("ref-same");
         let good = body("Same", "Consumable", "Potion", 10, None);
         item_file(
@@ -460,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_item_file_fails_the_step_and_not_the_hours() {
+    fn bad_item_file_fails_the_reference_step_and_not_an_hour() {
         let w = World::new("ref-bad");
         w.snapshot(10, &[l(1, 100, 1)]);
         let dir = w.config.data_dir.join("bronze/items");

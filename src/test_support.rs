@@ -18,17 +18,23 @@ impl io::Write for Logged {
     }
 }
 
-/// Runs `f` and gives what it logged.
-pub(crate) fn logging<T>(f: impl FnOnce() -> T) -> (T, String) {
-    // `tracing` caches whether a log call has a listener. A test that logs
-    // with none listening would turn the call off for the tests that capture
-    // it, so a global listener that discards everything keeps every call on.
+/// Keeps every log call switched on for the process: `tracing` caches whether
+/// a log call has a listener, and a test that logs with none listening would
+/// turn the call off for the tests that capture it. A global listener that
+/// discards everything keeps every call on. Every test that captures logs calls it
+/// first ([`logging`] does), as do the collect and items worlds.
+pub(crate) fn listening() {
     static LISTENER: std::sync::Once = std::sync::Once::new();
     LISTENER.call_once(|| {
         let _ = tracing::subscriber::set_global_default(
             tracing_subscriber::fmt().with_writer(io::sink).finish(),
         );
     });
+}
+
+/// Runs `f` and gives what it logged.
+pub(crate) fn logging<T>(f: impl FnOnce() -> T) -> (T, String) {
+    listening();
     let log = Logged(Arc::default());
     let writer = log.clone();
     let subscriber = tracing_subscriber::fmt()

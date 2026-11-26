@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn two_lakes_of_one_process_spill_apart_and_each_folder_goes_with_its_lake() {
+    fn each_duckdb_connection_spills_to_its_own_folder_removed_at_close() {
         let root = scratch("spill-drop");
         let a = Lake::open(&Backend::PlainFile(root.join("a.duckdb")), &root).unwrap();
         let b = Lake::open(&Backend::PlainFile(root.join("b.duckdb")), &root).unwrap();

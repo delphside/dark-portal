@@ -173,6 +173,14 @@ impl Blizzard {
         }
     }
 
+    /// The time each kind of request is given in all, as the agents hold it:
+    /// the snapshot's, then the others'.
+    #[cfg(test)]
+    pub(crate) fn timeouts_held(&self) -> (Option<Duration>, Option<Duration>) {
+        let held = |agent: &Agent| agent.config().timeouts().global;
+        (held(&self.snapshot_agent), held(&self.other_agent))
+    }
+
     /// Takes a token by the client-credentials grant. A refusal (401) is the
     /// wrong client secret: *technical, fundamental*.
     pub fn token(

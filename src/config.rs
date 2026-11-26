@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_absent_bucket_is_none() {
+    fn daily_bucket_access_file_is_read_only_where_a_bucket_is_set() {
         let dir = temp_dir("bucket");
         let mut v = vars(&secret_file(&dir));
         v.insert("DP_BUCKET".into(), String::new());
@@ -238,6 +238,12 @@ mod tests {
         assert_eq!((config.bucket, config.bucket_access), (None, None));
         v.remove("DP_BUCKET");
         assert_eq!(read(&v).unwrap().bucket, None);
+        // Unread with no bucket: a file that is not there is no error.
+        v.insert("DP_BUCKET_ACCESS_FILE".into(), "/nonexistent/access".into());
+        let config = read(&v).unwrap();
+        assert_eq!((config.bucket, config.bucket_access), (None, None));
+        v.insert("DP_BUCKET".into(), String::new());
+        assert!(read(&v).unwrap().bucket_access.is_none());
     }
 
     #[test]

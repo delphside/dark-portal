@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fatal_with_no_type_is_unexpected() {
+    fn unexpected_error_exits_70() {
         let mut report = Report::fatal(ErrorType::Business, "X", "x");
         report.error_type = None;
         assert_eq!(status(report), 70);

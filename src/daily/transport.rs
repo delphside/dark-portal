@@ -41,9 +41,14 @@ pub(crate) const ACCESS_REFUSED: &str = "BUCKET_ACCESS_REFUSED";
 /// The transport for the configured bucket: `None` where the environment has
 /// none.
 pub(crate) fn from_config(config: &Config) -> Option<Box<dyn Transport>> {
+    Some(Box::new(par_from_config(config)?))
+}
+
+/// The configured bucket's transport, as the [`Par`] it is.
+fn par_from_config(config: &Config) -> Option<Par> {
     config.bucket.as_ref()?;
     let access = config.bucket_access.clone()?;
-    Some(Box::new(Par::new(access, BUCKET_PUSH_TIMEOUT)))
+    Some(Par::new(access, BUCKET_PUSH_TIMEOUT))
 }
 
 /// `PUT` to a pre-authenticated request URL.
@@ -64,6 +69,12 @@ impl Par {
                 .build()
                 .into(),
         }
+    }
+
+    /// The time each request is given in all, as the agent holds it.
+    #[cfg(test)]
+    fn timeout(&self) -> Option<Duration> {
+        self.agent.config().timeouts().global
     }
 
     fn url(&self, object: &str) -> String {
@@ -361,6 +372,24 @@ mod tests {
         let report = refused(slow.put("a.parquet", &file("slow", b"x")).unwrap_err());
         assert_eq!(report.reason, "BUCKET_TIMEOUT");
         assert!(!format!("{report:?}").contains(TOKEN));
+    }
+
+    #[test]
+    fn daily_push_upload_is_bounded_at_5_minutes() {
+        // K5, 5.4.1: a request, its upload included, is cut off after the
+        // setting, 5 minutes, which the transport of a configured bucket is
+        // built with: its agent holds that timeout. That a request over its
+        // timeout is cut off is shown by
+        // `a_bucket_that_cannot_be_reached_or_is_too_slow_is_a_blip`, with a
+        // short one, as 5 minutes cannot be waited for.
+        assert_eq!(BUCKET_PUSH_TIMEOUT, Duration::from_secs(300));
+        let mut config = crate::transform::test_support::World::new("transport-timeout")
+            .config
+            .clone();
+        config.bucket = Some("bucket".to_owned());
+        config.bucket_access = Some(Secret::new("https://x.invalid/p/t/o/"));
+        let par = par_from_config(&config).unwrap();
+        assert_eq!(par.timeout(), Some(Duration::from_secs(300)));
     }
 
     #[test]

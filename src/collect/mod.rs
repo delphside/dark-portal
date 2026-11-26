@@ -191,9 +191,14 @@ fn collect(
     before_lock();
     // The pivot: the lock is held from the rename, and released where the run
     // ends, or kept by the caller.
-    *kept = Some(lock::acquire(&config.lock_file, LOCK_WAIT, clock).map_err(unwrap_stop)?);
-    if file.exists() {
+    let taken = lock::acquire(&config.lock_file, LOCK_WAIT, clock);
+    // The file is this run's own and is not the hour's yet: where the lock is
+    // not had, or the hour is collected, it goes (X6).
+    if taken.is_err() || file.exists() {
         let _ = std::fs::remove_file(&temporary);
+    }
+    *kept = Some(taken.map_err(unwrap_stop)?);
+    if file.exists() {
         return Ok(done("already collected"));
     }
     if !written {

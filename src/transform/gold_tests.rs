@@ -126,7 +126,7 @@ fn sold_estimate_is_the_floor_plus_units_gone_from_the_front() {
 }
 
 #[test]
-fn the_sold_floor_stays_within_the_estimate_across_a_busy_run() {
+fn sold_floor_never_exceeds_sold_estimate() {
     // TD-A's and TD-B's hours and a posting in one world, item by item.
     let w = World::new("gold-floor");
     let lake = run(
@@ -183,7 +183,7 @@ fn sold_out_item_has_an_hour_row_with_no_lowest_and_its_flows() {
 }
 
 #[test]
-fn the_first_hour_collected_has_prices_and_depth_and_null_flows_and_span() {
+fn first_hour_is_held_with_prices_and_depth_and_null_flows_and_span() {
     // TD-F's first hour: lowest 90, 15 units in 5 listings, flows and span
     // null.
     let w = World::new("gold-td-f");
@@ -247,7 +247,7 @@ fn the_hour_after_the_first_has_its_flows_and_the_span_of_one() {
 }
 
 #[test]
-fn a_missed_hour_has_no_item_hour_rather_than_zeros_and_the_next_carries_the_span() {
+fn missed_hour_has_no_item_hour_rather_than_zeros() {
     // TD-G's shape: h10 held, h11 and h12 missed, h13 held with span 3. The
     // listing posted at h13 is dated h13; the flows are those of the span.
     let w = World::new("gold-gap");
@@ -274,7 +274,7 @@ fn a_missed_hour_has_no_item_hour_rather_than_zeros_and_the_next_carries_the_spa
 }
 
 #[test]
-fn a_listing_posted_and_bought_between_snapshots_shows_in_no_flow() {
+fn listing_posted_and_bought_between_snapshots_shows_in_no_flow() {
     // A listing posted and bought between h10 and h11 is in neither snapshot,
     // so it has no event, and no flow counts it: both hours show the same.
     let w = World::new("gold-missed-sale");
@@ -375,7 +375,7 @@ fn a_failed_hour_leaves_no_gold_and_the_next_run_writes_it() {
 }
 
 #[test]
-fn a_rebuild_from_the_first_bronze_hour_gives_the_same_gold() {
+fn rebuild_from_the_first_bronze_hour_equals_the_incremental_run() {
     // L4: one run over all the hours, and a run per hour, give the same gold
     // (`dump` holds gold and reference).
     let hours = [
@@ -462,4 +462,26 @@ fn gold_agrees_with_silver_and_with_itself_across_a_busy_run() {
         .map(|g| (g.item, g.units_listed))
         .collect();
     assert_eq!(last, live);
+}
+
+#[test]
+fn lowest_is_the_cheapest_unit_price_in_the_latest_snapshot() {
+    // P2: the cheapest listing is neither the first nor the newest ID; once it
+    // is gone, the next snapshot's lowest is the cheapest of what it shows.
+    let w = World::new("gold-lowest");
+    let lake = run(
+        &w,
+        &[
+            (
+                9,
+                with_anchor(vec![l(1, 120, 2), l(2, 100, 1), l(3, 110, 4)]),
+            ),
+            (10, with_anchor(vec![l(1, 120, 2), l(3, 110, 4)])),
+        ],
+    );
+    let lowest: Vec<Option<u64>> = of_item(item_hours(&lake), 1)
+        .iter()
+        .map(|g| g.lowest)
+        .collect();
+    assert_eq!(lowest, [Some(100), Some(110)]);
 }

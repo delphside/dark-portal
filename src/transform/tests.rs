@@ -12,8 +12,10 @@ use std::time::Duration as StdDuration;
 use super::test_support::*;
 use super::*;
 use crate::collect::Clock;
+use crate::collect::clock::FakeClock;
 use crate::collect::lock;
 use crate::error::{ExitStatus, exit_status};
+use crate::test_support::logging;
 use crate::transform::{hour, vocabulary};
 use crate::types::{
     AuctionId, Copper, Duration, Event, EventKind, ListingRecord, Outcome as Result_, QueuePlace,
@@ -234,25 +236,29 @@ fn new_id_above_highest_live_id_is_no_warning_even_below_one_ended() {
     assert_eq!(find(&events_at(&lake, 11), 107, EventKind::Posted).units, 1);
 }
 
-#[test]
-fn ended_id_reappearing_is_logged_and_left_out() {
-    // TD-D4: 104 ended; at the next hour the snapshot holds it again.
-    let w = World::new("reappear");
+/// TD-D4: 104 ended; at the next hour the snapshot holds it again, with a new
+/// 105 behind both. Gives the world, the records before that hour and what
+/// the hour did.
+fn reappeared(name: &str) -> (World, Vec<ListingRecord>, Outcome) {
+    let w = World::new(name);
     w.snapshot(8, &[anchor()]);
     w.snapshot(9, &with_anchor(vec![l(103, 110, 4), l(104, 120, 2)]));
     w.snapshot(10, &with_anchor(vec![l(103, 110, 4)]));
     assert!(w.process().failure.is_none());
     let before = records(&w.open());
     assert_eq!(before.len(), 1);
-
-    // 105 is new, behind both: 104 is left out of the queue, so 105 is
-    // second, with 103's 4 units ahead of it and not 104's 2 as well.
     w.snapshot(
         11,
         &with_anchor(vec![l(103, 110, 4), l(104, 120, 2), l(105, 130, 1)]),
     );
     let outcome = w.process();
     assert!(outcome.failure.is_none());
+    (w, before, outcome)
+}
+
+#[test]
+fn ended_id_reappearing_is_logged_and_left_out() {
+    let (w, before, outcome) = reappeared("reappear");
     assert_eq!(outcome.warnings, [(HourWarning::IdReappeared, 104)]);
     let lake = w.open();
     assert_eq!(
@@ -263,9 +269,30 @@ fn ended_id_reappearing_is_logged_and_left_out() {
         [105]
     );
     assert_eq!(live_ids(&lake), [50, 103, 105]);
+    assert!(history(&lake, 104).is_empty());
     assert_eq!(records(&lake), before);
+}
+
+#[test]
+fn reappearing_id_above_the_highest_live_id_is_logged_and_left_out() {
+    // EV-1: 104 ended; the live IDs are 50 and 103, so 104 is above the
+    // highest live ID. It is logged by name, and no event, live row or history
+    // row is made for it.
+    let (w, _, outcome) = reappeared("reappear-above");
+    assert_eq!(outcome.warnings, [(HourWarning::IdReappeared, 104)]);
+    let lake = w.open();
+    assert!(!live_ids(&lake).contains(&104));
+    assert!(events_at(&lake, 11).iter().all(|e| e.id.0 != 104));
+    assert!(history(&lake, 104).is_empty());
+}
+
+#[test]
+fn reappearing_id_takes_no_place_in_any_queue() {
+    // 105 is behind both: 104 is left out of the queue, so 105 is second,
+    // with 103's 4 units ahead of it and not 104's 2 as well.
+    let (w, _, _) = reappeared("reappear-queue");
     assert_eq!(
-        history(&lake, 105),
+        history(&w.open(), 105),
         [(h(11), 1, "LONG".to_owned(), 2, 4, 5)]
     );
 }
@@ -777,7 +804,7 @@ fn ended_listing_writes_its_record_and_removes_its_live_rows() {
 }
 
 #[test]
-fn partial_sales_over_a_life_add_up_in_the_record() {
+fn listing_record_counts_units_sold_over_its_life() {
     // Item 1: 20 sells 4, then 3, from the front, then the rest: sold 10.
     // Item 2: 40 behind the intact 30 sells 4, then 3, then is cancelled: sold 7.
     let w = World::new("lifetime-sales");
@@ -808,7 +835,7 @@ fn partial_sales_over_a_life_add_up_in_the_record() {
 }
 
 #[test]
-fn a_listing_end_counts_the_units_undercut_since_it_was_listed() {
+fn undercut_counts_higher_ids_at_a_lower_price_still_listed() {
     // TD-H2: 702 at 150 ends; 708 (145), 710 (140) and 711 (130) have higher
     // IDs and lower prices: 1 + 5 + 2 = 8. 700 at 100 has a lower ID.
     let w = World::new("undercut");
@@ -1037,7 +1064,7 @@ fn events_after_missed_hours_are_dated_to_the_current_hour_with_their_span() {
 // ------------------------------------------------ G7: where 5.2.2 is silent
 
 #[test]
-fn a_quantity_rise_is_kept_with_no_event_and_a_warning() {
+fn quantity_rise_on_a_live_id_is_intact_with_no_event_and_a_warning() {
     let w = World::new("g7-rise");
     w.snapshot(9, &[l(1, 100, 3), l(2, 200, 4)]);
     w.snapshot(10, &[l(1, 100, 5), l(2, 200, 4)]);
@@ -1066,7 +1093,7 @@ fn a_listing_whose_quantity_rose_counts_as_intact_for_the_front() {
 }
 
 #[test]
-fn a_listing_that_rose_and_sold_counts_the_drops_and_what_it_then_held() {
+fn units_sold_of_a_raised_listing_can_exceed_its_first_quantity() {
     let w = World::new("g7-sold");
     w.snapshot(9, &[l(1, 100, 3)]);
     w.snapshot(10, &[l(1, 100, 5)]);
@@ -1077,7 +1104,7 @@ fn a_listing_that_rose_and_sold_counts_the_drops_and_what_it_then_held() {
 }
 
 #[test]
-fn a_price_change_is_kept_with_no_event_and_a_warning() {
+fn price_change_on_a_live_id_is_kept_with_no_event_and_a_warning() {
     let w = World::new("g7-price");
     w.snapshot(9, &[l(1, 100, 3)]);
     w.snapshot(10, &[l(1, 120, 3)]);
@@ -1183,7 +1210,7 @@ fn a_run_per_hour_gives_the_same_silver_as_one_run_over_all_of_them() {
 // ----------------------------------------------------------------- failure
 
 #[test]
-fn failed_transform_hour_rolls_back_whole_and_the_next_run_reprocesses_it() {
+fn next_run_reprocesses_a_failed_hour() {
     for step in [
         Step::Compare,
         Step::Events,
@@ -1289,7 +1316,7 @@ fn a_failed_hour_keeps_the_hours_before_it_and_stops() {
 }
 
 #[test]
-fn a_corrupt_bronze_hour_stops_the_run_unexpected_and_the_next_run_repairs_it() {
+fn unreadable_bronze_hour_stops_the_transform_with_exit_70() {
     let w = World::new("corrupt");
     w.snapshot(10, &[l(1, 100, 1)]);
     w.snapshot(11, &[l(1, 100, 1)]);
@@ -1361,7 +1388,7 @@ fn a_null_in_any_bronze_column_is_refused() {
 }
 
 #[test]
-fn a_file_of_another_hour_than_its_name_is_refused() {
+fn invalid_bronze_hour_stops_the_transform_with_exit_70_keeping_earlier_hours() {
     let w = World::new("invalid-hour");
     w.snapshot(10, &[l(1, 100, 1)]);
     std::fs::copy(
@@ -1371,6 +1398,7 @@ fn a_file_of_another_hour_than_its_name_is_refused() {
     .unwrap();
     let report = w.run();
     assert_eq!(report.reason, "BRONZE_HOUR_INVALID");
+    assert_eq!(exit_status(&report), ExitStatus::Unexpected);
     assert_eq!(report.metadata["hour"], "2026-11-20T11");
     assert_eq!(report.metadata["rows_of_another_hour"], "1");
     assert_eq!(
@@ -1457,6 +1485,41 @@ fn a_lock_held_past_the_wait_stops_the_run_with_a_blip_and_changes_nothing() {
     );
 }
 
+/// A clock that lets go of the lock it was given the first time it waits.
+struct ReleasesOnWait {
+    inner: FakeClock,
+    held: std::cell::RefCell<Option<lock::Lock>>,
+}
+
+impl Clock for ReleasesOnWait {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: StdDuration) {
+        self.held.borrow_mut().take();
+        self.inner.sleep(duration);
+    }
+}
+
+#[test]
+fn persons_transform_waits_for_the_hourly_runs_lock() {
+    // H1: a person runs `dp transform` while the hourly run holds the lock; it
+    // waits for it and, once it is let go inside the lock wait, runs.
+    let w = World::new("lock-waits");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let inner = FakeClock::at("2026-11-26T11:40:00Z");
+    let held = lock::acquire(&w.config.lock_file, StdDuration::ZERO, &inner).unwrap();
+    let clock = ReleasesOnWait {
+        inner,
+        held: std::cell::RefCell::new(Some(held)),
+    };
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(clock.inner.slept().len(), 1, "it waited once for the lock");
+    assert_eq!(processed(&w.open()), [(h(10), None)]);
+}
+
 // ------------------------------------------------------------------- bound
 
 /// The hours that took longer than the bound, where the one hour's Apply step
@@ -1493,28 +1556,53 @@ fn an_hour_that_took_over_5_minutes_is_over_the_bound() {
 }
 
 #[test]
-fn an_hour_that_took_5_minutes_or_less_is_not_over_the_bound() {
+fn hour_processed_in_5_minutes_or_less_logs_no_warning() {
     assert!(over_bound_after(300, "bound-exact").is_empty());
     assert!(over_bound_after(0, "bound-none").is_empty());
+    // Run for real, exactly the bound is no warning and no count.
+    let w = World::new("bound-exact-run");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let (report, text) = logging(|| {
+        run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+            if at == Step::Apply {
+                w.clock.sleep(StdDuration::from_secs(300));
+            }
+            Ok(())
+        })
+    });
+    assert_eq!(report.outcome, Severity::Ok);
+    assert_eq!(report.metadata["hours_over_bound"], "0");
+    assert!(!text.contains("HOUR_OVER_BOUND"), "{text}");
 }
 
 #[test]
-fn a_slow_hour_run_alone_is_judged_over_the_bound_and_the_run_still_completes() {
+fn hour_processed_over_5_minutes_is_logged_as_a_warning() {
     let w = World::new("bound-run");
     w.snapshot(10, &[l(1, 100, 1)]);
-    let report = run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
-        if at == Step::Apply {
-            w.clock.sleep(StdDuration::from_secs(301));
-        }
-        Ok(())
+    let (report, text) = logging(|| {
+        run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+            if at == Step::Apply {
+                w.clock.sleep(StdDuration::from_secs(301));
+            }
+            Ok(())
+        })
     });
     assert_eq!(report.outcome, Severity::Ok);
     assert_eq!(report.metadata["hours_over_bound"], "1");
     assert_eq!(exit_status(&report), ExitStatus::Completed);
+    let warning = text
+        .lines()
+        .find(|line| line.contains("HOUR_OVER_BOUND"))
+        .unwrap_or_else(|| panic!("the warning is logged: {text}"));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(
+        warning.contains("2026-11-20T10"),
+        "it names the hour: {warning}"
+    );
 }
 
 #[test]
-fn the_time_to_open_the_lake_counts_against_the_hour_it_then_processes() {
+fn transform_run_alone_counts_its_own_time_against_the_bound() {
     // H10, TT3: the hour's own steps take no time; opening and migrating the
     // lake, which no hook reaches, takes 301 s, and the run is shared out to
     // the hour.
@@ -1797,4 +1885,86 @@ fn latest_hour_not_yet_collected_is_no_gap() {
         recorded,
         found_at.format("%Y-%m-%d %H:%M:%S+00").to_string()
     );
+}
+
+#[test]
+fn sold_event_carries_the_quantity_last_seen() {
+    // EV-3: 1 is listed with 5, drops to 3 and is then gone from the front: the
+    // sale is of the 3 it had when last seen, not the 5 it began with, and
+    // its record counts the 2 sold before and the 3 after.
+    let w = World::new("sold-last-seen");
+    w.snapshot(9, &[l(1, 100, 5), l(2, 200, 1)]);
+    w.snapshot(10, &[l(1, 100, 3), l(2, 200, 1)]);
+    w.snapshot(11, &[l(2, 200, 1)]);
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let sold = find(&events_at(&lake, 11), 1, EventKind::Sold);
+    assert_eq!((sold.units, sold.tier), (3, Tier::Inferred));
+    assert_eq!(record(&lake, 1).units_sold, 5);
+}
+
+#[test]
+fn only_an_expired_or_cancelled_event_can_carry_a_tie() {
+    // EV-4: one hour with an event of every kind but expired (which
+    // `a_tie_marks_an_expired_event_too` has). 301 is gone behind the intact 302
+    // at its price and snapshot: a tie. The sale (310), the part sale (312)
+    // and the posting (320) are not.
+    let w = World::new("tie-kinds");
+    w.snapshot(9, &[anchor()]);
+    w.snapshot(
+        10,
+        &with_anchor(vec![
+            l(301, 200, 1),
+            l(302, 200, 1),
+            l(310, 100, 2),
+            l(312, 400, 3),
+        ]),
+    );
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(302, 200, 1), l(312, 400, 2), l(320, 300, 1)]),
+    );
+    assert!(w.process().failure.is_none());
+    let at_11 = events_at(&w.open(), 11);
+    for (id, kind) in [
+        (301, EventKind::Cancelled),
+        (310, EventKind::Sold),
+        (312, EventKind::PartlySold),
+        (320, EventKind::Posted),
+    ] {
+        let event = find(&at_11, id, kind);
+        assert_eq!(event.tie, id == 301, "{event:?}");
+    }
+    assert!(
+        at_11
+            .iter()
+            .all(|e| !e.tie || matches!(e.kind, EventKind::Expired | EventKind::Cancelled)),
+        "{at_11:?}"
+    );
+}
+
+#[test]
+fn gap_is_written_in_the_later_hours_transaction() {
+    // H3: h11 is missing between the snapshots h10 and h12; the gap is found
+    // in h12's transaction, so h12 failing leaves no gap and the next run
+    // finds it.
+    let w = World::new("gap-transaction");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    assert!(w.process().failure.is_none());
+    w.snapshot(12, &[l(1, 100, 1)]);
+    let report = run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+        if at == Step::Meta {
+            Err(Failure::unexpected("INJECTED", "A failure mid-hour."))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(report.reason, "INJECTED");
+    assert_eq!(gaps(&w.open()), Vec::<Hour>::new());
+    assert_eq!(report.metadata["hours_processed"], "0");
+
+    let report = w.run();
+    assert_eq!(report.outcome, Severity::Ok, "{report:#?}");
+    assert_eq!(gaps(&w.open()), [h(11)]);
+    assert_eq!(processed(&w.open()).len(), 2);
 }

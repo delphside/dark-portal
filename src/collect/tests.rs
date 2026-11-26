@@ -74,6 +74,7 @@ struct World {
 impl World {
     /// A run started at `start`, with an empty data folder.
     fn at(name: &str, start: &str) -> World {
+        crate::test_support::listening();
         let dir = std::env::temp_dir().join(format!("dp-collect-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -151,7 +152,7 @@ const LM_13: &str = "2026-11-26T13:31:40Z";
 // Step 1 and the current hour
 
 #[test]
-fn the_hour_is_collected_into_its_file_and_exits_0() {
+fn snapshot_lands_in_its_hours_bronze_file_by_rename() {
     let w = World::at("happy", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_11, 5);
@@ -167,7 +168,7 @@ fn the_hour_is_collected_into_its_file_and_exits_0() {
 }
 
 #[test]
-fn a_run_delayed_to_11_10_takes_hour_10() {
+fn run_inside_the_previous_hours_retry_window_collects_that_hour() {
     let w = World::at("delayed", "2026-11-26T11:10:00Z");
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_10, 5);
@@ -180,7 +181,7 @@ fn a_run_delayed_to_11_10_takes_hour_10() {
 }
 
 #[test]
-fn a_run_in_a_collected_hour_exits_0_and_asks_blizzard_nothing() {
+fn collect_in_a_collected_hour_exits_0_without_a_request() {
     let w = World::at("rerun", AT_1135);
     fs::create_dir_all(bronze_dir(&w.config.data_dir)).unwrap();
     fs::write(w.bronze("2026-11-26T11.parquet"), "already here").unwrap();
@@ -324,7 +325,7 @@ fn the_token_is_cached_mode_0600_and_basic_auth_carries_the_client() {
 }
 
 #[test]
-fn a_cached_token_with_more_than_the_margin_left_is_reused() {
+fn cached_token_is_reused_with_more_than_the_margin_left() {
     let w = World::at("reuse", AT_1135);
     w.cache_token("tok-cached", "2026-11-26T12:36:00Z"); // 1 h 1 min left
     w.stub.snapshot("tok-cached", LM_11, 5);
@@ -334,7 +335,7 @@ fn a_cached_token_with_more_than_the_margin_left_is_reused() {
 }
 
 #[test]
-fn a_cached_token_with_the_margin_or_less_left_is_replaced() {
+fn token_is_renewed_at_or_inside_the_margin() {
     let w = World::at("margin", AT_1135);
     w.cache_token("tok-cached", "2026-11-26T12:35:00Z"); // exactly 1 h left
     w.stub.token_ok(5);
@@ -346,7 +347,7 @@ fn a_cached_token_with_the_margin_or_less_left_is_replaced() {
 }
 
 #[test]
-fn a_cached_token_that_is_refused_is_replaced_once() {
+fn cached_token_refused_once_takes_a_new_token() {
     let w = World::at("refused-cached", AT_1135);
     w.cache_token("tok-revoked", "2026-11-27T11:00:00Z");
     w.stub
@@ -360,7 +361,7 @@ fn a_cached_token_that_is_refused_is_replaced_once() {
 }
 
 #[test]
-fn a_new_token_that_is_refused_is_a_fundamental_exit_2() {
+fn refused_client_secret_exits_2() {
     let w = World::at("refused-new", AT_1135);
     w.stub.token_status(401);
 
@@ -412,6 +413,7 @@ impl io::Write for Logged {
 
 #[test]
 fn neither_the_token_nor_the_secret_reaches_the_log_or_a_report() {
+    crate::test_support::listening();
     let log = Logged(Arc::default());
     let writer = log.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -444,7 +446,7 @@ fn neither_the_token_nor_the_secret_reaches_the_log_or_a_report() {
 // last-modified
 
 #[test]
-fn a_snapshot_from_before_the_hour_is_polled_every_poll_interval_until_it_refreshes() {
+fn stale_snapshot_is_polled_every_2_minutes_until_it_refreshes() {
     let w = World::at("poll", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_10, 2);
@@ -456,7 +458,7 @@ fn a_snapshot_from_before_the_hour_is_polled_every_poll_interval_until_it_refres
 }
 
 #[test]
-fn a_snapshot_still_old_when_the_window_closes_is_a_gap_exit_75() {
+fn snapshot_unrefreshed_by_25_past_exits_75_and_writes_nothing() {
     let w = World::at("stuck", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_10, 1000);
@@ -477,7 +479,7 @@ fn a_snapshot_still_old_when_the_window_closes_is_a_gap_exit_75() {
 }
 
 #[test]
-fn a_snapshot_of_the_next_hour_is_a_gap_exit_75_and_is_not_written() {
+fn last_modified_in_the_hour_after_the_current_one_exits_75_as_a_gap() {
     let w = World::at("moved-on", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_12, 5);
@@ -491,7 +493,7 @@ fn a_snapshot_of_the_next_hour_is_a_gap_exit_75_and_is_not_written() {
 }
 
 #[test]
-fn a_snapshot_two_hours_ahead_means_a_wrong_clock_exit_2() {
+fn last_modified_two_or_more_hours_ahead_exits_2() {
     let w = World::at("clock", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_13, 5);
@@ -503,7 +505,7 @@ fn a_snapshot_two_hours_ahead_means_a_wrong_clock_exit_2() {
 }
 
 #[test]
-fn the_hour_edges_of_last_modified_are_exact() {
+fn snapshot_hour_is_the_utc_hour_starting_of_last_modified() {
     // 11:00:00 is in hour 11, collected; 10:59:59 is still hour 10.
     let w = World::at("edge-in", AT_1135);
     w.stub.token_ok(5);
@@ -526,7 +528,7 @@ fn the_hour_edges_of_last_modified_are_exact() {
 // Blips and backoff
 
 #[test]
-fn a_blip_is_retried_with_backoff_doubling_from_30_seconds() {
+fn blip_cleared_by_retry_exits_0_with_a_warning() {
     let w = World::at("backoff", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot_answer(ResponseTemplate::new(503), 3);
@@ -543,7 +545,7 @@ fn a_blip_is_retried_with_backoff_doubling_from_30_seconds() {
 }
 
 #[test]
-fn the_backoff_stops_doubling_at_5_minutes() {
+fn retry_backoff_doubles_from_30_seconds_to_5_minutes() {
     let w = World::at("cap", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot_answer(ResponseTemplate::new(502), 1000);
@@ -567,7 +569,7 @@ fn the_backoff_stops_doubling_at_5_minutes() {
 }
 
 #[test]
-fn a_retry_after_replaces_the_backoff() {
+fn retry_after_is_honoured() {
     let w = World::at("retry-after", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot_answer(
@@ -601,7 +603,7 @@ fn a_retry_after_of_zero_or_a_date_is_not_a_hot_loop() {
 }
 
 #[test]
-fn each_blip_status_that_never_clears_ends_at_75_when_the_window_closes() {
+fn timeout_429_502_503_504_until_25_past_exits_75() {
     for status in [429, 502, 503, 504] {
         let w = World::at(&format!("blip-{status}"), AT_1135);
         w.stub.token_ok(5);
@@ -615,6 +617,24 @@ fn each_blip_status_that_never_clears_ends_at_75_when_the_window_closes() {
         assert_eq!(cause.metadata["http_status"], status.to_string());
         assert_eq!(exit_status(&report), ExitStatus::Blip, "{status}");
     }
+
+    // A request that times out every time is a blip as well.
+    let w = World::at("blip-timeout", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(
+        ResponseTemplate::new(200).set_delay(Duration::from_secs(2)),
+        1000,
+    );
+    let blizzard = Blizzard::with_timeouts(
+        w.stub.endpoints(),
+        Timeouts {
+            snapshot: Duration::from_millis(50),
+            other: Duration::from_secs(10),
+        },
+    );
+    let report = run_with(&w.config, &w.clock, blizzard);
+    assert_eq!(report.reason, "RETRY_WINDOW_CLOSED");
+    assert_eq!(exit_status(&report), ExitStatus::Blip);
 }
 
 #[test]
@@ -662,7 +682,7 @@ fn a_timeout_is_a_blip_retried_and_the_snapshot_timeout_applies() {
 }
 
 #[test]
-fn an_unreachable_blizzard_is_a_blip_and_ends_at_75() {
+fn unreachable_blizzard_is_a_blip() {
     let w = World::at("unreachable", AT_1135);
     let endpoints = Endpoints {
         oauth: "http://127.0.0.1:1".into(),
@@ -695,10 +715,131 @@ fn a_token_endpoint_blip_is_retried_too() {
     assert_eq!(w.clock.slept(), [secs(30)]);
 }
 
+#[test]
+fn snapshot_request_times_out_at_60_seconds_others_at_10() {
+    assert_eq!(Timeouts::SETTINGS.snapshot, secs(60));
+    assert_eq!(Timeouts::SETTINGS.other, secs(10));
+    // `Blizzard::new` gives its agents those settings, the snapshot's the 60 s.
+    let held = Blizzard::new(World::at("timeouts-held", AT_1135).stub.endpoints()).timeouts_held();
+    assert_eq!(held, (Some(secs(60)), Some(secs(10))));
+    // Each timeout is the one of its own requests: the token request is cut at
+    // `other` (a first answer 1 s late is a blip, retried), the snapshot at
+    // `snapshot` (an answer 0.6 s late, past `other`, is read).
+    let w = World::at("timeouts", AT_1135);
+    w.stub.mount(
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+            .up_to_n_times(1),
+    );
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(
+        ResponseTemplate::new(200)
+            .insert_header("last-modified", http_date(LM_11).as_str())
+            .set_body_string(BODY)
+            .set_delay(Duration::from_millis(600)),
+        5,
+    );
+    let blizzard = Blizzard::with_timeouts(
+        w.stub.endpoints(),
+        Timeouts {
+            snapshot: Duration::from_secs(5),
+            other: Duration::from_millis(300),
+        },
+    );
+
+    let report = run_with(&w.config, &w.clock, blizzard);
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    assert_eq!(
+        w.clock.slept(),
+        [secs(30)],
+        "only the token request timed out"
+    );
+    assert_eq!(w.stub.requests("GET"), 1);
+}
+
+#[test]
+fn new_token_refused_after_a_cached_one_exits_2() {
+    // C2, X3: the cached token is refused, a new one is taken, and that one is
+    // refused too: the client secret, exit 2, and no third token.
+    let w = World::at("refused-both", AT_1135);
+    w.cache_token("tok-revoked", "2026-11-27T11:00:00Z");
+    w.stub
+        .snapshot_answer_for("tok-revoked", ResponseTemplate::new(401), 5);
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(ResponseTemplate::new(401), 5);
+
+    let report = w.go();
+
+    assert_eq!(report.reason, "CLIENT_SECRET_REFUSED");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+    assert_eq!(exit(&report), 2);
+    assert_eq!(w.stub.requests("POST"), 1, "a new token is taken once");
+    assert_eq!(
+        w.stub.requests("GET"),
+        2,
+        "the cached token, then the new one"
+    );
+}
+
+/// A clock that lets go of the lock it was given once a wait has taken it
+/// past `after`.
+struct ReleasesOnWait {
+    inner: FakeClock,
+    after: DateTime<Utc>,
+    held: Mutex<Option<lock::Lock>>,
+}
+
+impl Clock for ReleasesOnWait {
+    fn now(&self) -> DateTime<Utc> {
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.inner.sleep(duration);
+        if self.inner.now() > self.after {
+            self.held.lock().unwrap().take();
+        }
+    }
+}
+
+#[test]
+fn current_hour_is_fixed_when_collect_starts() {
+    // C0: started at 11:24:58 the current hour is 10 (hour 11 begins at 11:25).
+    // Another run holds the lock when the file is written and lets go only
+    // after the lock wait has taken the clock past 11:25, still inside hour
+    // 10's retry window (which closes at 12:25).
+    // The file is still hour 10's, which a run that read the hour again after
+    // the wait would not write.
+    let w = World::at("fixed", "2026-11-26T11:24:58Z");
+    w.stub.token_ok(5);
+    w.stub.snapshot(TOKEN, LM_10, 5);
+    let inner = FakeClock::at("2026-11-26T11:24:58Z");
+    let held = lock::acquire(&w.config.lock_file, Duration::ZERO, &inner).unwrap();
+    let clock = ReleasesOnWait {
+        inner,
+        after: "2026-11-26T11:25:00Z".parse().unwrap(),
+        held: Mutex::new(Some(held)),
+    };
+
+    let report = run_with(&w.config, &clock, Blizzard::new(w.stub.endpoints()));
+
+    assert_eq!(exit(&report), 0, "{report:?}");
+    let slept = clock.inner.slept();
+    assert!(!slept.is_empty(), "it waited for the lock");
+    assert!(
+        clock.now() > "2026-11-26T11:25:00Z".parse::<DateTime<Utc>>().unwrap(),
+        "the wait took the clock past 11:25"
+    );
+    assert!(w.bronze("2026-11-26T10.parquet").exists());
+    assert!(!w.bronze("2026-11-26T11.parquet").exists());
+}
+
 // Fundamental and unexpected
 
 #[test]
-fn a_403_or_404_is_fundamental_exit_2() {
+fn snapshot_403_or_404_exits_2() {
     for status in [403, 404] {
         let w = World::at(&format!("fund-{status}"), AT_1135);
         w.stub.token_ok(5);
@@ -713,19 +854,44 @@ fn a_403_or_404_is_fundamental_exit_2() {
     }
 }
 
+/// A run whose snapshot request is answered `status` every time.
+fn answered(name: &str, status: u16) -> (World, Report) {
+    let w = World::at(&format!("{name}-{status}"), AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot_answer(ResponseTemplate::new(status), 5);
+    let report = w.go();
+    (w, report)
+}
+
+fn assert_unexpected_status(report: &Report, status: u16) {
+    assert_eq!(report.reason, "BLIZZARD_UNEXPECTED_STATUS", "{status}");
+    assert_eq!(report.metadata["http_status"], status.to_string());
+    assert_eq!(exit_status(report), ExitStatus::Unexpected, "{status}");
+}
+
 #[test]
-fn a_400_a_408_a_500_or_another_status_is_unexpected_exit_70() {
-    for status in [400, 408, 500, 418] {
-        let w = World::at(&format!("unexp-{status}"), AT_1135);
-        w.stub.token_ok(5);
-        w.stub.snapshot_answer(ResponseTemplate::new(status), 5);
-
-        let report = w.go();
-
-        assert_eq!(report.reason, "BLIZZARD_UNEXPECTED_STATUS", "{status}");
-        assert_eq!(report.metadata["http_status"], status.to_string());
-        assert_eq!(exit_status(&report), ExitStatus::Unexpected, "{status}");
+fn snapshot_400_or_an_unlisted_status_exits_70() {
+    for status in [400, 418] {
+        let (_, report) = answered("unexp", status);
+        assert_unexpected_status(&report, status);
     }
+}
+
+#[test]
+fn status_408_is_unexpected_and_not_a_blip() {
+    let (w, report) = answered("unexp", 408);
+    assert_unexpected_status(&report, 408);
+    assert_eq!(w.stub.requests("GET"), 1, "not retried");
+    assert!(w.clock.slept().is_empty(), "no backoff");
+}
+
+#[test]
+fn blizzard_500_exits_70_and_writes_nothing() {
+    let (w, report) = answered("unexp", 500);
+    assert_unexpected_status(&report, 500);
+    assert_eq!(exit(&report), 70);
+    assert!(!w.bronze("2026-11-26T11.parquet").exists());
+    assert!(w.temporaries().is_empty());
 }
 
 #[test]
@@ -736,7 +902,7 @@ fn a_token_endpoint_400_is_unexpected_exit_70() {
 }
 
 #[test]
-fn a_snapshot_without_last_modified_is_unexpected_exit_70() {
+fn missing_last_modified_exits_70() {
     let w = World::at("no-lm", AT_1135);
     w.stub.token_ok(5);
     w.stub
@@ -749,7 +915,7 @@ fn a_snapshot_without_last_modified_is_unexpected_exit_70() {
 }
 
 #[test]
-fn a_body_the_parser_cannot_use_is_unexpected_exit_70_and_leaves_no_file() {
+fn unusable_body_exits_70_and_leaves_no_bronze_file() {
     let w = World::at("bad-body", AT_1135);
     w.stub.token_ok(5);
     w.stub
@@ -763,20 +929,21 @@ fn a_body_the_parser_cannot_use_is_unexpected_exit_70_and_leaves_no_file() {
 }
 
 #[test]
-fn a_data_folder_that_cannot_be_written_is_fundamental_exit_2() {
+fn unwritable_data_folder_file_exits_2() {
     let w = World::at("no-disk", AT_1135);
     fs::create_dir_all(w.config.data_dir.parent().unwrap()).unwrap();
     fs::write(&w.config.data_dir, "a file where the folder should be").unwrap();
 
     let report = w.go();
 
+    assert_eq!(report.reason, "LOCAL_IO_FAILED");
     assert_eq!(exit_status(&report), ExitStatus::Fundamental);
 }
 
 // The lock
 
 #[test]
-fn a_lock_held_past_the_lock_wait_is_exit_75_and_the_file_is_not_renamed() {
+fn writing_subcommand_exits_75_when_the_lock_wait_runs_out() {
     let w = World::at("locked", AT_1135);
     w.stub.token_ok(5);
     w.stub.snapshot(TOKEN, LM_11, 5);
@@ -790,6 +957,35 @@ fn a_lock_held_past_the_lock_wait_is_exit_75_and_the_file_is_not_renamed() {
     assert!(!w.bronze("2026-11-26T11.parquet").exists());
     let waited: Duration = w.clock.slept().iter().sum();
     assert_eq!(waited, LOCK_WAIT);
+}
+
+#[test]
+fn collect_polls_without_the_lock_and_takes_it_only_to_rename() {
+    // H1: another run holds the lock throughout. Collect still polls (two
+    // waits of the poll interval for the stale snapshot), parses and writes its
+    // file, and waits for the lock only at the rename, where the wait runs out.
+    let w = World::at("polls-unlocked", AT_1135);
+    w.stub.token_ok(5);
+    w.stub.snapshot(TOKEN, LM_10, 2);
+    w.stub.snapshot(TOKEN, LM_11, 5);
+    let held = File::create(&w.config.lock_file).unwrap();
+    held.lock().unwrap();
+
+    let report = w.go();
+
+    assert_eq!(report.reason, "LOCK_WAIT_EXPIRED");
+    assert_eq!(exit(&report), 75);
+    let slept = w.clock.slept();
+    assert_eq!(
+        slept[..2],
+        [secs(120), secs(120)],
+        "polled with the lock held"
+    );
+    assert_eq!(slept[2..].iter().sum::<Duration>(), LOCK_WAIT);
+    assert_eq!(w.stub.requests("GET"), 3, "the snapshot was fetched whole");
+    assert!(!w.bronze("2026-11-26T11.parquet").exists());
+    // X6, O37: nothing is left, its own temporary file included.
+    assert!(w.temporaries().is_empty(), "{:?}", w.temporaries());
 }
 
 #[test]

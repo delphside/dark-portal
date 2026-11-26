@@ -193,13 +193,25 @@ mod tests {
     }
 
     #[test]
-    fn a_jobs_total_is_the_clocks_time_over_the_job_in_seconds_to_a_tenth() {
+    fn every_job_reports_total_seconds_and_its_step_seconds() {
         let clock = crate::collect::clock::FakeClock::at("2026-11-26T11:35:00Z");
         let report = totalled(&clock, || {
             clock.sleep(Duration::from_millis(12_340));
             Report::ok()
         });
         assert_eq!(report.metadata["total_seconds"], "12.3");
+
+        // A job that has steps carries each one's seconds beside its total.
+        let report = totalled(&clock, || {
+            let started = clock.now();
+            clock.sleep(Duration::from_secs(5));
+            let mut report = Report::ok();
+            record(&mut report, &clock, "export", started);
+            clock.sleep(Duration::from_secs(1));
+            report
+        });
+        assert_eq!(report.metadata["export_seconds"], "5.0");
+        assert_eq!(report.metadata["total_seconds"], "6.0");
     }
 
     #[test]

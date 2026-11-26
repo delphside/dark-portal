@@ -144,7 +144,7 @@ fn only_the_hours_it_lacks_are_written_after_a_new_hour() {
 }
 
 #[test]
-fn a_rerun_with_nothing_new_writes_nothing() {
+fn export_writes_nothing_where_nothing_is_new() {
     let w = world("export-rerun");
     let first = export_it(&w);
     assert_eq!(
@@ -164,7 +164,7 @@ fn a_rerun_with_nothing_new_writes_nothing() {
 }
 
 #[test]
-fn a_committed_hour_with_no_rows_still_gets_its_files_with_the_columns() {
+fn export_hour_with_no_rows_is_a_file_with_columns_and_no_rows() {
     // E (existence), D22.3: nothing listed.
     let w = World::new("export-empty-hour");
     w.seed(5, &[]);
@@ -197,7 +197,7 @@ fn no_committed_hour_writes_no_hour_file_and_the_other_files() {
 // ------------------------------------------------------------------- keeps
 
 #[test]
-fn an_hour_older_than_the_hourly_keep_is_not_written_and_one_exactly_the_keep_is() {
+fn export_skips_a_lacking_hour_older_than_the_hourly_keep() {
     // D26.4, D24.2, D24.3: by the hour the file is for. h(10) starts 10:00 on
     // 2026-11-20; four weeks on is 10:00 on 2026-12-18.
     let w = world("export-keep");
@@ -260,7 +260,7 @@ fn an_hour_is_past_the_keep_only_when_strictly_older() {
 // --------------------------------------------------------- failure, repair
 
 #[test]
-fn a_run_after_a_failed_export_writes_the_missing_hours() {
+fn failed_export_exits_3_and_the_next_run_repairs_it() {
     // H2, D26.3: a folder that cannot be made fails the export with exit 3;
     // the next run writes every hour it lacks.
     let w = world("export-repair");
@@ -331,7 +331,7 @@ fn a_fundamental_failure_ends_the_run_early_and_the_next_run_writes_the_rest() {
 }
 
 #[test]
-fn the_lock_held_past_the_wait_is_a_blip_and_writes_nothing() {
+fn export_run_alone_exits_75_where_the_lock_is_held_past_the_wait() {
     let w = world("export-locked");
     let held = w.lock();
     let report = export_it(&w);
@@ -357,7 +357,7 @@ fn a_file_that_fails_to_write_leaves_neither_it_nor_a_temporary_file() {
 }
 
 #[test]
-fn a_file_is_written_under_a_name_no_reader_takes_for_the_export() {
+fn export_files_appear_only_whole() {
     let file = Path::new("/x/item_hour/2026-11-20T10.parquet");
     let one = temporary_for(file).unwrap();
     let two = temporary_for(file).unwrap();
@@ -375,7 +375,7 @@ fn a_file_is_written_under_a_name_no_reader_takes_for_the_export() {
 }
 
 #[test]
-fn a_temporary_file_a_killed_run_left_is_removed_by_the_next() {
+fn export_removes_a_stale_tmp_under_the_lock() {
     let w = world("export-stale");
     export_it(&w);
     let stale = export_folder(&w).join("item_hour/2026-11-20T13.parquet.77-aa.tmp");
@@ -389,7 +389,7 @@ fn a_temporary_file_a_killed_run_left_is_removed_by_the_next() {
 // ---------------------------------------------------- item_day, item, SQL
 
 #[test]
-fn export_rewrites_item_day_and_item_only_where_they_changed() {
+fn export_rewrites_item_day_and_item_only_where_they_differ() {
     let w = world("export-rewrite");
     export_it(&w);
     // item_day is the daily job's; here a row stands in for it.
@@ -431,7 +431,24 @@ fn export_rewrites_item_day_and_item_only_where_they_changed() {
 }
 
 #[test]
-fn profiles_sql_is_the_views_the_settings_then_sql_profiles_unchanged() {
+fn export_rewrites_profiles_sql_only_where_its_text_differs() {
+    // E1: the file is rewritten where its text is not what `dp` would write
+    // (an older `dp`'s, a hand edit), and is left alone where it is.
+    let w = world("export-profiles-differs");
+    export_it(&w);
+    let file = export_folder(&w).join("profiles.sql");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), profiles_text());
+    assert_eq!(export_it(&w).metadata["rewritten"], "");
+
+    std::fs::write(&file, "-- an older dp's text\n").unwrap();
+    let report = export_it(&w);
+    assert_eq!(report.metadata["rewritten"], "profiles.sql", "{report:?}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), profiles_text());
+    assert_eq!(export_it(&w).metadata["rewritten"], "");
+}
+
+#[test]
+fn exported_profiles_sql_carries_sql_profiles_unchanged() {
     let w = world("export-profiles-text");
     export_it(&w);
     let text = std::fs::read_to_string(export_folder(&w).join("profiles.sql")).unwrap();
@@ -496,6 +513,58 @@ fn exported_profiles_sql_gives_the_same_profile_as_the_lake() {
     );
 }
 
+#[test]
+fn exported_views_read_the_export_dir_variable_or_the_working_folder() {
+    // P12: the views find the files under the variable `export_dir`, or, where
+    // the client has not set it, in the working folder (`.`), which the client
+    // loads `profiles.sql` from. A client's working folder is simulated with
+    // DuckDB's `file_search_path`, which resolves a relative name against a
+    // folder where the process's own working folder has no such file; the test
+    // does not change the process's.
+    let w = world("export-views-folder");
+    item_file(
+        &w,
+        "2026-11-26T100000",
+        &[(
+            1,
+            "2026-11-26 10:00:00+00",
+            200,
+            Some(
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5}"#,
+            ),
+        )],
+    );
+    assert_eq!(w.run().outcome, Severity::Ok);
+    assert_eq!(export_it(&w).outcome, Severity::Ok);
+    let profiles = std::fs::read_to_string(export_folder(&w).join("profiles.sql")).unwrap();
+    let query = "SELECT * FROM profile ORDER BY item";
+
+    let by_variable = Connection::open_in_memory().unwrap();
+    by_variable
+        .execute_batch(&format!(
+            "SET VARIABLE export_dir = {};",
+            quoted(&export_folder(&w).to_string_lossy())
+        ))
+        .unwrap();
+    by_variable.execute_batch(&profiles).unwrap();
+    let expected = rows(&by_variable, query);
+    assert_eq!(expected.len(), 2, "{expected:?}");
+
+    let by_folder = Connection::open_in_memory().unwrap();
+    by_folder
+        .execute_batch(&format!(
+            "SET file_search_path = {};",
+            quoted(&export_folder(&w).to_string_lossy())
+        ))
+        .unwrap();
+    by_folder.execute_batch(&profiles).unwrap();
+    let working: String = by_folder
+        .query_row("SELECT getvariable('export_dir')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(working, ".", "unset, it is the working folder");
+    assert_eq!(rows(&by_folder, query), expected);
+}
+
 // ------------------------------------------------------------------- bound
 
 #[test]
@@ -521,7 +590,7 @@ fn the_time_each_hour_took_is_kept_for_the_bound_to_judge() {
 }
 
 #[test]
-fn an_export_run_alone_is_judged_against_the_whole_bound() {
+fn export_run_alone_counts_its_own_time_against_the_bound() {
     // H10, TT3: an hour's files take 301 s, so the run counts the hour over.
     let w = world("export-alone-over");
     let clock = crate::transform::test_support::SlowOnceWritten::new(

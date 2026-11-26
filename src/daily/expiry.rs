@@ -204,7 +204,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_lake_expires_only_the_snapshots_older_than_its_keep_and_then_cleans_up() {
+    fn daily_expires_lake_snapshots_older_than_7_days() {
         let now = DateTime::parse_from_rfc3339("2026-11-21T00:50:00Z")
             .unwrap()
             .to_utc();
