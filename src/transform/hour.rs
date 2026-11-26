@@ -164,7 +164,7 @@ fn stage(lake: &Lake, data_dir: &Path, hour: Hour) -> Result<Staged, Failure> {
         .map_err(|e| lake_failure(&e.to_string(), reading))?;
     Ok(Staged {
         unknown_time_left,
-        last_modified: last_modified_of(lake.connection(), &file),
+        last_modified: last_modified_of(lake.connection(), &file).ok().flatten(),
     })
 }
 

@@ -18,6 +18,7 @@ use crate::collect::snapshot::last_modified_of;
 use crate::collect::{Clock, Endpoints, bronze_dir, window};
 use crate::config::Config;
 use crate::error::{Report, warned};
+use crate::settings::collection::REFRESH_INTERVAL_LEAST;
 use crate::types::Hour;
 
 /// Runs `dp probe`. The report is `Ok`, or a warning: never a failure.
@@ -50,7 +51,7 @@ fn failed(failure: Failure) -> Report {
     };
     let warning = Report::warning(
         "PROBE_FAILED",
-        "The refresh probe could not ask Blizzard or read bronze; it is tried again tomorrow.",
+        "The refresh probe could not read bronze or ask Blizzard.",
     )
     .with_metadata("cause", reason)
     .with_metadata("cause_message", message);
@@ -66,7 +67,16 @@ fn probe(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Repo
 
     let connection = Connection::open_in_memory()
         .map_err(|e| crate::collect::snapshot::duckdb_failure(&e.to_string()))?;
-    let Some(collected) = last_modified_of(&connection, &file) else {
+    // A file that is not there is an hour missed, and nothing to compare; one
+    // that is there and cannot be read is a failure.
+    let collected = last_modified_of(&connection, &file).map_err(|detail| {
+        Failure::unexpected(
+            "BRONZE_READ_FAILED",
+            "DuckDB could not read the hour before's bronze file.",
+        )
+        .with_metadata("detail", detail)
+    })?;
+    let Some(collected) = collected else {
         return Ok(report.with_metadata("result", "no snapshot of the hour before to compare"));
     };
     let token = blizzard.token(
@@ -76,17 +86,29 @@ fn probe(config: &Config, clock: &dyn Clock, blizzard: &Blizzard) -> Result<Repo
     )?;
     let report = report.with_metadata("collected_last_modified", collected.to_rfc3339());
     match blizzard.snapshot_probe(&token, collected)? {
-        Probed::Modified(latest) if latest > collected => Ok(warned(
-            report
-                .with_metadata("latest_last_modified", latest.to_rfc3339())
-                .with_metadata("result", "refreshed since"),
-            vec![refreshed_more_often(&hour_label, collected, latest)],
-        )),
+        Probed::Modified(latest) if refreshed_more_often_than_hourly(collected, latest) => {
+            Ok(warned(
+                report
+                    .with_metadata("latest_last_modified", latest.to_rfc3339())
+                    .with_metadata("result", "refreshed since"),
+                vec![refreshed_more_often(&hour_label, collected, latest)],
+            ))
+        }
         Probed::Modified(latest) => Ok(report
             .with_metadata("latest_last_modified", latest.to_rfc3339())
             .with_metadata("result", "not newer")),
         Probed::NotModified => Ok(report.with_metadata("result", "not newer")),
     }
+}
+
+/// Whether the latest snapshot is newer than the hour before's by less than
+/// the least about an hour: a refresh that has only moved a few minutes into
+/// the hour is newer by about an hour.
+fn refreshed_more_often_than_hourly(collected: DateTime<Utc>, latest: DateTime<Utc>) -> bool {
+    latest > collected
+        && (latest - collected)
+            .to_std()
+            .is_ok_and(|between| between < REFRESH_INTERVAL_LEAST)
 }
 
 /// Blizzard's latest snapshot is newer than the hour before's.
@@ -130,21 +152,31 @@ mod tests {
 
     /// A world whose bronze holds hour 11, and a stub Blizzard with a token.
     fn world(name: &str) -> (World, Stub) {
+        world_collected(name, COLLECTED)
+    }
+
+    /// As [`world`], hour 11 last modified at `collected`.
+    fn world_collected(name: &str, collected: &str) -> (World, Stub) {
         let w = empty_world(name);
-        w.snapshot_modified(11, &[l(1, 100, 1)], Some(COLLECTED));
+        w.snapshot_modified(11, &[l(1, 100, 1)], Some(collected));
         let stub = Stub::new();
         stub.token_ok(5);
         (w, stub)
     }
 
     fn mount(stub: &Stub, template: ResponseTemplate) {
+        mount_since(stub, COLLECTED, template);
+    }
+
+    /// Answers the conditional request made `since` the time collected.
+    fn mount_since(stub: &Stub, since: &str, template: ResponseTemplate) {
         stub.mount(
             Mock::given(method("GET"))
                 .and(path("/data/wow/auctions/commodities"))
                 .and(query_param("namespace", "dynamic-eu"))
                 .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
                 // The conditional request, with the time collected.
-                .and(IfModifiedSince(http_date(COLLECTED)))
+                .and(IfModifiedSince(http_date(since)))
                 .respond_with(template),
         );
     }
@@ -219,10 +251,53 @@ mod tests {
     }
 
     #[test]
-    fn one_second_newer_is_newer() {
-        let (w, stub) = world("one-second");
-        mount(&stub, modified("2026-11-20T11:31:41Z"));
-        assert_eq!(probe_at(&w, &stub).reason, "REFRESH_MORE_OFTEN");
+    fn a_snapshot_newer_by_less_than_about_an_hour_warns_and_one_newer_by_about_an_hour_does_not() {
+        // The least about an hour is 50 minutes, the setting's. What is newer
+        // by less is a refresh between the hourly ones.
+        for (name, collected, latest, warns) in [
+            ("one-second", COLLECTED, "2026-11-20T11:31:41Z", true),
+            ("half-hourly", COLLECTED, "2026-11-20T12:01:40Z", true),
+            ("under", COLLECTED, "2026-11-20T12:21:39Z", true),
+            ("least", COLLECTED, "2026-11-20T12:21:40Z", false),
+            ("an-hour", COLLECTED, "2026-11-20T12:31:40Z", false),
+            // An hourly refresh that has moved to :02 is the next hour's.
+            (
+                "moved-to-02",
+                "2026-11-20T11:02:00Z",
+                "2026-11-20T12:02:00Z",
+                false,
+            ),
+            (
+                "moved-to-00",
+                "2026-11-20T11:31:40Z",
+                "2026-11-20T12:00:00Z",
+                true,
+            ),
+            // Half-hourly after a move: :02 and :32.
+            (
+                "half-hourly-02",
+                "2026-11-20T11:02:00Z",
+                "2026-11-20T12:02:00Z",
+                false,
+            ),
+            (
+                "half-hourly-32",
+                "2026-11-20T11:02:00Z",
+                "2026-11-20T11:32:00Z",
+                true,
+            ),
+        ] {
+            let (w, stub) = world_collected(name, collected);
+            mount_since(&stub, collected, modified(latest));
+            let report = probe_at(&w, &stub);
+            assert_eq!(exit_status(&report), ExitStatus::Completed, "{name}");
+            if warns {
+                assert_eq!(report.reason, "REFRESH_MORE_OFTEN", "{name}: {report:?}");
+            } else {
+                assert_eq!(report.outcome, Severity::Ok, "{name}: {report:?}");
+                assert_eq!(report.metadata["result"], "not newer", "{name}");
+            }
+        }
     }
 
     #[test]
@@ -239,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bronze_file_that_cannot_be_read_is_nothing_to_compare_not_a_failure() {
+    fn a_bronze_file_that_cannot_be_read_is_a_warning_and_asks_blizzard_nothing() {
         let (w, stub) = world("garbage");
         std::fs::write(
             crate::transform::bronze::path(
@@ -251,6 +326,8 @@ mod tests {
         .unwrap();
         let report = probe_at(&w, &stub);
         assert_eq!(exit_status(&report), ExitStatus::Completed);
+        assert_eq!(report.reason, "PROBE_FAILED");
+        assert_eq!(report.warnings[0].metadata["cause"], "BRONZE_READ_FAILED");
         assert_eq!(stub.requests("GET"), 0);
     }
 

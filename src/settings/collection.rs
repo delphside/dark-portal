@@ -62,3 +62,7 @@ pub const REFRESH_INTERVAL_MOST: Duration = Duration::from_secs(70 * 60);
 /// "longest text": the most bytes a text field of a snapshot listing may have,
 /// 32. `time_left`'s longest band is 9.
 pub const TEXT_MAX_LENGTH: usize = 32;
+
+/// "longest quoted value": the most characters of a snapshot value a report
+/// quotes, 64.
+pub const QUOTED_VALUE_MAX: usize = 64;

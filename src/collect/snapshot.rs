@@ -19,7 +19,7 @@ use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor
 use super::failure::{Failure, io_failure, says_disk_full};
 use crate::error::{ErrorType, Report};
 use crate::lake::{Spill, job_limits};
-use crate::settings::collection::TEXT_MAX_LENGTH;
+use crate::settings::collection::{QUOTED_VALUE_MAX, TEXT_MAX_LENGTH};
 use crate::types::{AuctionId, Copper, ItemId, Listing};
 
 /// Why a body could not be turned into listings.
@@ -159,9 +159,6 @@ impl<'de> de::Deserialize<'de> for Scalar {
         deserializer.deserialize_any(Any)
     }
 }
-
-/// The longest a value is quoted in a report.
-const QUOTED_VALUE_MAX: usize = 64;
 
 impl State<'_> {
     /// Notes a field the parser does not know.
@@ -595,10 +592,13 @@ fn write_into<R: Read>(
 }
 
 /// The `last-modified` an hour's bronze file holds: `None` where the file is
-/// not there or cannot be read, since what asks never fails for it.
-pub(crate) fn last_modified_of(connection: &Connection, file: &Path) -> Option<DateTime<Utc>> {
+/// not there, and the message of the failure where it cannot be read.
+pub(crate) fn last_modified_of(
+    connection: &Connection,
+    file: &Path,
+) -> Result<Option<DateTime<Utc>>, String> {
     if !file.exists() {
-        return None;
+        return Ok(None);
     }
     let millis: Option<i64> = connection
         .query_row(
@@ -609,8 +609,8 @@ pub(crate) fn last_modified_of(connection: &Connection, file: &Path) -> Option<D
             [],
             |row| row.get(0),
         )
-        .ok()?;
-    DateTime::from_timestamp_millis(millis?)
+        .map_err(|e| e.to_string())?;
+    Ok(millis.and_then(DateTime::from_timestamp_millis))
 }
 
 /// Syncs a file, `what` being its description for a failure's report. One that

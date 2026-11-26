@@ -1253,6 +1253,7 @@ fn next_run_reprocesses_a_failed_hour() {
         // The next run processes it, giving what an uninterrupted run gives.
         let report = w.run();
         assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:#?}");
+        assert_eq!(warned_of(&report), ["HOUR_MISSED"], "h11 was missed");
         assert_eq!(report.metadata["hours"], "1");
         let clean = World::new(&format!("{name}-clean"));
         replay(&clean, &hours);
@@ -1867,8 +1868,8 @@ fn latest_hour_not_yet_collected_is_no_gap() {
     assert_eq!(exit_status(&report), ExitStatus::Completed);
     assert_eq!(
         warned_of(&report),
-        ["HOUR_MISSED", "REFRESH_INTERVAL_CHANGED"],
-        "the hour found missing, and the two hours between the last modified"
+        ["HOUR_MISSED"],
+        "the hour found missing; a gap's interval is not judged"
     );
     let lake = w.open();
     assert_eq!(gaps(&lake), [h(12)]);
@@ -1963,7 +1964,7 @@ fn gap_is_written_in_the_later_hours_transaction() {
 
     let report = w.run();
     assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:#?}");
-    assert_eq!(report.reason, "HOUR_MISSED");
+    assert_eq!(warned_of(&report), ["HOUR_MISSED"]);
     assert_eq!(gaps(&w.open()), [h(11)]);
     assert_eq!(processed(&w.open()).len(), 2);
 }
@@ -2143,9 +2144,9 @@ fn the_time_between_last_modified_not_about_an_hour_warns_the_refresh_interval_c
         ("hour", "2026-11-20T11:31:40Z", None),
         ("least", "2026-11-20T11:21:40Z", None),
         ("most", "2026-11-20T11:41:40Z", None),
-        ("under", "2026-11-20T11:21:39Z", Some("49")),
-        ("over", "2026-11-20T11:41:41Z", Some("70")),
-        ("half-hourly", "2026-11-20T11:01:40Z", Some("30")),
+        ("under", "2026-11-20T11:21:39Z", Some("2999")),
+        ("over", "2026-11-20T11:41:41Z", Some("4201")),
+        ("half-hourly", "2026-11-20T11:01:40Z", Some("1800")),
     ] {
         let w = World::new(&format!("interval-{name}"));
         // Hour 10 of the test world is 2026-11-20T10:00; its refresh :31:40.
@@ -2156,10 +2157,10 @@ fn the_time_between_last_modified_not_about_an_hour_warns_the_refresh_interval_c
         assert_eq!(exit_status(&report), ExitStatus::Completed, "{name}");
         match changed {
             None => assert!(report.warnings.is_empty(), "{name}: {report:?}"),
-            Some(minutes) => {
+            Some(seconds) => {
                 assert_eq!(warned_of(&report), ["REFRESH_INTERVAL_CHANGED"], "{name}");
                 let warning = &report.warnings[0].metadata;
-                assert_eq!(warning["minutes"], minutes, "{name}");
+                assert_eq!(warning["interval_seconds"], seconds, "{name}");
                 assert_eq!(warning["hour"], "2026-11-20T11", "{name}");
                 assert_eq!(
                     warning["previous_last_modified"],
@@ -2171,26 +2172,15 @@ fn the_time_between_last_modified_not_about_an_hour_warns_the_refresh_interval_c
 }
 
 #[test]
-fn a_daily_refresh_shows_as_each_hour_missed_and_a_refresh_interval_changed() {
+fn a_daily_refresh_shows_as_each_hour_missed_and_no_interval_warning() {
     let w = World::new("daily-refresh");
     w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
     w.snapshot_modified(34, &[l(1, 100, 1)], Some("2026-11-21T10:31:40Z"));
     let report = w.run();
 
-    let reasons = warned_of(&report);
-    assert_eq!(
-        reasons.iter().filter(|r| **r == "HOUR_MISSED").count(),
-        23,
-        "{reasons:?}"
-    );
-    assert_eq!(
-        reasons
-            .iter()
-            .filter(|r| **r == "REFRESH_INTERVAL_CHANGED")
-            .count(),
-        1
-    );
     assert_eq!(exit_status(&report), ExitStatus::Completed);
+    let reasons = warned_of(&report);
+    assert_eq!(reasons, vec!["HOUR_MISSED"; 23]);
 }
 
 #[test]

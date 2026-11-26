@@ -12,3 +12,7 @@ pub const JOB_THREADS: u32 = 1;
 /// "hourly processing bound": 5 minutes for `transform` and `export` of one
 /// hour; a run over it is logged as a warning.
 pub const HOURLY_PROCESSING_BOUND: Duration = Duration::from_secs(5 * 60);
+
+/// "item IDs named": the most item IDs a warning of the reference table names,
+/// 5.
+pub const ITEMS_NAMED: usize = 5;

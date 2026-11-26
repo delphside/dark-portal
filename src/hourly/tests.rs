@@ -434,7 +434,7 @@ fn blizzard_world(name: &str) -> (World, Stub) {
             .and(header("authorization", bearer.as_str()))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(r#"{"id":10,"name":"Flask","sell_price":5}"#),
+                    .set_body_string(r#"{"id":10,"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#),
             ),
     );
     (w, stub)
@@ -454,7 +454,7 @@ fn hourly_holds_the_lock_from_the_rename_through_export() {
         free: Cell::new(0),
     };
     let report = run_with(&w.config, &clock, || stub.endpoints(), &w.backend());
-    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
     assert_eq!(report.metadata["step_export"], "OK");
     assert!(
         clock.probes.get() > 0,
@@ -472,7 +472,7 @@ fn items_is_lent_the_lock_and_takes_none_of_its_own_for_a_new_item() {
     // and fail.
     let (w, stub) = blizzard_world("hourly-items-lent");
     let report = run_with(&w.config, &w.clock, || stub.endpoints(), &w.backend());
-    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
     assert_eq!(report.metadata["step_items"], "OK");
     assert!(crate::items::has_parquet(&crate::items::items_dir(&w.config.data_dir)).unwrap());
     assert!(
@@ -531,12 +531,14 @@ fn the_real_steps_take_the_lock_once_and_run_one_hour_through() {
             1,
             "2026-11-20 09:35:00+00",
             200,
-            Some(r#"{"name":"Flask","sell_price":5}"#),
+            Some(
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
+            ),
         )],
     );
     let clock = FakeClock::at("2026-11-20T10:40:00Z");
     let report = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
-    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
     assert!(
         clock.slept().is_empty(),
         "nothing waited: {:?}",
@@ -571,7 +573,9 @@ fn transform_and_export_of_an_hour_are_judged_together_against_5_minutes() {
             1,
             "2026-11-20 09:35:00+00",
             200,
-            Some(r#"{"name":"Flask","sell_price":5}"#),
+            Some(
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
+            ),
         )],
     );
     let clock = FakeClock::at("2026-11-20T10:40:00Z");
@@ -597,7 +601,7 @@ fn transform_and_export_of_an_hour_are_judged_together_against_5_minutes() {
         },
         &times,
     );
-    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
     assert_eq!(report.metadata["step_export"], "OK");
     assert_eq!(exit_status(&report), ExitStatus::Completed);
     assert_eq!(
@@ -622,7 +626,9 @@ fn runs_own_work_counts_against_the_bound_shared_across_its_hours() {
             1,
             "2026-11-20 09:35:00+00",
             200,
-            Some(r#"{"name":"Flask","sell_price":5}"#),
+            Some(
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
+            ),
         )],
     );
     let clock = crate::transform::test_support::SlowOnceWritten::new(
@@ -631,7 +637,7 @@ fn runs_own_work_counts_against_the_bound_shared_across_its_hours() {
         Duration::from_secs(301),
     );
     let report = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
-    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
     assert_eq!(report.metadata["hours_over_bound"], "1");
 }
 
@@ -646,12 +652,14 @@ fn a_rerun_of_the_real_steps_does_nothing_and_exits_0() {
             1,
             "2026-11-20 09:35:00+00",
             200,
-            Some(r#"{"name":"Flask","sell_price":5}"#),
+            Some(
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
+            ),
         )],
     );
     let clock = FakeClock::at("2026-11-20T10:40:00Z");
     let first = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
-    assert_eq!(code(&first), 0, "{first:?}");
+    assert_eq!(first.outcome, Severity::Ok, "{first:?}");
     let second = run_with(&w.config, &clock, Endpoints::blizzard, &w.backend());
     assert_eq!(code(&second), 0, "{second:?}");
 }
@@ -670,7 +678,9 @@ fn failed_transform_hour_rolls_back_whole_and_hourly_exits_3() {
             1,
             "2026-11-20 09:35:00+00",
             200,
-            Some(r#"{"name":"Flask","sell_price":5}"#),
+            Some(
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
+            ),
         )],
     );
     let clock = FakeClock::at("2026-11-20T10:40:00Z");
@@ -838,7 +848,7 @@ fn secret_never_appears_in_logs_bronze_or_export() {
         report.log();
         report
     });
-    assert_eq!(code(&report), 0, "{report:?}");
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
     assert!(log.contains("took a new Blizzard access token"), "{log}");
     let data = &w.config.data_dir;
     assert!(!files_holding(&data.join("bronze"), "Flask").is_empty());

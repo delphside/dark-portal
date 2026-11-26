@@ -24,6 +24,7 @@ use crate::collect::snapshot::quoted;
 use crate::error::Report;
 use crate::items::{has_parquet, items_dir};
 use crate::lake::{Lake, lake_failure};
+use crate::settings::transform::ITEMS_NAMED;
 
 /// What a rebuild found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,9 +48,6 @@ const PATHS: [(&str, bool); 5] = [
     ("sell_price", true),
     ("purchase_price", true),
 ];
-
-/// How many item IDs a warning names.
-const ITEMS_NAMED: usize = 5;
 
 /// Rebuilds `reference.item` from the item files under `data_dir`.
 ///

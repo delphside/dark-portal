@@ -260,6 +260,8 @@ pub fn process_hours(
             outcome.warnings.extend(summary.warnings.iter().copied());
             let before = previous.and_then(|previous| {
                 last_modified_of(lake.connection(), &bronze::path(data_dir, previous))
+                    .ok()
+                    .flatten()
             });
             outcome.reports.extend(hour_reports(&summary, before));
             outcome.hours.push(summary);
@@ -318,7 +320,8 @@ fn hour_reports(summary: &HourSummary, before: Option<DateTime<Utc>>) -> Vec<Rep
             .with_metadata("listings", listings.to_string()),
         );
     }
-    if let (Some(now), Some(before)) = (summary.last_modified, before) {
+    // Only between consecutive held hours: a missed hour is `HOUR_MISSED`'s.
+    if let (Some(now), Some(before), Some(1)) = (summary.last_modified, before, summary.span) {
         let between = (now - before).to_std().unwrap_or_default();
         if !(REFRESH_INTERVAL_LEAST..=REFRESH_INTERVAL_MOST).contains(&between) {
             reports.push(
@@ -329,7 +332,7 @@ fn hour_reports(summary: &HourSummary, before: Option<DateTime<Utc>>) -> Vec<Rep
                 .with_metadata("hour", hour)
                 .with_metadata("last_modified", now.to_rfc3339())
                 .with_metadata("previous_last_modified", before.to_rfc3339())
-                .with_metadata("minutes", (between.as_secs() / 60).to_string()),
+                .with_metadata("interval_seconds", between.as_secs().to_string()),
             );
         }
     }

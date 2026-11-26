@@ -131,7 +131,7 @@ fn only_the_hours_it_lacks_are_written_after_a_new_hour() {
     export_it(&w);
     let before = files(&w);
     w.snapshot(13, &[l(1, 100, 3)]);
-    assert_eq!(exit_status(&w.run()), ExitStatus::Completed);
+    assert_eq!(w.run().outcome, Severity::Ok);
     let report = export_it(&w);
     assert_eq!(report.metadata["hours"], "1");
     let after = files(&w);
@@ -418,11 +418,11 @@ fn export_rewrites_item_day_and_item_only_where_they_differ() {
             "2026-11-26 10:00:00+00",
             200,
             Some(
-                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5}"#,
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
             ),
         )],
     );
-    assert_eq!(exit_status(&w.run()), ExitStatus::Completed);
+    assert_eq!(w.run().outcome, Severity::Ok);
     let report = export_it(&w);
     assert_eq!(report.metadata["rewritten"], "item.parquet", "{report:?}");
     let read = file_rows(&export_folder(&w).join("item.parquet"));
@@ -481,11 +481,11 @@ fn exported_profiles_sql_gives_the_same_profile_as_the_lake() {
             "2026-11-26 10:00:00+00",
             200,
             Some(
-                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5}"#,
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
             ),
         )],
     );
-    assert_eq!(exit_status(&w.run()), ExitStatus::Completed);
+    assert_eq!(w.run().outcome, Severity::Ok);
     let report = export_it(&w);
     assert_eq!(report.outcome, Severity::Ok, "{report:?}");
 
@@ -530,11 +530,11 @@ fn exported_views_read_the_export_dir_variable_or_the_working_folder() {
             "2026-11-26 10:00:00+00",
             200,
             Some(
-                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5}"#,
+                r#"{"name":"Flask","item_class":{"name":"Consumable"},"item_subclass":{"name":"Potion"},"sell_price":5,"purchase_price":9}"#,
             ),
         )],
     );
-    assert_eq!(exit_status(&w.run()), ExitStatus::Completed);
+    assert_eq!(w.run().outcome, Severity::Ok);
     assert_eq!(export_it(&w).outcome, Severity::Ok);
     let profiles = std::fs::read_to_string(export_folder(&w).join("profiles.sql")).unwrap();
     let query = "SELECT * FROM profile ORDER BY item";
