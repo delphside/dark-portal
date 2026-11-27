@@ -1,0 +1,40 @@
+# Format, lint and test `dp` on both architectures it ships for
+# (docs/5.1.3 *Technology decisions*). The compiler is the one
+# `rust-toolchain.toml` pins, which rustup installs when `cargo` first runs.
+name: Rust
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86_64 and aarch64.
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+
+      # The bundled DuckDB takes many minutes to compile; the cache keeps the
+      # registry and the target directory between runs.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked

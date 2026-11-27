@@ -1,0 +1,20 @@
+[Unit]
+Description=Dark Portal hourly run (%i)
+Documentation=https://github.com/delphside/dark-portal/blob/main/docs/5.1.1-architecture.md
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=exec
+# The environment's `.env`, which holds the image to run (DP_IMAGE) among the
+# settings of docs/5.4.1. The instance (%i) is the environment's name.
+EnvironmentFile=/etc/dp/%i.env
+Environment=DP_ENV_FILE=/etc/dp/%i.env
+ExecStart=/usr/local/libexec/dp/dp-run hourly
+# No restart: the next hourly timer is the retry. A `75` leaves the unit
+# failed, which is true: the hour is still unfetched until a later run takes it.
+Restart=no
+# 5.4.1: the item fetch ends 50 min after the start (the lock wait before the
+# next hourly run, `items::fetch_end`) and `transform` and `export` are bounded
+# at 5 min, 55 min. A test reads this against the settings.
+RuntimeMaxSec=55min

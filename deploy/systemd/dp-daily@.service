@@ -1,0 +1,22 @@
+[Unit]
+Description=Dark Portal daily run (%i)
+Documentation=https://github.com/delphside/dark-portal/blob/main/docs/5.1.1-architecture.md
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/dp/%i.env
+Environment=DP_ENV_FILE=/etc/dp/%i.env
+ExecStart=/usr/local/libexec/dp/dp-run daily
+# No restart: `dp daily` retries itself on a `75` (5.1.1 *Restarts and
+# recovery*), and ends with the last attempt's status. Any other status waits
+# for the next timer start.
+Restart=no
+# 5.4.1: from the timer start (00:50) to the daily retries end (03:00), 130 min,
+# then the last attempt's lock wait (10 min), its close at the day close bound
+# (15 min) and the after-close allowance (10 min): 165 min. `dp daily` ends its
+# retries no later than 130 min after it starts, so a run started early or by
+# hand closes within this; a push or item retry still running at the limit is
+# stopped and repeated by the next run. A test reads this against the settings.
+RuntimeMaxSec=165min

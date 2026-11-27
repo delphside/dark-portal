@@ -1,0 +1,30 @@
+[package]
+name = "dp"
+version = "0.1.0"
+edition = "2024"
+description = "Dark Portal: collects the auction house and keeps its history"
+publish = false
+
+[lib]
+name = "dp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dp"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4", features = ["derive"] }
+# DuckDB 1.4.5, which has a DuckLake extension at extensions.duckdb.org.
+duckdb = { version = "=1.4.5", features = ["bundled", "parquet", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+ureq = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+wiremock = "0.6"

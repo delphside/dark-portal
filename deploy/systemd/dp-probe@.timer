@@ -1,0 +1,13 @@
+[Unit]
+Description=Dark Portal refresh probe (%i)
+
+[Timer]
+# 5.4.1: the probe timer start; a test reads this against the settings.
+OnCalendar=*-*-* 12:05:00 UTC
+# Not persistent: a probe run late, with the host just back, would meet the
+# refresh it is there to avoid, and tomorrow's does the same work.
+Persistent=false
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

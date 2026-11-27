@@ -1,0 +1,2352 @@
+//! The tests of `dp transform`: each rule of `docs/5.2.2-listing-lifecycle-and-events.md`
+//! on small constructed snapshots run through the real SQL, with the expected
+//! rows worked out by hand from 5.2.2's text and the test design's datasets
+//! (TD-A to TD-K), not from the code.
+//!
+//! The lake is a plain DuckDB file under the same name as DuckLake's; DuckLake
+//! itself is first run on E5 (`crate::lake`).
+
+use std::cell::Cell;
+use std::time::Duration as StdDuration;
+
+use super::test_support::*;
+use super::*;
+use crate::collect::Clock;
+use crate::collect::clock::FakeClock;
+use crate::collect::lock;
+use crate::error::{ExitStatus, exit_status};
+use crate::test_support::logging;
+use crate::transform::{hour, vocabulary};
+use crate::types::{
+    AuctionId, Copper, Duration, Event, EventKind, ListingRecord, Outcome as Result_, QueuePlace,
+    Rule, Tier,
+};
+use duckdb::Connection;
+
+/// The listing every world keeps in item 2, so no snapshot is empty and the
+/// queue of item 1 is judged by itself.
+fn anchor() -> L {
+    l(50, 10, 1).item(2)
+}
+
+fn with_anchor(mut listings: Vec<L>) -> Vec<L> {
+    listings.push(anchor());
+    listings
+}
+
+/// Writes each snapshot and runs the command once, which must not stop.
+fn replay(world: &World, snapshots: &[(i64, Vec<L>)]) -> Report {
+    for (n, listings) in snapshots {
+        world.snapshot(*n, listings);
+    }
+    let report = world.run();
+    assert_ne!(report.outcome, Severity::Fatal, "{report:#?}");
+    report
+}
+
+fn events_at(lake: &Lake, n: i64) -> Vec<Event> {
+    events(lake)
+        .into_iter()
+        .filter(|e| e.hour == h(n))
+        .collect()
+}
+
+fn place(lowest: u64, position: u32, units_ahead: u64, units_at_or_below: u64) -> QueuePlace {
+    QueuePlace {
+        lowest: Copper(lowest),
+        position,
+        units_ahead,
+        units_at_or_below,
+    }
+}
+
+// ---------------------------------------------------------------- the first hour
+
+#[test]
+fn first_snapshot_writes_live_listings_and_no_events() {
+    // TD-F's first hour.
+    let w = World::new("first");
+    let report = replay(
+        &w,
+        &[(
+            10,
+            vec![
+                l(500, 90, 1).band("VERY_LONG"),
+                l(501, 100, 2).band("MEDIUM"),
+                l(502, 110, 3).band("SHORT"),
+                l(503, 120, 4),
+                l(504, 130, 5).band("VERY_LONG"),
+            ],
+        )],
+    );
+    assert_eq!(report.outcome, Severity::Ok);
+    assert_eq!(report.metadata["hours"], "1");
+    let lake = w.open();
+    assert!(events(&lake).is_empty());
+    assert!(records(&lake).is_empty());
+    let live = live(&lake);
+    assert_eq!(live.len(), 5);
+    for listing in &live {
+        assert_eq!(listing.posted, None);
+        assert_eq!(listing.posting, None);
+        assert_eq!(listing.first_seen, h(10));
+        assert_eq!(listing.last_seen, h(10));
+    }
+    // Every listing has its history row for the hour, with its place in the queue.
+    assert_eq!(
+        history(&lake, 503),
+        [(h(10), 4, "LONG".to_owned(), 4, 6, 10)]
+    );
+    assert_eq!(
+        history(&lake, 500),
+        [(h(10), 1, "VERY_LONG".to_owned(), 1, 0, 1)]
+    );
+}
+
+#[test]
+fn first_hour_is_held_with_a_null_span_and_is_the_mark() {
+    let w = World::new("first-held");
+    replay(&w, &[(10, vec![l(1, 100, 1)])]);
+    let lake = w.open();
+    assert_eq!(processed(&lake), [(h(10), None)]);
+    assert_eq!(mark(&lake), Some(h(10)));
+    assert!(gaps(&lake).is_empty());
+}
+
+#[test]
+fn the_hour_after_the_first_ends_listings_by_their_last_band() {
+    // TD-F at h11, span 1: 500 intact; 501 and 502 expired (their bands start
+    // under 1 hour); 503 and 504 cancelled; 505 is posted.
+    let w = World::new("first-bands");
+    replay(
+        &w,
+        &[
+            (
+                10,
+                vec![
+                    l(500, 90, 1).band("VERY_LONG"),
+                    l(501, 100, 2).band("MEDIUM"),
+                    l(502, 110, 3).band("SHORT"),
+                    l(503, 120, 4),
+                    l(504, 130, 5).band("VERY_LONG"),
+                ],
+            ),
+            (11, vec![l(500, 90, 1).band("VERY_LONG"), l(505, 140, 6)]),
+        ],
+    );
+    let lake = w.open();
+    let at_11 = events_at(&lake, 11);
+    assert_eq!(only(&at_11, 501).kind, EventKind::Expired);
+    assert_eq!(only(&at_11, 502).kind, EventKind::Expired);
+    assert_eq!(only(&at_11, 503).kind, EventKind::Cancelled);
+    assert_eq!(only(&at_11, 504).kind, EventKind::Cancelled);
+    let posted = only(&at_11, 505);
+    assert_eq!(
+        (posted.kind, posted.units, posted.span),
+        (EventKind::Posted, 6, 1)
+    );
+    // The posting hour of a listing in the first snapshot is unknown, so the
+    // band decided and no duration is recorded.
+    for id in [501, 502] {
+        let record = record(&lake, id);
+        assert_eq!(
+            (record.outcome, record.duration, record.posted),
+            (Result_::Expired, None, None)
+        );
+        assert_eq!(record.posting, None);
+    }
+    assert_eq!(record(&lake, 503).outcome, Result_::Cancelled);
+}
+
+// ---------------------------------------------------------------------- EV-1
+
+#[test]
+fn new_id_not_live_is_posted_certain() {
+    let w = World::new("posted");
+    replay(
+        &w,
+        &[
+            (9, vec![l(10, 100, 3)]),
+            (10, vec![l(10, 100, 3), l(11, 90, 4)]),
+        ],
+    );
+    let lake = w.open();
+    let at_10 = events_at(&lake, 10);
+    assert_eq!(
+        at_10,
+        [Event {
+            unit_price: Copper(90),
+            ..event(h(10), 11, EventKind::Posted, 4, 1)
+        }]
+    );
+    assert_eq!(
+        (at_10[0].tier, at_10[0].rule, at_10[0].tie),
+        (Tier::Certain, Rule::Ev1, false)
+    );
+    // Posted at h10, with the queue around it as C shows it: it is the head.
+    let listing = &live(&lake)[1];
+    assert_eq!((listing.id, listing.posted), (11, Some(h(10))));
+    assert_eq!(listing.posting, Some(place(90, 1, 0, 4)));
+}
+
+#[test]
+fn new_id_at_or_below_highest_live_id_is_posted_and_logged_as_a_warning() {
+    // TD-D on TD-A: a new 100 is at or below 104; a new 106 is not.
+    let w = World::new("ids-below");
+    let last = vec![
+        anchor(),
+        l(101, 100, 2),
+        l(103, 110, 4),
+        l(105, 105, 6),
+        l(100, 95, 1),
+        l(106, 108, 1),
+    ];
+    w.snapshot(
+        9,
+        &with_anchor(vec![l(101, 100, 5), l(103, 110, 4), l(104, 120, 2)]),
+    );
+    w.snapshot(
+        10,
+        &with_anchor(vec![l(101, 100, 5), l(103, 110, 4), l(104, 120, 2)]),
+    );
+    w.snapshot(11, &last);
+    let outcome = w.process();
+    assert!(outcome.failure.is_none());
+    assert_eq!(outcome.warnings, [(HourWarning::IdNotAboveHighest, 100)]);
+    let lake = w.open();
+    let at_11 = events_at(&lake, 11);
+    assert_eq!(find(&at_11, 100, EventKind::Posted).units, 1);
+    assert_eq!(find(&at_11, 106, EventKind::Posted).units, 1);
+    assert_eq!(find(&at_11, 105, EventKind::Posted).units, 6);
+}
+
+#[test]
+fn new_id_above_highest_live_id_is_no_warning_even_below_one_ended() {
+    // TD-D3: 110 ended last hour, so the highest live ID is 104; a new 107 is
+    // posted with no warning.
+    let w = World::new("ids-ended");
+    w.snapshot(8, &[anchor()]);
+    w.snapshot(9, &with_anchor(vec![l(104, 120, 2), l(110, 130, 1)]));
+    w.snapshot(10, &with_anchor(vec![l(104, 120, 2)]));
+    w.snapshot(11, &with_anchor(vec![l(104, 120, 2), l(107, 125, 1)]));
+    let outcome = w.process();
+    assert!(outcome.failure.is_none());
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    let lake = w.open();
+    assert_eq!(find(&events_at(&lake, 11), 107, EventKind::Posted).units, 1);
+}
+
+/// TD-D4: 104 ended; at the next hour the snapshot holds it again, with a new
+/// 105 behind both. Gives the world, the records before that hour and what
+/// the hour did.
+fn reappeared(name: &str) -> (World, Vec<ListingRecord>, Outcome) {
+    let w = World::new(name);
+    w.snapshot(8, &[anchor()]);
+    w.snapshot(9, &with_anchor(vec![l(103, 110, 4), l(104, 120, 2)]));
+    w.snapshot(10, &with_anchor(vec![l(103, 110, 4)]));
+    assert!(w.process().failure.is_none());
+    let before = records(&w.open());
+    assert_eq!(before.len(), 1);
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(103, 110, 4), l(104, 120, 2), l(105, 130, 1)]),
+    );
+    let outcome = w.process();
+    assert!(outcome.failure.is_none());
+    (w, before, outcome)
+}
+
+#[test]
+fn ended_id_reappearing_is_logged_and_left_out() {
+    let (w, before, outcome) = reappeared("reappear");
+    assert_eq!(outcome.warnings, [(HourWarning::IdReappeared, 104)]);
+    let lake = w.open();
+    assert_eq!(
+        events_at(&lake, 11)
+            .iter()
+            .map(|e| e.id.0)
+            .collect::<Vec<_>>(),
+        [105]
+    );
+    assert_eq!(live_ids(&lake), [50, 103, 105]);
+    assert!(history(&lake, 104).is_empty());
+    assert_eq!(records(&lake), before);
+}
+
+#[test]
+fn reappearing_id_above_the_highest_live_id_is_logged_and_left_out() {
+    // EV-1: 104 ended; the live IDs are 50 and 103, so 104 is above the
+    // highest live ID. It is logged by name, and no event, live row or history
+    // row is made for it.
+    let (w, _, outcome) = reappeared("reappear-above");
+    assert_eq!(outcome.warnings, [(HourWarning::IdReappeared, 104)]);
+    let lake = w.open();
+    assert!(!live_ids(&lake).contains(&104));
+    assert!(events_at(&lake, 11).iter().all(|e| e.id.0 != 104));
+    assert!(history(&lake, 104).is_empty());
+}
+
+#[test]
+fn reappearing_id_takes_no_place_in_any_queue() {
+    // 105 is behind both: 104 is left out of the queue, so 105 is second,
+    // with 103's 4 units ahead of it and not 104's 2 as well.
+    let (w, _, _) = reappeared("reappear-queue");
+    assert_eq!(
+        history(&w.open(), 105),
+        [(h(11), 1, "LONG".to_owned(), 2, 4, 5)]
+    );
+}
+
+// ---------------------------------------------------------------------- EV-2
+
+#[test]
+fn quantity_drop_is_a_certain_partial_sale_of_the_drop() {
+    let w = World::new("partly");
+    replay(&w, &[(9, vec![l(1, 100, 10)]), (10, vec![l(1, 100, 7)])]);
+    let lake = w.open();
+    assert_eq!(
+        events_at(&lake, 10),
+        [Event {
+            unit_price: Copper(100),
+            ..event(h(10), 1, EventKind::PartlySold, 3, 1)
+        }]
+    );
+    assert_eq!(live(&lake)[0].quantity, 7);
+    assert_eq!(
+        history(&lake, 1).iter().map(|r| r.1).collect::<Vec<_>>(),
+        [10, 7]
+    );
+    assert!(records(&lake).is_empty());
+}
+
+#[test]
+fn quantity_drop_behind_an_intact_listing_is_a_sale_logged_as_a_warning() {
+    // TD-D2: 104 drops from 2 to 1 behind the intact 103.
+    let w = World::new("partly-behind");
+    w.snapshot(9, &[l(103, 110, 4), l(104, 120, 2)]);
+    w.snapshot(10, &[l(103, 110, 4), l(104, 120, 1)]);
+    let outcome = w.process();
+    assert_eq!(outcome.warnings, [(HourWarning::SaleBehindIntact, 104)]);
+    let lake = w.open();
+    let sale = only(&events_at(&lake, 10), 104);
+    assert_eq!(
+        (sale.kind, sale.units, sale.tier),
+        (EventKind::PartlySold, 1, Tier::Certain)
+    );
+}
+
+// ---------------------------------------------------------------------- EV-3
+
+#[test]
+fn listing_gone_from_the_front_is_sold_inferred() {
+    let w = World::new("sold");
+    replay(
+        &w,
+        &[
+            (9, vec![l(1, 100, 3), l(2, 200, 5)]),
+            (10, vec![l(2, 200, 5)]),
+        ],
+    );
+    let lake = w.open();
+    let sold = only(&events_at(&lake, 10), 1);
+    assert_eq!(
+        (
+            sold.kind, sold.units, sold.tier, sold.rule, sold.tie, sold.span
+        ),
+        (EventKind::Sold, 3, Tier::Inferred, Rule::Ev3, false, 1)
+    );
+    let record = record(&lake, 1);
+    assert_eq!(
+        (record.outcome, record.outcome_tier, record.units_sold),
+        (Result_::Sold, Tier::Inferred, 3)
+    );
+    assert_eq!(record.duration, None);
+}
+
+#[test]
+fn every_gone_listing_is_sold_when_none_is_intact() {
+    // TD-B: no intact listing, so the whole queue is the front.
+    let w = World::new("none-intact");
+    w.snapshot(9, &[l(201, 50, 2), l(202, 60, 3), l(203, 70, 4)]);
+    w.snapshot(10, &[l(202, 60, 1)]);
+    let outcome = w.process();
+    assert!(outcome.warnings.is_empty());
+    let lake = w.open();
+    let at_10 = events_at(&lake, 10);
+    assert_eq!(at_10.len(), 3);
+    assert_eq!(find(&at_10, 201, EventKind::Sold).units, 2);
+    assert_eq!(find(&at_10, 202, EventKind::PartlySold).units, 2);
+    assert_eq!(find(&at_10, 203, EventKind::Sold).units, 4);
+}
+
+// ----------------------------------------------------- EV-4, EV-5 and EV-6
+
+/// The event of `id` at h11 in a world where h10 and h11 are the snapshots
+/// after a first h9 (TD-C): listings seen at h9 are first seen at h9.
+fn tie_event(name: &str, h9: Vec<L>, h10: Vec<L>, h11: Vec<L>, id: u64) -> Event {
+    let w = World::new(name);
+    w.snapshot(9, &with_anchor(h9));
+    w.snapshot(10, &with_anchor(h10));
+    w.snapshot(11, &with_anchor(h11));
+    assert!(w.process().failure.is_none());
+    only(&events_at(&w.open(), 11), id)
+}
+
+#[test]
+fn listing_gone_behind_a_cheaper_intact_listing_carries_no_tie() {
+    // TD-C4: 303 at 190 intact ahead of 304 at 200, gone.
+    let e = tie_event(
+        "tie-c4",
+        vec![],
+        vec![l(303, 190, 1), l(304, 200, 1)],
+        vec![l(303, 190, 1)],
+        304,
+    );
+    assert_eq!(
+        (e.kind, e.tie, e.tier, e.rule),
+        (EventKind::Cancelled, false, Tier::Inferred, Rule::Ev6)
+    );
+}
+
+#[test]
+fn listing_gone_behind_a_same_price_listing_from_another_snapshot_carries_no_tie() {
+    // TD-C2: 310 first seen h10, 305 first seen h9, same price.
+    let e = tie_event(
+        "tie-c2",
+        vec![l(305, 200, 1)],
+        vec![l(305, 200, 1), l(310, 200, 1)],
+        vec![l(310, 200, 1)],
+        305,
+    );
+    assert_eq!((e.kind, e.tie), (EventKind::Cancelled, false));
+}
+
+#[test]
+fn listing_gone_behind_a_same_price_listing_from_its_snapshot_carries_a_tie() {
+    // TD-C1: 302 intact, 301 gone, both first seen h10 at 200: their order rests on ID order.
+    let e = tie_event(
+        "tie-c1",
+        vec![],
+        vec![l(301, 200, 1), l(302, 200, 1)],
+        vec![l(302, 200, 1)],
+        301,
+    );
+    assert_eq!(
+        (e.kind, e.tie, e.tier, e.rule),
+        (EventKind::Cancelled, true, Tier::Inferred, Rule::Ev6)
+    );
+}
+
+#[test]
+fn tie_needs_every_intact_listing_ahead_to_share_its_price_and_snapshot() {
+    // TD-C5: 320 (h9, 180) and 322 (h10, 200) intact ahead of 321 (h10, 200), gone.
+    let c5 = tie_event(
+        "tie-c5",
+        vec![l(320, 180, 1)],
+        vec![l(320, 180, 1), l(321, 200, 1), l(322, 200, 1)],
+        vec![l(320, 180, 1), l(322, 200, 1)],
+        321,
+    );
+    assert_eq!((c5.kind, c5.tie), (EventKind::Cancelled, false));
+    // TD-C7: 333 and 332 intact ahead of 331, all first seen h10 at 200.
+    let c7 = tie_event(
+        "tie-c7",
+        vec![],
+        vec![l(331, 200, 1), l(332, 200, 1), l(333, 200, 1)],
+        vec![l(332, 200, 1), l(333, 200, 1)],
+        331,
+    );
+    assert_eq!((c7.kind, c7.tie), (EventKind::Cancelled, true));
+    // An intact listing ahead at the same price but first seen in a later
+    // snapshot breaks the tie, though the other one ahead shares 331's.
+    let w = World::new("tie-later-intact");
+    w.snapshot(9, &[anchor()]);
+    w.snapshot(10, &with_anchor(vec![l(331, 200, 1), l(332, 200, 1)]));
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(331, 200, 1), l(332, 200, 1), l(340, 200, 1)]),
+    );
+    w.snapshot(12, &with_anchor(vec![l(332, 200, 1), l(340, 200, 1)]));
+    assert!(w.process().failure.is_none());
+    let e = only(&events_at(&w.open(), 12), 331);
+    assert_eq!(
+        (e.kind, e.tie),
+        (EventKind::Cancelled, false),
+        "340 was first seen at h11, 332 at h10"
+    );
+}
+
+#[test]
+fn a_tie_marks_an_expired_event_too() {
+    // Both posted h10 at 200: 301 expires at h22 (10 + 12) with 302 intact ahead of it.
+    let seeded = World::new("tie-expired");
+    seeded.seed(
+        21,
+        &[
+            Seed {
+                listing: l(302, 200, 1),
+                first_seen: 10,
+                posted: Some(10),
+            },
+            Seed {
+                listing: l(301, 200, 1),
+                first_seen: 10,
+                posted: Some(10),
+            },
+        ],
+    );
+    seeded.snapshot(22, &[l(302, 200, 1)]);
+    assert!(seeded.process().failure.is_none());
+    let e = only(&events_at(&seeded.open(), 22), 301);
+    assert_eq!(
+        (e.kind, e.rule, e.tie),
+        (EventKind::Expired, Rule::Ev5, true)
+    );
+}
+
+#[test]
+fn sold_listing_never_carries_a_tie() {
+    // TD-C3: 310 gone in front of 305 intact; TD-C6: 302 gone in front of 301 intact.
+    let c3 = tie_event(
+        "tie-c3",
+        vec![l(305, 200, 1)],
+        vec![l(305, 200, 1), l(310, 200, 1)],
+        vec![l(305, 200, 1)],
+        310,
+    );
+    assert_eq!((c3.kind, c3.tie), (EventKind::Sold, false));
+    let c6 = tie_event(
+        "tie-c6",
+        vec![],
+        vec![l(301, 200, 1), l(302, 200, 1)],
+        vec![l(301, 200, 1)],
+        302,
+    );
+    assert_eq!((c6.kind, c6.tie), (EventKind::Sold, false));
+}
+
+/// Seeds an intact 400 and a gone 401 (item 1), `held` being the last hour
+/// processed, and processes snapshot `c` holding only 400. Returns 401's event
+/// and record.
+fn gone_behind_intact(name: &str, held: i64, c: i64, gone: Seed) -> (Event, ListingRecord) {
+    let w = World::new(name);
+    w.seed(
+        held,
+        &[
+            Seed {
+                listing: l(400, 250, 1),
+                first_seen: 0,
+                posted: gone.posted,
+            },
+            gone,
+        ],
+    );
+    w.snapshot(c, &[l(400, 250, 1)]);
+    let outcome = w.process();
+    assert!(outcome.failure.is_none());
+    let lake = w.open();
+    (only(&events_at(&lake, c), 401), record(&lake, 401))
+}
+
+fn posted_at_0(band: &'static str) -> Seed {
+    Seed {
+        listing: l(401, 300, 1).band(band),
+        first_seen: 0,
+        posted: Some(0),
+    }
+}
+
+#[test]
+fn expiry_matches_when_posting_plus_duration_is_the_current_hour() {
+    for d in Duration::ALL {
+        let c = i64::from(d.hours());
+        let (event, record) =
+            gone_behind_intact(&format!("expiry-now-{c}"), c - 1, c, posted_at_0("LONG"));
+        assert_eq!(
+            (event.kind, event.rule, event.tier),
+            (EventKind::Expired, Rule::Ev5, Tier::Inferred),
+            "D = {c}"
+        );
+        assert_eq!(record.duration, Some(*d));
+        assert_eq!(record.outcome, Result_::Expired);
+    }
+}
+
+#[test]
+fn expiry_matches_at_the_window_start_current_hour_minus_span() {
+    for d in Duration::ALL {
+        let c = i64::from(d.hours()) + 1;
+        let (event, record) =
+            gone_behind_intact(&format!("expiry-start-{c}"), c - 1, c, posted_at_0("LONG"));
+        assert_eq!(event.kind, EventKind::Expired, "D = {}", d.hours());
+        assert_eq!(record.duration, Some(*d));
+    }
+}
+
+#[test]
+fn posting_plus_duration_before_the_window_is_cancelled() {
+    for d in Duration::ALL {
+        let c = i64::from(d.hours()) + 2;
+        let (event, record) =
+            gone_behind_intact(&format!("expiry-before-{c}"), c - 1, c, posted_at_0("LONG"));
+        assert_eq!(
+            (event.kind, event.rule),
+            (EventKind::Cancelled, Rule::Ev6),
+            "D = {}",
+            d.hours()
+        );
+        assert_eq!(
+            (record.outcome, record.duration),
+            (Result_::Cancelled, None)
+        );
+    }
+}
+
+#[test]
+fn posting_plus_duration_after_the_current_hour_is_cancelled() {
+    // For 12, C = 11 puts posting + 12 at C + 1. A band that would expire it
+    // without a posting hour is ignored where the posting hour is known.
+    for d in Duration::ALL {
+        let c = i64::from(d.hours()) - 1;
+        let (event, _) =
+            gone_behind_intact(&format!("expiry-after-{c}"), c - 1, c, posted_at_0("SHORT"));
+        assert_eq!(event.kind, EventKind::Cancelled, "D = {}", d.hours());
+    }
+}
+
+#[test]
+fn expiry_records_the_shortest_matching_duration() {
+    // TD-G2: the last hour held is h10, C is h24, span 14: posted h0, 12 and
+    // 24 are both inside [10, 24].
+    let (event, record) = gone_behind_intact("expiry-shortest", 10, 24, posted_at_0("LONG"));
+    assert_eq!((event.kind, event.span), (EventKind::Expired, 14));
+    assert_eq!(record.duration, Some(Duration::H12));
+}
+
+fn by_band(band: &'static str, span: i64) -> EventKind {
+    let seed = Seed {
+        listing: l(401, 300, 1).band(band),
+        first_seen: 0,
+        posted: None,
+    };
+    let (event, record) = gone_behind_intact(&format!("band-{band}-{span}"), 30 - span, 30, seed);
+    assert_eq!(i64::from(event.span), span);
+    assert_eq!(record.duration, None, "a band decides with no duration");
+    event.kind
+}
+
+#[test]
+fn unknown_posting_hour_expires_on_a_short_or_medium_band() {
+    assert_eq!(by_band("SHORT", 1), EventKind::Expired);
+    assert_eq!(by_band("MEDIUM", 1), EventKind::Expired);
+}
+
+#[test]
+fn long_band_is_cancelled_at_span_2_and_expired_at_span_3() {
+    assert_eq!(by_band("LONG", 2), EventKind::Cancelled);
+    assert_eq!(by_band("LONG", 3), EventKind::Expired);
+}
+
+#[test]
+fn very_long_band_is_cancelled_at_span_12_and_expired_at_span_13() {
+    assert_eq!(by_band("VERY_LONG", 12), EventKind::Cancelled);
+    assert_eq!(by_band("VERY_LONG", 13), EventKind::Expired);
+}
+
+#[test]
+fn gone_listing_writes_exactly_one_event_and_no_unsold_row() {
+    let w = World::new("one-event");
+    w.snapshot(
+        9,
+        &with_anchor(vec![l(1, 100, 1), l(2, 110, 1), l(3, 120, 1)]),
+    );
+    w.snapshot(10, &with_anchor(vec![l(2, 110, 1)]));
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let at_10 = events_at(&lake, 10);
+    for id in [1, 3] {
+        assert_eq!(at_10.iter().filter(|e| e.id.0 == id).count(), 1);
+    }
+    assert_eq!(only(&at_10, 1).kind, EventKind::Sold);
+    assert_eq!(only(&at_10, 3).kind, EventKind::Cancelled);
+    let unknown: i64 = lake
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM silver.event WHERE kind NOT IN \
+             ('posted', 'partly_sold', 'sold', 'expired', 'cancelled')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown, 0);
+}
+
+// --------------------------------------------------- the mixed queue, TD-A
+
+#[test]
+fn a_mixed_queue_gives_each_listing_its_event_its_record_and_its_place() {
+    let w = World::new("td-a");
+    let at_10 = || {
+        with_anchor(vec![
+            l(102, 100, 3),
+            l(101, 100, 5),
+            l(103, 110, 4),
+            l(104, 120, 2),
+        ])
+    };
+    w.snapshot(8, &[anchor()]);
+    w.snapshot(9, &at_10());
+    w.snapshot(10, &at_10());
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(101, 100, 2), l(103, 110, 4), l(105, 105, 6)]),
+    );
+    let outcome = w.process();
+    assert!(outcome.failure.is_none());
+    assert!(outcome.warnings.is_empty());
+    let lake = w.open();
+
+    let price = |e: Event, p: u64| Event {
+        unit_price: Copper(p),
+        ..e
+    };
+    assert_eq!(
+        events_at(&lake, 11),
+        [
+            price(event(h(11), 101, EventKind::PartlySold, 3, 1), 100),
+            price(event(h(11), 102, EventKind::Sold, 3, 1), 100),
+            price(event(h(11), 104, EventKind::Cancelled, 2, 1), 120),
+            price(event(h(11), 105, EventKind::Posted, 6, 1), 105),
+        ]
+    );
+    assert_eq!(live_ids(&lake), [50, 101, 103, 105]);
+    let l105 = live(&lake).into_iter().find(|x| x.id == 105).unwrap();
+    assert_eq!(l105.posting, Some(place(100, 2, 2, 8)));
+    // 103 is intact: one more history row and no event.
+    assert_eq!(history(&lake, 103).len(), 3);
+    assert_eq!(
+        history(&lake, 103).last().unwrap(),
+        &(h(11), 4, "LONG".to_owned(), 3, 8, 12)
+    );
+
+    // 102 sold; 104, behind the intact 103, cancelled: 9 + 12 = 21 is outside [10, 11].
+    assert_eq!(
+        record(&lake, 102),
+        ListingRecord {
+            id: AuctionId(102),
+            item: crate::types::ItemId(1),
+            unit_price: Copper(100),
+            quantity: 3,
+            first_seen: h(9),
+            last_seen: h(10),
+            posted: Some(h(9)),
+            duration: None,
+            posting: Some(place(100, 1, 0, 8)),
+            ended: h(11),
+            outcome: Result_::Sold,
+            outcome_tier: Tier::Inferred,
+            tie: false,
+            units_sold: 3,
+            end: place(100, 1, 0, 8),
+            end_units_undercut: 0,
+        }
+    );
+    let r104 = record(&lake, 104);
+    assert_eq!(
+        (r104.outcome, r104.units_sold, r104.duration),
+        (Result_::Cancelled, 0, None)
+    );
+    assert_eq!(r104.end, place(100, 4, 12, 14));
+    assert_eq!(r104.posting, Some(place(100, 4, 12, 14)));
+    // No live rows or history for what ended.
+    for id in [102, 104] {
+        assert!(history(&lake, id).is_empty());
+    }
+}
+
+#[test]
+fn ended_listing_writes_its_record_and_removes_its_live_rows() {
+    // TD-A's follow-on: after 101 goes from the front at h12 its record has
+    // quantity 5 and units sold 5.
+    let w = World::new("td-a-h12");
+    let at_10 = || {
+        with_anchor(vec![
+            l(102, 100, 3),
+            l(101, 100, 5),
+            l(103, 110, 4),
+            l(104, 120, 2),
+        ])
+    };
+    w.snapshot(8, &[anchor()]);
+    w.snapshot(9, &at_10());
+    w.snapshot(10, &at_10());
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(101, 100, 2), l(103, 110, 4), l(105, 105, 6)]),
+    );
+    assert!(w.process().failure.is_none());
+    w.snapshot(12, &with_anchor(vec![l(103, 110, 4), l(105, 105, 6)]));
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let r101 = record(&lake, 101);
+    assert_eq!(
+        (r101.quantity, r101.units_sold, r101.outcome),
+        (5, 5, Result_::Sold)
+    );
+    assert_eq!(
+        (r101.first_seen, r101.last_seen, r101.ended),
+        (h(9), h(11), h(12))
+    );
+    assert_eq!(r101.end, place(100, 1, 0, 2));
+    assert!(!live_ids(&lake).contains(&101));
+    assert!(history(&lake, 101).is_empty());
+    assert_eq!(processed(&lake).len(), 5);
+}
+
+#[test]
+fn listing_record_counts_units_sold_over_its_life() {
+    // Item 1: 20 sells 4, then 3, from the front, then the rest: sold 10.
+    // Item 2: 40 behind the intact 30 sells 4, then 3, then is cancelled: sold 7.
+    let w = World::new("lifetime-sales");
+    let rest = |a: u32, b: u32| {
+        vec![
+            l(20, 100, a),
+            l(10, 200, 1),
+            l(30, 100, 1).item(2),
+            l(40, 150, b).item(2),
+        ]
+    };
+    w.snapshot(9, &rest(10, 10));
+    w.snapshot(10, &rest(6, 6));
+    w.snapshot(11, &rest(3, 3));
+    w.snapshot(12, &[l(10, 200, 1), l(30, 100, 1).item(2)]);
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let sold = record(&lake, 20);
+    assert_eq!(
+        (sold.quantity, sold.units_sold, sold.outcome),
+        (10, 10, Result_::Sold)
+    );
+    let cancelled = record(&lake, 40);
+    assert_eq!(
+        (cancelled.quantity, cancelled.units_sold, cancelled.outcome),
+        (10, 7, Result_::Cancelled)
+    );
+}
+
+#[test]
+fn undercut_counts_higher_ids_at_a_lower_price_still_listed() {
+    // TD-H2: 702 at 150 ends; 708 (145), 710 (140) and 711 (130) have higher
+    // IDs and lower prices: 1 + 5 + 2 = 8. 700 at 100 has a lower ID.
+    let w = World::new("undercut");
+    w.snapshot(9, &[l(700, 100, 1)]);
+    w.snapshot(10, &[l(700, 100, 1), l(702, 150, 1), l(708, 145, 1)]);
+    let busy = vec![
+        l(700, 100, 1),
+        l(702, 150, 1),
+        l(708, 145, 1),
+        l(710, 140, 5),
+        l(711, 130, 2),
+    ];
+    w.snapshot(11, &busy);
+    w.snapshot(12, &busy);
+    w.snapshot(
+        13,
+        &[
+            l(700, 100, 1),
+            l(708, 145, 1),
+            l(710, 140, 5),
+            l(711, 130, 2),
+        ],
+    );
+    assert!(w.process().failure.is_none());
+    let r = record(&w.open(), 702);
+    assert_eq!(r.end_units_undercut, 8);
+    assert_eq!(r.end, place(100, 5, 9, 10));
+    assert_eq!(r.outcome, Result_::Cancelled);
+}
+
+// ------------------------------------------------------------------- queues
+
+#[test]
+fn queue_orders_by_price_then_newest_id_first() {
+    let w = World::new("queue-order");
+    replay(
+        &w,
+        &[(
+            9,
+            vec![l(10, 100, 1), l(11, 100, 1), l(12, 90, 1), l(9, 110, 1)],
+        )],
+    );
+    let lake = w.open();
+    let position = |id| history(&lake, id)[0].3;
+    assert_eq!(
+        [position(12), position(11), position(10), position(9)],
+        [1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn queue_place_counts_units_ahead_and_at_or_below() {
+    let w = World::new("queue-place");
+    replay(
+        &w,
+        &[(
+            9,
+            vec![l(10, 100, 3), l(11, 100, 2), l(12, 90, 1), l(9, 110, 4)],
+        )],
+    );
+    let lake = w.open();
+    // (position, units ahead, units at or below): the units at its price or
+    // lower count both listings at the price, whatever their order.
+    let place_of = |id| {
+        let row = &history(&lake, id)[0];
+        (row.3, row.4, row.5)
+    };
+    assert_eq!(place_of(12), (1, 0, 1));
+    assert_eq!(place_of(11), (2, 1, 6));
+    assert_eq!(place_of(10), (3, 3, 6));
+    assert_eq!(place_of(9), (4, 6, 10));
+}
+
+#[test]
+fn fronts_are_judged_per_item() {
+    // TD-H: in item 1, 702 (150) is gone behind the intact 700 (100). In item
+    // 2, 701 (120) is gone in front of the intact 703 (130). Judged across
+    // items, 701 would be behind 700 and unsold.
+    let w = World::new("per-item");
+    w.snapshot(
+        9,
+        &[
+            l(700, 100, 1),
+            l(702, 150, 1),
+            l(701, 120, 1).item(2),
+            l(703, 130, 1).item(2),
+        ],
+    );
+    w.snapshot(10, &[l(700, 100, 1), l(703, 130, 1).item(2)]);
+    assert!(w.process().failure.is_none());
+    let at_10 = events_at(&w.open(), 10);
+    assert_eq!(only(&at_10, 702).kind, EventKind::Cancelled);
+    assert_eq!(only(&at_10, 701).kind, EventKind::Sold);
+}
+
+#[test]
+fn intact_listing_adds_a_history_row_and_no_event() {
+    let w = World::new("intact");
+    replay(
+        &w,
+        &[
+            (9, vec![l(1, 100, 5).band("LONG")]),
+            (10, vec![l(1, 100, 5).band("MEDIUM")]),
+        ],
+    );
+    let lake = w.open();
+    assert!(events(&lake).is_empty());
+    assert_eq!(
+        history(&lake, 1),
+        [
+            (h(9), 5, "LONG".to_owned(), 1, 0, 5),
+            (h(10), 5, "MEDIUM".to_owned(), 1, 0, 5)
+        ]
+    );
+    let listing = &live(&lake)[0];
+    assert_eq!((listing.last_seen, listing.first_seen), (h(10), h(9)));
+    assert_eq!(listing.time_left, "MEDIUM");
+}
+
+// -------------------------------------------- a missed hour, and what 5.2.2 omits
+
+#[test]
+fn missing_bronze_hours_are_recorded_as_gaps_by_the_transform() {
+    let w = World::new("gap-one");
+    replay(&w, &[(10, vec![l(1, 100, 1)]), (12, vec![l(1, 100, 1)])]);
+    let lake = w.open();
+    assert_eq!(gaps(&lake), [h(11)]);
+    assert_eq!(processed(&lake), [(h(10), None), (h(12), Some(2))]);
+    let found_at: String = lake
+        .connection()
+        .query_row("SELECT CAST(found_at AS VARCHAR) FROM meta.gap", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(found_at, "2026-11-26 11:40:00+00");
+    assert!(events(&lake).is_empty());
+}
+
+#[test]
+fn listing_first_seen_after_a_gap_has_no_posting_hour_or_queue_at_posting() {
+    let w = World::new("gap-new");
+    replay(
+        &w,
+        &[
+            (10, vec![l(1, 100, 1)]),
+            (12, vec![l(1, 100, 1), l(2, 50, 2)]),
+        ],
+    );
+    let lake = w.open();
+    let new = live(&lake).into_iter().find(|x| x.id == 2).unwrap();
+    assert_eq!(
+        (new.posted, new.posting, new.first_seen),
+        (None, None, h(12))
+    );
+    // Its posting is still an event, dated to the current hour with its span.
+    let e = only(&events_at(&lake, 12), 2);
+    assert_eq!((e.kind, e.span), (EventKind::Posted, 2));
+}
+
+#[test]
+fn events_after_missed_hours_are_dated_to_the_current_hour_with_their_span() {
+    // TD-G: h10 held, h11 and h12 missed, C is h13, span 3, window [10, 13].
+    let w = World::new("td-g");
+    let seed = |id: u64, posted: i64| Seed {
+        listing: l(id, 100 + id, 1),
+        first_seen: posted,
+        posted: Some(posted),
+    };
+    w.seed(
+        10,
+        &[
+            Seed {
+                listing: l(600, 50, 1),
+                first_seen: 0,
+                posted: Some(0),
+            },
+            seed(601, 1),
+            seed(602, 0),
+            seed(603, -1),
+            seed(604, -2),
+            seed(608, -3),
+            seed(609, 10),
+        ],
+    );
+    w.snapshot(13, &[l(600, 50, 1), l(605, 200, 1).band("SHORT")]);
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let at_13 = events_at(&lake, 13);
+    assert!(
+        events(&lake).iter().all(|e| e.hour == h(13)),
+        "no event is dated to a missed hour"
+    );
+    for id in [601, 602, 603, 604] {
+        // posted + 12 is 13, 12, 11 and 10: C, inside, inside and C - span.
+        assert_eq!(only(&at_13, id).kind, EventKind::Expired, "{id}");
+        assert_eq!(record(&lake, id).duration, Some(Duration::H12));
+    }
+    for id in [608, 609] {
+        // h(-3) + 12 = 9, just before the window; h10 + 12 = 22, after it.
+        assert_eq!(only(&at_13, id).kind, EventKind::Cancelled, "{id}");
+    }
+    assert!(at_13.iter().all(|e| e.span == 3));
+    let posted = only(&at_13, 605);
+    assert_eq!((posted.kind, posted.span), (EventKind::Posted, 3));
+    assert_eq!(gaps(&lake), [h(11), h(12)]);
+    assert_eq!(processed(&lake).last(), Some(&(h(13), Some(3))));
+    let new = live(&lake).into_iter().find(|x| x.id == 605).unwrap();
+    assert_eq!((new.posted, new.posting), (None, None));
+
+    // At h14, span 1: 605 is gone behind 600, so its band decides: expired.
+    // A new 606 is posted at h14 with its queue.
+    w.snapshot(14, &[l(600, 50, 1), l(606, 210, 1)]);
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let at_14 = events_at(&lake, 14);
+    assert_eq!(
+        (only(&at_14, 605).kind, only(&at_14, 605).span),
+        (EventKind::Expired, 1)
+    );
+    assert_eq!(record(&lake, 605).duration, None);
+    let new = live(&lake).into_iter().find(|x| x.id == 606).unwrap();
+    assert_eq!(new.posted, Some(h(14)));
+    assert_eq!(new.posting, Some(place(50, 2, 1, 2)));
+}
+
+// ------------------------------------------------ G7: where 5.2.2 is silent
+
+#[test]
+fn quantity_rise_on_a_live_id_is_intact_with_no_event_and_a_warning() {
+    let w = World::new("g7-rise");
+    w.snapshot(9, &[l(1, 100, 3), l(2, 200, 4)]);
+    w.snapshot(10, &[l(1, 100, 5), l(2, 200, 4)]);
+    let outcome = w.process();
+    assert_eq!(outcome.warnings, [(HourWarning::QuantityRose, 1)]);
+    let lake = w.open();
+    assert!(events(&lake).is_empty());
+    assert_eq!(live(&lake)[0].quantity, 5);
+    assert_eq!(
+        history(&lake, 1).iter().map(|r| r.1).collect::<Vec<_>>(),
+        [3, 5]
+    );
+}
+
+#[test]
+fn a_listing_whose_quantity_rose_counts_as_intact_for_the_front() {
+    // 3 is gone behind 1, which rose: 1 is there, so 3 is unsold, not sold.
+    let w = World::new("g7-intact");
+    w.snapshot(9, &[l(1, 100, 3), l(3, 300, 1)]);
+    w.snapshot(10, &[l(1, 100, 5)]);
+    assert!(w.process().failure.is_none());
+    assert_eq!(
+        only(&events_at(&w.open(), 10), 3).kind,
+        EventKind::Cancelled
+    );
+}
+
+#[test]
+fn units_sold_of_a_raised_listing_can_exceed_its_first_quantity() {
+    let w = World::new("g7-sold");
+    w.snapshot(9, &[l(1, 100, 3)]);
+    w.snapshot(10, &[l(1, 100, 5)]);
+    w.snapshot(11, &[]);
+    assert!(w.process().failure.is_none());
+    let r = record(&w.open(), 1);
+    assert_eq!((r.quantity, r.units_sold, r.outcome), (3, 5, Result_::Sold));
+}
+
+#[test]
+fn price_change_on_a_live_id_is_kept_with_no_event_and_a_warning() {
+    let w = World::new("g7-price");
+    w.snapshot(9, &[l(1, 100, 3)]);
+    w.snapshot(10, &[l(1, 120, 3)]);
+    let outcome = w.process();
+    assert_eq!(outcome.warnings, [(HourWarning::PriceChanged, 1)]);
+    let lake = w.open();
+    assert!(events(&lake).is_empty());
+    assert_eq!(live(&lake)[0].unit_price, 120);
+}
+
+// ---------------------------------------------- the high-water mark and the hours
+
+#[test]
+fn transform_catches_up_every_bronze_hour_in_order() {
+    let w = World::new("catch-up");
+    let report = replay(
+        &w,
+        &[
+            (9, vec![l(1, 100, 1)]),
+            (10, vec![l(1, 100, 1), l(2, 90, 1)]),
+            (11, vec![l(2, 90, 1)]),
+            (12, vec![l(2, 90, 1)]),
+        ],
+    );
+    assert_eq!(report.metadata["hours"], "4");
+    let lake = w.open();
+    assert_eq!(
+        processed(&lake),
+        [
+            (h(9), None),
+            (h(10), Some(1)),
+            (h(11), Some(1)),
+            (h(12), Some(1))
+        ]
+    );
+    assert_eq!(mark(&lake), Some(h(12)));
+    let file: String = lake
+        .connection()
+        .query_row(
+            "SELECT bronze_file FROM meta.processed ORDER BY hour LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(file, "bronze/commodities/eu/2026-11-20T09.parquet");
+}
+
+#[test]
+fn only_the_hours_after_the_mark_are_processed() {
+    let w = World::new("after-mark");
+    replay(&w, &[(9, vec![l(1, 100, 1)]), (10, vec![l(1, 100, 1)])]);
+    w.snapshot(11, &[l(1, 100, 1)]);
+    let outcome = w.process();
+    assert_eq!(
+        outcome.hours.iter().map(|s| s.hour).collect::<Vec<_>>(),
+        [h(11)]
+    );
+}
+
+#[test]
+fn reprocessing_a_committed_hour_changes_nothing() {
+    let w = World::new("idempotent");
+    replay(
+        &w,
+        &[
+            (9, vec![l(1, 100, 3), l(2, 200, 1)]),
+            (10, vec![l(2, 200, 1)]),
+        ],
+    );
+    let before = dump(&w.open());
+    let again = w.run();
+    assert_eq!(again.outcome, Severity::Ok);
+    assert_eq!(again.metadata["hours"], "0");
+    assert_eq!(dump(&w.open()), before);
+}
+
+#[test]
+fn a_run_per_hour_gives_the_same_silver_as_one_run_over_all_of_them() {
+    let hours: Vec<(i64, Vec<L>)> = vec![
+        (
+            9,
+            with_anchor(vec![l(102, 100, 3), l(101, 100, 5), l(103, 110, 4)]),
+        ),
+        (
+            10,
+            with_anchor(vec![l(102, 100, 3), l(101, 100, 4), l(103, 110, 4)]),
+        ),
+        (
+            12,
+            with_anchor(vec![l(101, 100, 4), l(103, 110, 4), l(104, 90, 2)]),
+        ),
+        (13, with_anchor(vec![l(103, 110, 4), l(104, 90, 1)])),
+    ];
+    let all = World::new("replay-all");
+    replay(&all, &hours);
+    let each = World::new("replay-each");
+    for hour in &hours {
+        replay(&each, std::slice::from_ref(hour));
+    }
+    assert_eq!(dump(&all.open()), dump(&each.open()));
+}
+
+// ----------------------------------------------------------------- failure
+
+#[test]
+fn next_run_reprocesses_a_failed_hour() {
+    for step in [
+        Step::Compare,
+        Step::Events,
+        Step::Records,
+        Step::Apply,
+        Step::Gold,
+        Step::Meta,
+    ] {
+        let name = format!("rollback-{step:?}");
+        let hours = [
+            (10, with_anchor(vec![l(1, 100, 3), l(2, 200, 1)])),
+            // h11 is missed: the failed hour also holds a gap, an event of each kind and a record.
+            (12, with_anchor(vec![l(2, 200, 1), l(3, 150, 2)])),
+        ];
+        let w = World::new(&name);
+        replay(&w, &hours[..1]);
+        let before = dump(&w.open());
+        w.snapshot(12, &hours[1].1);
+
+        let report = run_hooked(&w.config, &w.clock, &w.backend(), &|hour, at| {
+            if at == step {
+                Err(Failure::unexpected("INJECTED", "A failure mid-hour.")
+                    .with_metadata("hour", bronze::hour_name(hour)))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(report.reason, "INJECTED", "{step:?}");
+        assert_eq!(exit_status(&report), ExitStatus::Unexpected);
+        assert_eq!(report.metadata["hours_processed"], "0");
+        let lake = w.open();
+        assert_eq!(
+            dump(&lake),
+            before,
+            "nothing of the hour is visible after a failure at {step:?}"
+        );
+        assert_eq!(mark(&lake), Some(h(10)));
+        drop(lake);
+
+        // The next run processes it, giving what an uninterrupted run gives.
+        let report = w.run();
+        assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:#?}");
+        assert_eq!(warned_of(&report), ["HOUR_MISSED"], "h11 was missed");
+        assert_eq!(report.metadata["hours"], "1");
+        let clean = World::new(&format!("{name}-clean"));
+        replay(&clean, &hours);
+        assert_eq!(dump(&w.open()), dump(&clean.open()), "{step:?}");
+    }
+}
+
+#[test]
+fn a_failed_hour_is_rolled_back_on_the_connection_that_failed() {
+    // Not through a run, which closes the connection and so abandons the
+    // transaction anyway: the same connection must see none of the hour and
+    // be able to begin the next.
+    let w = World::new("rollback-same");
+    w.snapshot(10, &[l(1, 100, 3), l(2, 200, 1)]);
+    w.snapshot(11, &[l(2, 200, 1)]);
+    let lake = w.open();
+    vocabulary::install(&lake).unwrap();
+    let ok = |_: Hour, _: Step| Ok(());
+    hour::process(&lake, &w.config.data_dir, &w.clock, h(10), None, &ok).unwrap();
+    let before = dump(&lake);
+    let fail = |_: Hour, at: Step| {
+        if at == Step::Apply {
+            Err(Failure::unexpected("INJECTED", "x"))
+        } else {
+            Ok(())
+        }
+    };
+    assert!(
+        hour::process(
+            &lake,
+            &w.config.data_dir,
+            &w.clock,
+            h(11),
+            Some(h(10)),
+            &fail
+        )
+        .is_err()
+    );
+    assert_eq!(dump(&lake), before);
+    hour::process(&lake, &w.config.data_dir, &w.clock, h(11), Some(h(10)), &ok).unwrap();
+    assert_eq!(processed(&lake).len(), 2);
+}
+
+#[test]
+fn a_failed_hour_keeps_the_hours_before_it_and_stops() {
+    let w = World::new("stops");
+    w.snapshot(9, &[l(1, 100, 1)]);
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(11, &[l(1, 100, 1)]);
+    let report = run_hooked(&w.config, &w.clock, &w.backend(), &|hour, at| {
+        if hour == h(10) && at == Step::Apply {
+            Err(Failure::unexpected("INJECTED", "x"))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(report.metadata["hours_processed"], "1");
+    assert_eq!(report.metadata["hour"], "2026-11-20T10");
+    let lake = w.open();
+    assert_eq!(processed(&lake), [(h(9), None)]);
+}
+
+#[test]
+fn unreadable_bronze_hour_stops_the_transform_with_exit_70() {
+    let w = World::new("corrupt");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(11, &[l(1, 100, 1)]);
+    w.snapshot(12, &[l(1, 100, 1)]);
+    std::fs::write(bronze::path(&w.config.data_dir, h(11)), b"not parquet").unwrap();
+    let report = w.run();
+    assert_eq!(report.reason, "BRONZE_HOUR_UNREADABLE");
+    assert_eq!(exit_status(&report), ExitStatus::Unexpected);
+    assert_eq!(report.metadata["hour"], "2026-11-20T11");
+    assert_eq!(processed(&w.open()), [(h(10), None)]);
+
+    w.snapshot(11, &[l(1, 100, 1)]);
+    let report = w.run();
+    assert_eq!(report.outcome, Severity::Ok);
+    assert_eq!(processed(&w.open()).len(), 3);
+}
+
+#[test]
+fn an_hour_that_is_not_what_its_file_says_is_refused() {
+    // A repeated ID would be joined twice.
+    let w = World::new("invalid-dup");
+    w.snapshot(10, &[l(1, 100, 1), l(1, 100, 2)]);
+    let report = w.run();
+    assert_eq!(report.reason, "BRONZE_HOUR_INVALID");
+    assert_ne!(report.metadata["rows"], "0");
+    assert_ne!(report.metadata["rows"], report.metadata["distinct_ids"]);
+    assert!(processed(&w.open()).is_empty());
+}
+
+#[test]
+fn a_null_in_any_bronze_column_is_refused() {
+    for column in [
+        "hour",
+        "last_modified",
+        "fetched_at",
+        "id",
+        "item",
+        "quantity",
+        "unit_price",
+        "time_left",
+    ] {
+        let w = World::new(&format!("null-{column}"));
+        w.snapshot(10, &[l(1, 100, 1), l(2, 110, 1)]);
+        let file = bronze::path(&w.config.data_dir, h(10));
+        let rewritten = file.with_extension("rewritten");
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT * REPLACE (CASE WHEN id = 1 THEN NULL ELSE {column} END AS {column}) \
+                 FROM read_parquet('{}')) TO '{}' (FORMAT PARQUET);",
+                file.to_string_lossy(),
+                rewritten.to_string_lossy()
+            ))
+            .unwrap();
+        std::fs::rename(&rewritten, &file).unwrap();
+        let report = w.run();
+        assert_eq!(report.reason, "BRONZE_HOUR_INVALID", "{column}");
+        assert_eq!(report.metadata["rows_with_a_null"], "1", "{column}");
+        assert!(processed(&w.open()).is_empty());
+    }
+}
+
+#[test]
+fn invalid_bronze_hour_stops_the_transform_with_exit_70_keeping_earlier_hours() {
+    let w = World::new("invalid-hour");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    std::fs::copy(
+        bronze::path(&w.config.data_dir, h(10)),
+        bronze::path(&w.config.data_dir, h(11)),
+    )
+    .unwrap();
+    let report = w.run();
+    assert_eq!(report.reason, "BRONZE_HOUR_INVALID");
+    assert_eq!(exit_status(&report), ExitStatus::Unexpected);
+    assert_eq!(report.metadata["hour"], "2026-11-20T11");
+    assert_eq!(report.metadata["rows_of_another_hour"], "1");
+    assert_eq!(
+        processed(&w.open()),
+        [(h(10), None)],
+        "the hour before it is kept"
+    );
+}
+
+#[test]
+fn nothing_to_process_is_a_run_that_completed() {
+    let w = World::new("nothing");
+    let report = w.run();
+    assert_eq!(
+        (report.outcome, report.metadata["hours"].as_str()),
+        (Severity::Ok, "0")
+    );
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    assert_eq!(mark(&w.open()), None);
+}
+
+#[test]
+fn an_empty_first_snapshot_is_held_and_the_next_posts_every_listing() {
+    let w = World::new("empty-first");
+    replay(&w, &[(10, vec![]), (11, vec![l(1, 100, 2), l(2, 90, 1)])]);
+    let lake = w.open();
+    assert_eq!(processed(&lake), [(h(10), None), (h(11), Some(1))]);
+    let at_11 = events_at(&lake, 11);
+    assert_eq!(at_11.len(), 2);
+    assert!(at_11.iter().all(|e| e.kind == EventKind::Posted));
+    assert_eq!(live(&lake)[0].posted, Some(h(11)));
+}
+
+#[test]
+fn a_lake_that_cannot_be_opened_stops_the_run_fundamental_exit_2() {
+    let w = World::new("no-lake");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let report = run_with(
+        &w.config,
+        &w.clock,
+        &Backend::PlainFile("/nonexistent-dir/lake.duckdb".into()),
+    );
+    assert_eq!(report.reason, "LAKE_UNAVAILABLE");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+}
+
+// -------------------------------------------------------------------- lock
+
+#[test]
+fn the_lock_is_held_for_the_whole_transform() {
+    let w = World::new("lock-whole");
+    w.snapshot(9, &[l(1, 100, 1)]);
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let refused = Cell::new(0);
+    let asked = Cell::new(0);
+    let report = run_hooked(&w.config, &w.clock, &w.backend(), &|_, _| {
+        asked.set(asked.get() + 1);
+        if matches!(
+            lock::acquire(&w.config.lock_file, StdDuration::ZERO, &w.clock),
+            Err(Failure::Stop(r)) if r.reason == "LOCK_WAIT_EXPIRED"
+        ) {
+            refused.set(refused.get() + 1);
+        }
+        Ok(())
+    });
+    assert_eq!(report.outcome, Severity::Ok);
+    assert!(asked.get() >= 10, "every step of both hours asked");
+    assert_eq!(refused.get(), asked.get());
+    // Released at the end.
+    assert!(lock::acquire(&w.config.lock_file, StdDuration::ZERO, &w.clock).is_ok());
+}
+
+#[test]
+fn a_lock_held_past_the_wait_stops_the_run_with_a_blip_and_changes_nothing() {
+    let w = World::new("lock-held");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let _held = lock::acquire(&w.config.lock_file, StdDuration::ZERO, &w.clock).unwrap();
+    let report = w.run();
+    assert_eq!(report.reason, "LOCK_WAIT_EXPIRED");
+    assert_eq!(exit_status(&report), ExitStatus::Blip);
+    assert!(
+        !w.dir.join("lake.duckdb").exists(),
+        "the lake was not opened"
+    );
+}
+
+/// A clock that lets go of the lock it was given the first time it waits.
+struct ReleasesOnWait {
+    inner: FakeClock,
+    held: std::cell::RefCell<Option<lock::Lock>>,
+}
+
+impl Clock for ReleasesOnWait {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.inner.now()
+    }
+
+    fn sleep(&self, duration: StdDuration) {
+        self.held.borrow_mut().take();
+        self.inner.sleep(duration);
+    }
+}
+
+#[test]
+fn persons_transform_waits_for_the_hourly_runs_lock() {
+    // H1: a person runs `dp transform` while the hourly run holds the lock; it
+    // waits for it and, once it is let go inside the lock wait, runs.
+    let w = World::new("lock-waits");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let inner = FakeClock::at("2026-11-26T11:40:00Z");
+    let held = lock::acquire(&w.config.lock_file, StdDuration::ZERO, &inner).unwrap();
+    let clock = ReleasesOnWait {
+        inner,
+        held: std::cell::RefCell::new(Some(held)),
+    };
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(clock.inner.slept().len(), 1, "it waited once for the lock");
+    assert_eq!(processed(&w.open()), [(h(10), None)]);
+}
+
+// ------------------------------------------------------------------- bound
+
+/// The hours that took longer than the bound, where the one hour's Apply step
+/// takes `seconds`.
+fn over_bound_after(seconds: u64, name: &str) -> Vec<(Hour, StdDuration)> {
+    let w = World::new(name);
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let lake = w.open();
+    let held = w.lock();
+    let outcome = process_hours(
+        &lake,
+        &w.config.data_dir,
+        &w.clock,
+        &|_, at| {
+            if at == Step::Apply {
+                w.clock.sleep(StdDuration::from_secs(seconds));
+            }
+            Ok(())
+        },
+        &held,
+    );
+    assert!(outcome.failure.is_none());
+    let times = crate::bound::HourTimes::default();
+    times.add_run(&outcome.took, StdDuration::ZERO);
+    times.over_bound()
+}
+
+#[test]
+fn an_hour_that_took_over_5_minutes_is_over_the_bound() {
+    assert_eq!(
+        over_bound_after(301, "bound-over"),
+        [(h(10), StdDuration::from_secs(301))]
+    );
+}
+
+#[test]
+fn hour_processed_in_5_minutes_or_less_logs_no_warning() {
+    assert!(over_bound_after(300, "bound-exact").is_empty());
+    assert!(over_bound_after(0, "bound-none").is_empty());
+    // Run for real, exactly the bound is no warning and no count.
+    let w = World::new("bound-exact-run");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let (report, text) = logging(|| {
+        run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+            if at == Step::Apply {
+                w.clock.sleep(StdDuration::from_secs(300));
+            }
+            Ok(())
+        })
+    });
+    assert_eq!(report.outcome, Severity::Ok);
+    assert_eq!(report.metadata["hours_over_bound"], "0");
+    assert!(!text.contains("HOUR_OVER_BOUND"), "{text}");
+}
+
+#[test]
+fn hour_processed_over_5_minutes_is_logged_as_a_warning() {
+    let w = World::new("bound-run");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let (report, text) = logging(|| {
+        run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+            if at == Step::Apply {
+                w.clock.sleep(StdDuration::from_secs(301));
+            }
+            Ok(())
+        })
+    });
+    assert_eq!(report.outcome, Severity::Ok);
+    assert_eq!(report.metadata["hours_over_bound"], "1");
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    let warning = text
+        .lines()
+        .find(|line| line.contains("HOUR_OVER_BOUND"))
+        .unwrap_or_else(|| panic!("the warning is logged: {text}"));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(
+        warning.contains("2026-11-20T10"),
+        "it names the hour: {warning}"
+    );
+}
+
+#[test]
+fn transform_run_alone_counts_its_own_time_against_the_bound() {
+    // H10, TT3: the hour's own steps take no time; opening and migrating the
+    // lake, which no hook reaches, takes 301 s, and the run is shared out to
+    // the hour.
+    let w = World::new("bound-open");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let clock = SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        w.dir.join("lake.duckdb"),
+        StdDuration::from_secs(301),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "1");
+}
+
+#[test]
+fn a_run_with_no_hour_to_process_counts_nothing_against_the_bound() {
+    let w = World::new("bound-no-hour");
+    let clock = SlowOnceWritten::new(
+        "2026-11-26T11:40:00Z",
+        w.dir.join("lake.duckdb"),
+        StdDuration::from_secs(301),
+    );
+    let report = run_with(&w.config, &clock, &w.backend());
+    assert_eq!(report.outcome, Severity::Ok, "{report:?}");
+    assert_eq!(report.metadata["hours_over_bound"], "0");
+}
+
+#[test]
+fn a_lock_on_another_file_is_refused_before_the_lake_is_opened() {
+    let w = World::new("lock-other-file");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let other = w.dir.join("other.lock");
+    let lent = lock::acquire(&other, StdDuration::ZERO, &w.clock).unwrap();
+    let report = run_locked(
+        &w.config,
+        &w.clock,
+        &w.backend(),
+        &|_, _| Ok(()),
+        &lent,
+        &crate::bound::HourTimes::default(),
+    );
+    assert_eq!(report.reason, "LOCK_NOT_THE_LOCK_FILE");
+    assert!(
+        !w.dir.join("lake.duckdb").exists(),
+        "the lake was not opened"
+    );
+}
+
+// ------------------------------------------------------------ DuckLake's limits
+
+#[test]
+fn the_transform_sql_uses_only_what_ducklake_supports() {
+    for (_, file) in hour::STEPS {
+        let code: String = file
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_uppercase();
+        // What DuckLake does not support, and what is avoided by choice: a
+        // whole replace and an insert are simpler than `UPDATE` or `MERGE`,
+        // which DuckLake does support.
+        let unsupported = [
+            "PRIMARY KEY",
+            "UNIQUE",
+            "CHECK",
+            "FOREIGN KEY",
+            " ENUM",
+            "CREATE INDEX",
+            "CREATE SEQUENCE",
+            "ON CONFLICT",
+        ];
+        let avoided = ["MERGE INTO", "UPDATE "];
+        for banned in unsupported.iter().chain(&avoided) {
+            assert!(!code.contains(banned), "{banned} in the transform SQL");
+        }
+    }
+}
+
+// ------------------------------------------------------- the exit, run alone
+
+/// A world with hour 10 in bronze and a lake that is already migrated, so a
+/// run's failure is in its hour and not in the lake's opening.
+fn world_with_a_migrated_lake(name: &str) -> World {
+    let w = World::new(name);
+    w.snapshot(10, &[l(1, 100, 1)]);
+    drop(w.open());
+    w
+}
+
+#[test]
+fn transform_out_of_memory_exits_2_when_run_alone() {
+    // X3, D28.6: DuckDB really runs out of memory under the job's limit, in
+    // the work after the lake is opened; the run stops on a fundamental error,
+    // exit 2, and the hour is not committed.
+    let w = world_with_a_migrated_lake("oom-alone");
+    let report = crate::lake::starved::under(crate::lake::starved::AFTER_OPENING, || w.run());
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(report.error_type, Some(ErrorType::TechnicalFundamental));
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+    assert_eq!(mark(&w.open()), None, "no hour is committed");
+}
+
+#[test]
+fn transform_out_of_memory_in_migrating_the_lake_exits_2_when_run_alone() {
+    // X3: the same before any hour, on a lake that is still to be migrated.
+    let w = World::new("oom-migrating");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    let report = crate::lake::starved::under(crate::lake::starved::TINY, || w.run());
+    assert_eq!(report.reason, "OUT_OF_MEMORY", "{report:#?}");
+    assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+}
+
+#[test]
+fn transform_run_alone_exits_by_its_errors_type_and_never_3() {
+    // D28.12, X3, X4, H2: the lock held past the wait 75; the lake
+    // unavailable, a full disk or no memory 2; a failure of the lake or an
+    // unexpected one in an hour 70. A run alone has no pivot, so never 3.
+    let fails = |failure: fn() -> Failure| {
+        let w = world_with_a_migrated_lake("exit-by-type");
+        run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+            if at == Step::Apply {
+                Err(failure())
+            } else {
+                Ok(())
+            }
+        })
+    };
+    /// What a case is called, the failure it injects, the reason and the exit.
+    type Case = (&'static str, fn() -> Failure, &'static str, u8);
+    let cases: [Case; 4] = [
+        (
+            "out of memory",
+            || crate::lake::out_of_memory("Out of Memory Error: x", "injected"),
+            "OUT_OF_MEMORY",
+            2,
+        ),
+        (
+            "a full disk",
+            || {
+                crate::collect::failure::io_failure(
+                    &std::io::Error::from(std::io::ErrorKind::StorageFull),
+                    "injected",
+                )
+            },
+            "DISK_FULL",
+            2,
+        ),
+        (
+            "a failure of the lake",
+            || lake_failure("Binder Error: no such column", "injected"),
+            "LAKE_FAILED",
+            70,
+        ),
+        (
+            "an unexpected failure in the hour",
+            || Failure::unexpected("INJECTED", "x"),
+            "INJECTED",
+            70,
+        ),
+    ];
+    for (what, failure, reason, status) in cases {
+        let report = fails(failure);
+        assert_eq!(exit_status(&report).code(), status, "{what}: {report:#?}");
+        assert_eq!(report.outcome, Severity::Fatal, "{what}");
+        assert_eq!(report.reason, reason, "{what}");
+    }
+    let w = world_with_a_migrated_lake("exit-by-type-lock");
+    let _held = w.lock();
+    assert_eq!(exit_status(&w.run()).code(), 75);
+}
+
+// ------------------------------------------------- the price of a sale (EV-2, EV-7)
+
+#[test]
+fn quantity_drop_at_a_changed_price_is_a_sale_at_the_new_price() {
+    // TD-M, D1.7, EV-7: 802 goes from 120 x 3 to 125 x 2 behind intact
+    // listings: a sale of the 1 unit the quantity dropped by, priced at the
+    // 125 it is listed at now, and a warning names it. 800's quantity rose and
+    // 801's price changed: kept, no event, each named in a warning.
+    let w = World::new("td-m");
+    let live = |c: &[L]| c.iter().map(|x| x.item(1)).collect::<Vec<_>>();
+    let before = live(&[l(800, 100, 5), l(801, 110, 4), l(802, 120, 3)]);
+    w.snapshot(9, &before);
+    w.snapshot(10, &before);
+    w.snapshot(11, &live(&[l(800, 100, 7), l(801, 115, 4), l(802, 125, 2)]));
+    let outcome = w.process();
+    assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+    let lake = w.open();
+    let at_11 = events_at(&lake, 11);
+    assert_eq!(at_11.len(), 1, "{at_11:#?}");
+    assert_eq!(
+        at_11[0],
+        Event {
+            unit_price: Copper(125),
+            ..event(h(11), 802, EventKind::PartlySold, 1, 1)
+        }
+    );
+    assert_eq!(live_by_id(&lake, 802).unit_price, 125);
+    assert!(
+        outcome
+            .warnings
+            .contains(&(HourWarning::SaleBehindIntact, 802)),
+        "{:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome.warnings.contains(&(HourWarning::QuantityRose, 800)),
+        "{:?}",
+        outcome.warnings
+    );
+    assert!(
+        outcome.warnings.contains(&(HourWarning::PriceChanged, 801)),
+        "{:?}",
+        outcome.warnings
+    );
+}
+
+fn live_by_id(lake: &Lake, id: u64) -> Live {
+    live(lake).into_iter().find(|l| l.id == id).unwrap()
+}
+
+#[test]
+fn partly_sold_event_is_priced_at_the_listings_current_price() {
+    // EV-2: the drop is priced at the listing's price in the snapshot that
+    // showed it, not the price it was first seen at: 1 is reduced and
+    // re-priced, 2 is reduced at the price it had.
+    let w = World::new("ev2-price");
+    replay(
+        &w,
+        &[
+            (9, vec![l(1, 100, 10), l(2, 200, 6)]),
+            (10, vec![l(1, 110, 7), l(2, 200, 4)]),
+        ],
+    );
+    let lake = w.open();
+    let at_10 = events_at(&lake, 10);
+    let priced = |id: u64| {
+        let event = only(&at_10, id);
+        (event.kind, event.units, event.unit_price)
+    };
+    assert_eq!(priced(1), (EventKind::PartlySold, 3, Copper(110)));
+    assert_eq!(priced(2), (EventKind::PartlySold, 2, Copper(200)));
+}
+
+// ------------------------------------------------- the latest hour (H3)
+
+#[test]
+fn latest_hour_not_yet_collected_is_no_gap() {
+    // H3, D17.5: the hours held are 10 and 11 and hour 12 is not yet collected:
+    // with no later snapshot it is no gap. Once hour 13 is held, a later run
+    // finds 12 missing and records it, found at that run's time.
+    let w = World::new("not-yet-collected");
+    replay(&w, &[(10, vec![l(1, 100, 1)]), (11, vec![l(1, 100, 1)])]);
+    let lake = w.open();
+    assert_eq!(gaps(&lake), Vec::<Hour>::new());
+    assert_eq!(mark(&lake), Some(h(11)));
+    drop(lake);
+
+    // A run again with still nothing newer is no more of a gap.
+    w.clock.sleep(StdDuration::from_secs(3600));
+    assert_eq!(w.run().outcome, Severity::Ok);
+    assert_eq!(gaps(&w.open()), Vec::<Hour>::new());
+
+    w.snapshot(13, &[l(1, 100, 1)]);
+    w.clock.sleep(StdDuration::from_secs(3600));
+    let found_at = w.clock.now();
+    let report = w.run();
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    assert_eq!(
+        warned_of(&report),
+        ["HOUR_MISSED"],
+        "the hour found missing; a gap's interval is not judged"
+    );
+    let lake = w.open();
+    assert_eq!(gaps(&lake), [h(12)]);
+    assert_eq!(processed(&lake).last(), Some(&(h(13), Some(2))));
+    let recorded: String = lake
+        .connection()
+        .query_row("SELECT CAST(found_at AS VARCHAR) FROM meta.gap", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        recorded,
+        found_at.format("%Y-%m-%d %H:%M:%S+00").to_string()
+    );
+}
+
+#[test]
+fn sold_event_carries_the_quantity_last_seen() {
+    // EV-3: 1 is listed with 5, drops to 3 and is then gone from the front: the
+    // sale is of the 3 it had when last seen, not the 5 it began with, and
+    // its record counts the 2 sold before and the 3 after.
+    let w = World::new("sold-last-seen");
+    w.snapshot(9, &[l(1, 100, 5), l(2, 200, 1)]);
+    w.snapshot(10, &[l(1, 100, 3), l(2, 200, 1)]);
+    w.snapshot(11, &[l(2, 200, 1)]);
+    assert!(w.process().failure.is_none());
+    let lake = w.open();
+    let sold = find(&events_at(&lake, 11), 1, EventKind::Sold);
+    assert_eq!((sold.units, sold.tier), (3, Tier::Inferred));
+    assert_eq!(record(&lake, 1).units_sold, 5);
+}
+
+#[test]
+fn only_an_expired_or_cancelled_event_can_carry_a_tie() {
+    // EV-4: one hour with an event of every kind but expired (which
+    // `a_tie_marks_an_expired_event_too` has). 301 is gone behind the intact 302
+    // at its price and snapshot: a tie. The sale (310), the part sale (312)
+    // and the posting (320) are not.
+    let w = World::new("tie-kinds");
+    w.snapshot(9, &[anchor()]);
+    w.snapshot(
+        10,
+        &with_anchor(vec![
+            l(301, 200, 1),
+            l(302, 200, 1),
+            l(310, 100, 2),
+            l(312, 400, 3),
+        ]),
+    );
+    w.snapshot(
+        11,
+        &with_anchor(vec![l(302, 200, 1), l(312, 400, 2), l(320, 300, 1)]),
+    );
+    assert!(w.process().failure.is_none());
+    let at_11 = events_at(&w.open(), 11);
+    for (id, kind) in [
+        (301, EventKind::Cancelled),
+        (310, EventKind::Sold),
+        (312, EventKind::PartlySold),
+        (320, EventKind::Posted),
+    ] {
+        let event = find(&at_11, id, kind);
+        assert_eq!(event.tie, id == 301, "{event:?}");
+    }
+    assert!(
+        at_11
+            .iter()
+            .all(|e| !e.tie || matches!(e.kind, EventKind::Expired | EventKind::Cancelled)),
+        "{at_11:?}"
+    );
+}
+
+#[test]
+fn gap_is_written_in_the_later_hours_transaction() {
+    // H3: h11 is missing between the snapshots h10 and h12; the gap is found
+    // in h12's transaction, so h12 failing leaves no gap and the next run
+    // finds it.
+    let w = World::new("gap-transaction");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    assert!(w.process().failure.is_none());
+    w.snapshot(12, &[l(1, 100, 1)]);
+    let report = run_hooked(&w.config, &w.clock, &w.backend(), &|_, at| {
+        if at == Step::Meta {
+            Err(Failure::unexpected("INJECTED", "A failure mid-hour."))
+        } else {
+            Ok(())
+        }
+    });
+    assert_eq!(report.reason, "INJECTED");
+    assert_eq!(gaps(&w.open()), Vec::<Hour>::new());
+    assert_eq!(report.metadata["hours_processed"], "0");
+
+    let report = w.run();
+    assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:#?}");
+    assert_eq!(warned_of(&report), ["HOUR_MISSED"]);
+    assert_eq!(gaps(&w.open()), [h(11)]);
+    assert_eq!(processed(&w.open()).len(), 2);
+}
+
+// When Blizzard's response changes (5.2.1, 5.2.2)
+
+/// The reasons of the warnings a run's report lists, in order.
+fn warned_of(report: &Report) -> Vec<&str> {
+    report.warnings.iter().map(|w| w.reason.as_str()).collect()
+}
+
+#[test]
+fn time_left_not_a_band_is_processed_kept_as_given_and_warned_with_the_value() {
+    let w = World::new("time-left-unknown");
+    w.snapshot(10, &[l(1, 100, 1).band("FOREVER"), l(2, 110, 1)]);
+    let (report, text) = logging(|| w.run());
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:?}");
+    assert_eq!(report.outcome, Severity::Warning);
+    assert_eq!(report.reason, "TIME_LEFT_UNKNOWN");
+    let [warning] = report.warnings.as_slice() else {
+        panic!("one warning: {report:?}");
+    };
+    assert_eq!(warning.metadata["hour"], "2026-11-20T10");
+    assert_eq!(warning.metadata["values"], "FOREVER");
+    assert_eq!(warning.metadata["listings"], "1");
+    assert!(text.contains("TIME_LEFT_UNKNOWN"), "{text}");
+    let lake = w.open();
+    assert_eq!(processed(&lake), [(h(10), None)], "the hour is held");
+    let held: Vec<(u64, String)> = live(&lake)
+        .into_iter()
+        .map(|l| (l.id, l.time_left))
+        .collect();
+    assert_eq!(
+        held,
+        [(1, "FOREVER".to_owned()), (2, "LONG".to_owned())],
+        "silver keeps the value as given"
+    );
+    assert_eq!(history(&lake, 1)[0].2, "FOREVER");
+}
+
+#[test]
+fn a_snapshot_of_known_bands_warns_of_no_time_left() {
+    let w = World::new("time-left-known");
+    w.snapshot(
+        10,
+        &[l(1, 100, 1).band("SHORT"), l(2, 110, 1).band("VERY_LONG")],
+    );
+    let report = w.run();
+    assert_eq!(report.outcome, Severity::Ok);
+    assert!(report.warnings.is_empty());
+}
+
+#[test]
+fn unknown_time_left_is_warned_once_an_hour_with_its_values_and_listings() {
+    let w = World::new("time-left-each-hour");
+    w.snapshot(
+        10,
+        &[
+            l(1, 100, 1).band("FOREVER"),
+            l(2, 110, 1).band("ODD"),
+            l(3, 120, 1).band("ODD"),
+            l(4, 130, 1),
+        ],
+    );
+    w.snapshot(11, &[l(1, 100, 1).band("FOREVER"), l(4, 130, 1)]);
+    let report = w.run();
+
+    assert_eq!(
+        warned_of(&report),
+        ["TIME_LEFT_UNKNOWN", "TIME_LEFT_UNKNOWN"]
+    );
+    let first = &report.warnings[0].metadata;
+    assert_eq!(
+        (
+            first["hour"].as_str(),
+            first["values"].as_str(),
+            first["listings"].as_str()
+        ),
+        ("2026-11-20T10", "FOREVER,ODD", "3")
+    );
+    let second = &report.warnings[1].metadata;
+    assert_eq!(
+        (
+            second["hour"].as_str(),
+            second["values"].as_str(),
+            second["listings"].as_str()
+        ),
+        ("2026-11-20T11", "FOREVER", "1")
+    );
+}
+
+#[test]
+fn gone_behind_an_intact_listing_expires_only_where_its_band_shows_it_could() {
+    // EV-5, posting hour unknown: a band's lower bound under the span expires
+    // it; a time left that is not a band has no bound, so it is cancelled.
+    for (name, band, kind) in [
+        ("short", "SHORT", EventKind::Expired),
+        ("long", "LONG", EventKind::Cancelled),
+        ("unknown", "FOREVER", EventKind::Cancelled),
+        ("unknown-shouting", "short", EventKind::Cancelled),
+    ] {
+        let w = World::new(&format!("ev5-{name}"));
+        w.snapshot(10, &[l(1, 100, 5), l(2, 200, 5).band(band)]);
+        w.snapshot(11, &[l(1, 100, 5)]);
+        w.run();
+        let lake = w.open();
+        let events = events(&lake);
+        let ended: Vec<EventKind> = events
+            .iter()
+            .filter(|e| e.id.0 == 2)
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(ended, [kind], "{name}");
+        let gold = item_hours(&lake);
+        let counted = gold
+            .iter()
+            .find(|g| g.hour == h(11))
+            .unwrap()
+            .flows
+            .unwrap();
+        assert_eq!(counted[1], 0, "{name}: nothing here is a certain sale");
+        assert_eq!(counted[2], 0, "{name}: nor an estimated one");
+    }
+}
+
+#[test]
+fn unknown_time_left_gone_from_the_front_is_the_estimate_and_never_the_floor() {
+    let w = World::new("ev3-unknown");
+    w.snapshot(10, &[l(1, 100, 5).band("FOREVER")]);
+    w.snapshot(11, &[l(9, 50, 1).item(2)]);
+    w.run();
+    let lake = w.open();
+    let found = events(&lake);
+    assert_eq!(find(&found, 1, EventKind::Sold).units, 5);
+    let flows = item_hours(&lake)
+        .into_iter()
+        .find(|g| g.item == 1 && g.hour == h(11))
+        .unwrap()
+        .flows
+        .unwrap();
+    // posted, sold floor, sold estimate, expired, cancelled
+    assert_eq!(flows, [0, 0, 5, 0, 0]);
+}
+
+#[test]
+fn each_hour_missed_is_warned_and_the_run_exits_0() {
+    let w = World::new("missed");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(13, &[l(1, 100, 1)]);
+    let report = w.run();
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    let missed: Vec<&str> = report
+        .warnings
+        .iter()
+        .filter(|w| w.reason == "HOUR_MISSED")
+        .map(|w| w.metadata["hour"].as_str())
+        .collect();
+    assert_eq!(missed, ["2026-11-20T11", "2026-11-20T12"]);
+    assert_eq!(gaps(&w.open()), [h(11), h(12)]);
+}
+
+#[test]
+fn hours_held_one_after_another_warn_of_no_missed_hour() {
+    let w = World::new("not-missed");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(11, &[l(1, 100, 1)]);
+    let report = w.run();
+    assert!(report.warnings.is_empty(), "{report:?}");
+}
+
+#[test]
+fn the_time_between_last_modified_not_about_an_hour_warns_the_refresh_interval_changed() {
+    // From 50 to 70 minutes, both included, is about an hour.
+    for (name, second, changed) in [
+        ("hour", "2026-11-20T11:31:40Z", None),
+        ("least", "2026-11-20T11:21:40Z", None),
+        ("most", "2026-11-20T11:41:40Z", None),
+        ("under", "2026-11-20T11:21:39Z", Some("2999")),
+        ("over", "2026-11-20T11:41:41Z", Some("4201")),
+        ("half-hourly", "2026-11-20T11:01:40Z", Some("1800")),
+    ] {
+        let w = World::new(&format!("interval-{name}"));
+        // Hour 10 of the test world is 2026-11-20T10:00; its refresh :31:40.
+        w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
+        w.snapshot_modified(11, &[l(1, 100, 1)], Some(second));
+        let report = w.run();
+
+        assert_eq!(exit_status(&report), ExitStatus::Completed, "{name}");
+        match changed {
+            None => assert!(report.warnings.is_empty(), "{name}: {report:?}"),
+            Some(seconds) => {
+                assert_eq!(warned_of(&report), ["REFRESH_INTERVAL_CHANGED"], "{name}");
+                let warning = &report.warnings[0].metadata;
+                assert_eq!(warning["interval_seconds"], seconds, "{name}");
+                assert_eq!(warning["hour"], "2026-11-20T11", "{name}");
+                assert!(
+                    warning["last_modified"].starts_with(&second[..19]),
+                    "{name}: {warning:?}"
+                );
+                assert_eq!(
+                    warning["previous_last_modified"],
+                    "2026-11-20T10:31:40+00:00"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_daily_refresh_shows_as_each_hour_missed_and_no_interval_warning() {
+    let w = World::new("daily-refresh");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
+    w.snapshot_modified(34, &[l(1, 100, 1)], Some("2026-11-21T10:31:40Z"));
+    let report = w.run();
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed);
+    let reasons = warned_of(&report);
+    assert_eq!(reasons, vec!["HOUR_MISSED"; 23]);
+}
+
+#[test]
+fn the_first_hour_collected_has_no_refresh_interval_to_judge() {
+    let w = World::new("interval-first");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T03:00:00Z"));
+    assert!(w.run().warnings.is_empty());
+}
+
+// Decision 13, the cases the test design adds (5.2.1, 5.2.2)
+
+#[test]
+fn unknown_time_left_with_no_posting_hour_is_cancelled_where_very_long_expires() {
+    // D39.10: no lower bound, so never expired by band, at span 1 or 13.
+    for (band, span, kind) in [
+        ("EXTRA_LONG", 1, EventKind::Cancelled),
+        ("EXTRA_LONG", 13, EventKind::Cancelled),
+        ("VERY_LONG", 13, EventKind::Expired),
+    ] {
+        let seed = Seed {
+            listing: l(401, 300, 1).band(band),
+            first_seen: 0,
+            posted: None,
+        };
+        let name = format!("unknown-unposted-{band}-{span}");
+        let (event, _) = gone_behind_intact(&name, 30 - span, 30, seed);
+        assert_eq!(event.kind, kind, "{band} at span {span}");
+    }
+}
+
+#[test]
+fn unknown_time_left_with_a_posting_hour_expires_by_its_duration() {
+    // D39.11: the duration test reads no band: posted h0, gone at h12.
+    let (event, record) = gone_behind_intact("unknown-posted", 11, 12, posted_at_0("EXTRA_LONG"));
+    assert_eq!(event.kind, EventKind::Expired);
+    assert_eq!(record.duration, Some(Duration::H12));
+}
+
+#[test]
+fn unknown_time_left_reduced_is_a_partial_sale() {
+    // D39.13: reduced by 1 behind an intact listing.
+    let w = World::new("unknown-partly");
+    w.snapshot(9, &[l(103, 110, 4), l(104, 120, 2).band("FOREVER")]);
+    w.snapshot(10, &[l(103, 110, 4), l(104, 120, 1).band("FOREVER")]);
+    w.run();
+    let sale = only(&events_at(&w.open(), 10), 104);
+    assert_eq!((sale.kind, sale.units), (EventKind::PartlySold, 1));
+}
+
+#[test]
+fn time_left_in_another_case_is_not_a_band() {
+    // D39.5
+    let w = World::new("band-case");
+    w.snapshot(10, &[l(1, 100, 1).band("short"), l(2, 110, 1)]);
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["TIME_LEFT_UNKNOWN"]);
+    assert_eq!(report.warnings[0].metadata["values"], "short");
+}
+
+#[test]
+fn an_empty_time_left_is_not_a_band_and_is_kept_and_warned() {
+    // D39.16
+    let w = World::new("empty-band");
+    w.snapshot(10, &[l(1, 100, 1).band(""), l(2, 110, 1)]);
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["TIME_LEFT_UNKNOWN"]);
+    assert_eq!(report.warnings[0].metadata["values"], "");
+    assert_eq!(report.warnings[0].metadata["listings"], "1");
+    assert_eq!(history(&w.open(), 1)[0].2, "");
+}
+
+#[test]
+fn time_left_values_are_distinct_and_sorted_and_listings_is_a_count() {
+    // G49: two listings with one value and one with another.
+    let w = World::new("values-sorted");
+    w.snapshot(
+        10,
+        &[
+            l(1, 100, 1).band("ZETA"),
+            l(2, 110, 1).band("ALPHA"),
+            l(3, 120, 1).band("ZETA"),
+        ],
+    );
+    let metadata = &w.run().warnings[0].metadata;
+    assert_eq!(metadata["values"], "ALPHA,ZETA");
+    assert_eq!(metadata["listings"], "3");
+}
+
+#[test]
+fn interval_of_one_second_between_consecutive_hours_warns() {
+    // D45.6
+    let w = World::new("interval-one-second");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:59:59Z"));
+    w.snapshot_modified(11, &[l(1, 100, 1)], Some("2026-11-20T11:00:00Z"));
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["REFRESH_INTERVAL_CHANGED"]);
+    assert_eq!(report.warnings[0].metadata["interval_seconds"], "1");
+}
+
+#[test]
+fn interval_is_not_judged_across_a_missed_hour() {
+    // D45.8: h10 and h13 held, h11 and h12 missed; h13 follows h10 by 3 h.
+    let w = World::new("interval-across-gap");
+    w.snapshot_modified(10, &[l(1, 100, 1)], Some("2026-11-20T10:31:40Z"));
+    w.snapshot_modified(13, &[l(1, 100, 1)], Some("2026-11-20T13:31:40Z"));
+    let report = w.run();
+    assert_eq!(warned_of(&report), ["HOUR_MISSED", "HOUR_MISSED"]);
+}
+
+#[test]
+fn a_rerun_after_the_gap_is_recorded_raises_no_hour_missed_again() {
+    // D46.5
+    let w = World::new("missed-once");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    w.snapshot(12, &[l(1, 100, 1)]);
+    assert_eq!(warned_of(&w.run()), ["HOUR_MISSED"]);
+    let again = w.run();
+    assert!(again.warnings.is_empty(), "{again:?}");
+    assert_eq!(again.outcome, Severity::Ok);
+}
+
+#[test]
+fn an_item_field_missing_leaves_the_transform_exit_0_and_the_hours_committed() {
+    // D50.7
+    let w = World::new("item-missing-exit");
+    w.snapshot(10, &[l(1, 100, 1)]);
+    item_file(
+        &w,
+        "2026-11-20T100000",
+        &[(1, "2026-11-20 10:00:00+00", 200, Some(r#"{"id":1}"#))],
+    );
+    let report = w.run();
+
+    assert_eq!(exit_status(&report), ExitStatus::Completed, "{report:?}");
+    assert_eq!(warned_of(&report)[0], "ITEM_FIELD_MISSING");
+    assert_eq!(processed(&w.open()), [(h(10), None)]);
+    assert_eq!(reference(&w.open()).len(), 1, "the item is kept");
+}
+
+#[test]
+fn a_rebuild_raises_the_hour_warnings_again_for_every_hour_it_processes() {
+    // G55: the lake rebuilt from bronze reads each hour as new.
+    let w = World::new("rebuild-warns");
+    w.snapshot_modified(
+        10,
+        &[l(1, 100, 1).band("FOREVER")],
+        Some("2026-11-20T10:31:40Z"),
+    );
+    w.snapshot_modified(12, &[l(1, 100, 1)], Some("2026-11-20T12:31:40Z"));
+    let first = warned_of(&w.run()).join(",");
+    assert_eq!(first, "TIME_LEFT_UNKNOWN,HOUR_MISSED");
+    assert!(w.run().warnings.is_empty());
+
+    for entry in std::fs::read_dir(&w.dir).unwrap().flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lake.duckdb")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    let again = warned_of(&w.run()).join(",");
+    assert_eq!(again, first);
+}

@@ -1,0 +1,489 @@
+//! The lake: the DuckLake catalog `meta`, `silver`, `gold` and `reference`
+//! live in (5.4.2 *The lake*, `docs/5.4.2-storage-schema.md`).
+//!
+//! **What is tested, and what is not.** The tests of `dp transform` cannot load
+//! DuckLake, so they attach a plain DuckDB file under the same name, `lake`,
+//! through the same code path: [`Backend::PlainFile`] is the one switch. Every
+//! statement `dp` sends therefore uses only what DuckLake supports (no `ENUM`,
+//! no key or `CHECK`, no index, no sequence; an upsert is a delete then an
+//! insert). **DuckLake itself, with its SQLite catalog and its Parquet files,
+//! is first run on E5**: the attach, a transaction across tables, a rollback,
+//! `DELETE` with no `WHERE` and the migrations are what to watch there.
+//!
+//! A job opens the lake under the VM-wide lock; nothing here takes it.
+
+mod migrations;
+mod profiles;
+
+use std::path::{Path, PathBuf};
+
+use duckdb::Connection;
+
+use crate::collect::failure::{Failure, io_failure, says_disk_full};
+use crate::error::{ErrorType, Report};
+use crate::settings::transform::{JOB_MEMORY_LIMIT, JOB_THREADS};
+
+pub use migrations::{MIGRATIONS, Migration};
+pub(crate) use profiles::HOURS_PER_DAY;
+pub use profiles::{PROFILES_SQL, settings_sql};
+
+/// Where a job's DuckDB connections spill what does not fit the memory limit:
+/// under the data folder, which is on disk, so that no connection depends on
+/// the working directory or on the memory-backed `/tmp` of the image.
+pub fn scratch_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("state/duckdb-tmp")
+}
+
+/// A DuckDB connection's own spill folder, `<pid>-<16 hex random>` under
+/// [`scratch_dir`]: the scheme the temporary files of bronze are named by
+/// ([`unique_tag`](crate::collect::unique_tag)). Two DuckDB instances that
+/// spilled to one folder would write the same file names, so every connection
+/// has its own, and the process's pid is not unique across containers. The
+/// folder is removed when this is dropped, which is when its connection is
+/// closed: declare a `Spill` before the connection that uses it, or a field
+/// after it. One left by a dead run is removed by `dp daily`
+/// ([`crate::daily`]'s stale-file step).
+#[derive(Debug)]
+pub struct Spill {
+    path: PathBuf,
+}
+
+impl Spill {
+    /// Makes a new folder under `root`, which is [`scratch_dir`] of the data
+    /// folder in a job.
+    ///
+    /// # Errors
+    ///
+    /// *Technical* where the folder cannot be made: a full disk is *fundamental*.
+    pub fn create(root: &Path) -> Result<Spill, Failure> {
+        let tag = crate::collect::unique_tag(std::process::id(), &crate::collect::random_suffix()?);
+        let path = root.join(tag);
+        std::fs::create_dir_all(&path)
+            .map_err(|e| io_failure(&e, "creating the DuckDB spill folder"))?;
+        Ok(Spill { path })
+    }
+
+    /// The folder.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // What is left is a stale folder, which `dp daily` removes.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The statements that set every connection of a job the same way: extensions
+/// are loaded but never installed, `memory_limit` and `threads` are the job's
+/// (5.4.1), and `temp_directory` is the connection's own `spill`.
+pub(crate) fn job_limits(spill: &Spill) -> String {
+    #[cfg(test)]
+    let memory_limit = starved::limit().unwrap_or(JOB_MEMORY_LIMIT);
+    #[cfg(not(test))]
+    let memory_limit = JOB_MEMORY_LIMIT;
+    format!(
+        "SET autoinstall_known_extensions = false; SET autoload_known_extensions = true; \
+         SET memory_limit='{memory_limit}'; SET threads={JOB_THREADS}; \
+         SET temp_directory={};",
+        crate::collect::snapshot::quoted(&spill.path().to_string_lossy())
+    )
+}
+
+/// A test's way to starve a job of memory: for the closure's duration, on
+/// this thread, every connection a job opens takes a limit in place of the
+/// job's `memory_limit` (a small one makes DuckDB really run out; one it
+/// cannot parse makes opening fail). Nothing in the product reads it.
+#[cfg(test)]
+pub(crate) mod starved {
+    use std::cell::Cell;
+
+    /// A limit under which DuckDB cannot allocate the first block of a write
+    /// (a table insert, a Parquet file) but still reads.
+    pub(crate) const TINY: &str = "100KB";
+
+    /// A limit under which a lake already made opens and its migrations are
+    /// found applied, and DuckDB then runs out of memory in the work after
+    /// them (reading an hour, writing a file). Found by trying, for the
+    /// pinned DuckDB; a lake not yet made, or the first write of any file,
+    /// needs less.
+    pub(crate) const AFTER_OPENING: &str = "3MB";
+
+    thread_local! {
+        static LIMIT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn limit() -> Option<&'static str> {
+        LIMIT.with(Cell::get)
+    }
+
+    /// Runs `f` with every connection opened on this thread limited to `limit`.
+    pub(crate) fn under<T>(limit: &'static str, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<&'static str>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LIMIT.with(|cell| cell.set(self.0));
+            }
+        }
+        let _restore = Restore(LIMIT.with(|cell| cell.replace(Some(limit))));
+        f()
+    }
+}
+
+/// The name the lake is attached under, and so the catalog every statement's
+/// `meta.`, `silver.`, `gold.` and `reference.` resolves in.
+pub const CATALOG: &str = "lake";
+
+/// Where the lake is, and so what is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backend {
+    /// Production: a DuckLake catalog `lake/catalog.sqlite` with its Parquet
+    /// data in `lake/data/`, under the data folder.
+    DuckLake {
+        /// `DP_DATA_DIR`.
+        data_dir: PathBuf,
+    },
+    /// A plain DuckDB file attached as `lake`, for tests that cannot load
+    /// DuckLake. Not a setting: nothing reads it from the environment.
+    PlainFile(PathBuf),
+}
+
+/// An open lake: a DuckDB connection with the catalog attached as `lake` and
+/// made the default, so `silver.event` is `lake.silver.event`.
+pub struct Lake {
+    // In this order: the connection is closed before its spill folder goes.
+    connection: Connection,
+    _spill: Spill,
+}
+
+/// A failure of the lake's own: the lake could not be used, which is not the
+/// fault of the hour in hand.
+pub(crate) fn lake_failure(message: &str, doing: &str) -> Failure {
+    if says_out_of_memory(message) {
+        return out_of_memory(message, doing);
+    }
+    if says_disk_full(message) {
+        return io_failure(
+            &std::io::Error::from(std::io::ErrorKind::StorageFull),
+            doing,
+        );
+    }
+    Failure::Stop(Box::new(
+        Report::fatal(
+            ErrorType::Unexpected,
+            "LAKE_FAILED",
+            "DuckDB could not complete a statement on the lake.",
+        )
+        .with_metadata("doing", doing)
+        .with_metadata("detail", message),
+    ))
+}
+
+/// Whether a message from DuckDB says the job ran out of memory. DuckDB 1.4.5
+/// builds it from the exception type's name, `Out of Memory`, and `Error: `
+/// (`exception.cpp`, `OutOfMemoryException`).
+pub(crate) fn says_out_of_memory(message: &str) -> bool {
+    message.contains("Out of Memory Error")
+}
+
+/// The job hit its `memory_limit`: a limit the operator sets, so *technical,
+/// fundamental*.
+pub(crate) fn out_of_memory(message: &str, doing: &str) -> Failure {
+    Failure::Stop(Box::new(
+        Report::fatal(
+            ErrorType::TechnicalFundamental,
+            "OUT_OF_MEMORY",
+            "DuckDB ran out of memory under the job's memory limit; the hour is more than the limit holds.",
+        )
+        .with_metadata("doing", doing)
+        .with_metadata("detail", message),
+    ))
+}
+
+fn unavailable(message: &str, doing: &str) -> Failure {
+    // No memory and a full disk are the operator's to fix, and are named as such
+    // wherever they are met: only what is left is the lake being unavailable.
+    if says_out_of_memory(message) || says_disk_full(message) {
+        return lake_failure(message, doing);
+    }
+    Failure::Stop(Box::new(
+        Report::fatal(
+            ErrorType::TechnicalFundamental,
+            "LAKE_UNAVAILABLE",
+            "The lake cannot be opened; check the DuckLake and SQLite extensions, and the lake folder.",
+        )
+        .with_metadata("doing", doing)
+        .with_metadata("detail", message),
+    ))
+}
+
+fn lake_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("lake").join("data")
+}
+
+/// The `ATTACH` that makes the backend the catalog `lake`.
+///
+/// DuckLake's `sqlite:` prefix names the catalog's kind: without it DuckLake
+/// takes the file for a DuckDB catalog. E5 is where it is first run.
+pub(crate) fn attach_statement(backend: &Backend) -> String {
+    match backend {
+        Backend::DuckLake { data_dir } => format!(
+            "ATTACH 'ducklake:sqlite:{}' AS {CATALOG} (DATA_PATH '{}/')",
+            data_dir
+                .join("lake")
+                .join("catalog.sqlite")
+                .to_string_lossy()
+                .replace('\'', "''"),
+            lake_data_dir(data_dir)
+                .to_string_lossy()
+                .replace('\'', "''"),
+        ),
+        Backend::PlainFile(file) => format!(
+            "ATTACH {} AS {CATALOG}",
+            crate::collect::snapshot::quoted(&file.to_string_lossy())
+        ),
+    }
+}
+
+impl Lake {
+    /// Opens the lake under the job limits (`memory_limit` and `threads`).
+    /// `scratch` is the folder DuckDB's spill folder of this lake is made in
+    /// ([`Spill`]), for what does not fit the memory limit.
+    ///
+    /// # Errors
+    ///
+    /// *Technical, fundamental* where the extensions are not installed (the
+    /// image installs them at build; autoinstall stays off) or the folder
+    /// cannot be used.
+    pub fn open(backend: &Backend, scratch: &Path) -> Result<Lake, Failure> {
+        let spill = Spill::create(scratch)?;
+        let limits = job_limits(&spill);
+        let connection = Connection::open_in_memory()
+            .map_err(|e| lake_failure(&e.to_string(), "opening DuckDB"))?;
+        let batch = |sql: &str, doing: &str| {
+            connection
+                .execute_batch(sql)
+                .map_err(|e| lake_failure(&e.to_string(), doing))
+        };
+        batch(&limits, "setting the job limits")?;
+        if let Backend::DuckLake { data_dir } = backend {
+            std::fs::create_dir_all(lake_data_dir(data_dir))
+                .map_err(|e| io_failure(&e, "creating the lake folder"))?;
+            connection
+                .execute_batch("LOAD ducklake; LOAD sqlite;")
+                .map_err(|e| unavailable(&e.to_string(), "loading the DuckLake extensions"))?;
+        }
+        let attach = attach_statement(backend);
+        connection
+            .execute_batch(&attach)
+            .map_err(|e| unavailable(&e.to_string(), "attaching the lake"))?;
+        batch(&format!("USE {CATALOG};"), "using the lake")?;
+        Ok(Lake {
+            connection,
+            _spill: spill,
+        })
+    }
+
+    /// The connection, for the statements of a job.
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Runs statements.
+    pub(crate) fn execute(&self, sql: &str, doing: &str) -> Result<(), Failure> {
+        self.connection
+            .execute_batch(sql)
+            .map_err(|e| lake_failure(&e.to_string(), doing))
+    }
+
+    /// Starts a transaction: what follows commits or rolls back as one.
+    pub(crate) fn begin(&self) -> Result<(), Failure> {
+        self.execute("BEGIN TRANSACTION;", "beginning a transaction")
+    }
+
+    /// Commits the transaction.
+    pub(crate) fn commit(&self) -> Result<(), Failure> {
+        self.execute("COMMIT;", "committing")
+    }
+
+    /// Rolls the transaction back. Its own failure is only logged: the
+    /// failure that called for it is the one to report.
+    pub(crate) fn rollback(&self) {
+        if let Err(e) = self.connection.execute_batch("ROLLBACK;") {
+            tracing::warn!(error = %e, "the rollback itself failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{ExitStatus, exit_status};
+
+    fn scratch(name: &str) -> PathBuf {
+        let scratch = std::env::temp_dir().join(format!("dp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        scratch
+    }
+
+    #[test]
+    fn a_job_connection_spills_to_its_own_folder_not_the_working_directory() {
+        // The image's working directory is read-only: DuckDB's default spill
+        // folder, `.tmp` beside it, would not be writable.
+        let root = scratch("spill");
+        let spill = Spill::create(&root).unwrap();
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(&job_limits(&spill)).unwrap();
+        let set: String = connection
+            .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(set, spill.path().to_string_lossy());
+        assert!(spill.path().is_dir());
+        assert_eq!(spill.path().parent(), Some(root.as_path()));
+        assert_eq!(
+            scratch_dir(Path::new("/srv/dp/x")),
+            Path::new("/srv/dp/x/state/duckdb-tmp")
+        );
+    }
+
+    #[test]
+    fn two_connections_get_different_folders_named_for_the_process_and_a_random_suffix() {
+        let root = scratch("spill-two");
+        let first = Spill::create(&root).unwrap();
+        let second = Spill::create(&root).unwrap();
+        assert_ne!(first.path(), second.path());
+        for spill in [&first, &second] {
+            let name = spill.path().file_name().unwrap().to_string_lossy();
+            let (pid, random) = name.split_once('-').expect(&name);
+            assert_eq!(pid, std::process::id().to_string());
+            assert_eq!(random.len(), 16, "{name}");
+            assert!(random.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        }
+    }
+
+    /// How many spill folders `root` holds.
+    fn folders(root: &Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .count()
+    }
+
+    #[test]
+    fn each_duckdb_connection_spills_to_its_own_folder_removed_at_close() {
+        let root = scratch("spill-drop");
+        let a = Lake::open(&Backend::PlainFile(root.join("a.duckdb")), &root).unwrap();
+        let b = Lake::open(&Backend::PlainFile(root.join("b.duckdb")), &root).unwrap();
+        let spilling = |lake: &Lake| -> String {
+            lake.connection()
+                .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_ne!(spilling(&a), spilling(&b));
+        assert_eq!(folders(&root), 2);
+        drop(a);
+        assert_eq!(folders(&root), 1);
+        drop(b);
+        assert_eq!(folders(&root), 0);
+    }
+
+    #[test]
+    fn production_attaches_a_ducklake_catalog_with_its_data_beside_it() {
+        let backend = Backend::DuckLake {
+            data_dir: PathBuf::from("/srv/dp/production"),
+        };
+        assert_eq!(
+            attach_statement(&backend),
+            "ATTACH 'ducklake:sqlite:/srv/dp/production/lake/catalog.sqlite' AS lake \
+             (DATA_PATH '/srv/dp/production/lake/data/')"
+        );
+    }
+
+    #[test]
+    fn a_test_attaches_a_plain_file_under_the_same_name() {
+        let backend = Backend::PlainFile(PathBuf::from("/tmp/it's.duckdb"));
+        assert_eq!(
+            attach_statement(&backend),
+            "ATTACH '/tmp/it''s.duckdb' AS lake"
+        );
+    }
+
+    #[test]
+    fn a_full_disk_is_fundamental_and_any_other_failure_unexpected() {
+        let Failure::Stop(full) = lake_failure(
+            "IO Error: Could not write file \"x\": No space left on device",
+            "writing",
+        ) else {
+            panic!("expected a stop");
+        };
+        assert_eq!(full.reason, "DISK_FULL");
+        assert_eq!(exit_status(&full), ExitStatus::Fundamental);
+        let Failure::Stop(other) = lake_failure("Binder Error: no such table", "writing") else {
+            panic!("expected a stop");
+        };
+        assert_eq!(other.reason, "LAKE_FAILED");
+        assert_eq!(exit_status(&other), ExitStatus::Unexpected);
+    }
+
+    #[test]
+    fn duckdbs_out_of_memory_message_is_recognised_and_is_fundamental() {
+        let message =
+            "Out of Memory Error: failed to pin block of size 256.0 KiB (953.6 MiB/953.6 MiB used)";
+        assert!(says_out_of_memory(message));
+        assert!(!says_out_of_memory(
+            "IO Error: Could not write file: Permission denied"
+        ));
+        assert!(!says_out_of_memory("Binder Error: out of range"));
+        let Failure::Stop(report) = lake_failure(message, "comparing") else {
+            panic!("expected a stop");
+        };
+        assert_eq!(report.reason, "OUT_OF_MEMORY");
+        assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+        assert_eq!(report.metadata["doing"], "comparing");
+    }
+
+    #[test]
+    fn an_attach_that_runs_out_of_memory_or_disk_is_named_so_and_is_fundamental() {
+        // X3: only what is left is the lake unavailable.
+        let oom = unavailable(
+            "Out of Memory Error: failed to pin block",
+            "attaching the lake",
+        );
+        let disk = unavailable("IO Error: No space left on device", "attaching the lake");
+        let other = unavailable("IO Error: Cannot open file", "attaching the lake");
+        let reason = |failure| match failure {
+            Failure::Stop(report) => (report.reason.clone(), exit_status(&report)),
+            other => panic!("expected a stop, got {other:?}"),
+        };
+        assert_eq!(
+            reason(oom),
+            ("OUT_OF_MEMORY".to_owned(), ExitStatus::Fundamental)
+        );
+        assert_eq!(
+            reason(disk),
+            ("DISK_FULL".to_owned(), ExitStatus::Fundamental)
+        );
+        assert_eq!(
+            reason(other),
+            ("LAKE_UNAVAILABLE".to_owned(), ExitStatus::Fundamental)
+        );
+    }
+
+    #[test]
+    fn a_lake_that_cannot_be_attached_is_fundamental() {
+        let scratch = std::env::temp_dir().join(format!("dp-lake-unusable-{}", std::process::id()));
+        let backend = Backend::PlainFile(PathBuf::from("/nonexistent-dir/lake.duckdb"));
+        let Err(Failure::Stop(report)) = Lake::open(&backend, &scratch) else {
+            panic!("expected a stop");
+        };
+        assert_eq!(report.reason, "LAKE_UNAVAILABLE");
+        assert_eq!(exit_status(&report), ExitStatus::Fundamental);
+    }
+}

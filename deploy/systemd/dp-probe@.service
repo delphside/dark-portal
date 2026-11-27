@@ -1,0 +1,15 @@
+[Unit]
+Description=Dark Portal refresh probe (%i)
+Documentation=https://github.com/delphside/dark-portal/blob/main/docs/5.2.1-collection.md
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/dp/%i.env
+Environment=DP_ENV_FILE=/etc/dp/%i.env
+ExecStart=/usr/local/libexec/dp/dp-run probe
+# No restart: `dp probe` never fails, and tomorrow's run is as good.
+Restart=no
+# 5.4.1: the probe run time limit. A test reads this against the settings.
+RuntimeMaxSec=5min

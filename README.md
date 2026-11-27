@@ -9,6 +9,9 @@ of the Delphside programme, and its design is in its main project,
 
 | Path | What it holds |
 | --- | --- |
+| [`src/`](src/), [`tests/`](tests/) | the `dp` binary's code and its integration tests |
+| [`Cargo.toml`](Cargo.toml), [`Cargo.lock`](Cargo.lock), [`rust-toolchain.toml`](rust-toolchain.toml) | the crate, its locked dependencies and the pinned compiler |
+| [`docs/`](docs/README.md) | Dark Portal's design documents |
 | [`sizing/`](sizing/README.md) | the sizing test's scripts and its first run's report |
 | [`app-profile.toml`](app-profile.toml) | the technical profile the programme's tooling reads |
 | [`CLAUDE.md`](CLAUDE.md) | the rules Claude follows in this repository, beyond the programme's |
