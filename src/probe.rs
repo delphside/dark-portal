@@ -524,6 +524,63 @@ mod tests {
         assert_eq!(stub.requests("POST"), 1, "a token of its own");
     }
 
+    /// A local address that refuses connections: a port nothing listens on.
+    fn refusing() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{address}")
+    }
+
+    fn probing(w: &World, endpoints: Endpoints) -> Report {
+        let short = Duration::from_secs(2);
+        let blizzard = Blizzard::with_timeouts(
+            endpoints,
+            Timeouts {
+                snapshot: short,
+                other: short,
+            },
+        );
+        run_with(&w.config, &FakeClock::at(AT_1205), &blizzard)
+    }
+
+    #[test]
+    fn a_token_endpoint_that_cannot_be_reached_is_a_failed_probe_with_exit_0() {
+        // G58, D48.2
+        let (w, stub) = world("token-unreachable");
+        mount(&stub, modified("2026-11-20T12:01:10Z"));
+        let endpoints = Endpoints {
+            oauth: refusing(),
+            api: stub.endpoints().api,
+        };
+
+        let report = probing(&w, endpoints);
+
+        assert_eq!(report.reason, "PROBE_FAILED", "{report:?}");
+        assert_eq!(exit_status(&report), ExitStatus::Completed);
+        assert_eq!(
+            stub.requests("GET"),
+            0,
+            "no snapshot request without a token"
+        );
+    }
+
+    #[test]
+    fn blizzard_that_cannot_be_reached_is_a_failed_probe_with_exit_0() {
+        // G59, D48.3
+        let (w, stub) = world("blizzard-unreachable");
+        let endpoints = Endpoints {
+            oauth: stub.endpoints().oauth,
+            api: refusing(),
+        };
+
+        let report = probing(&w, endpoints);
+
+        assert_eq!(report.reason, "PROBE_FAILED", "{report:?}");
+        assert_eq!(exit_status(&report), ExitStatus::Completed);
+        assert_eq!(stub.requests("POST"), 1, "the token was taken first");
+    }
+
     #[test]
     fn a_probe_that_ran_ends_with_its_total_seconds_on_the_final_line() {
         // D48.9: the job's total is on the report the process logs last.
